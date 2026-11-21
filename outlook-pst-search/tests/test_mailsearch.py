@@ -393,7 +393,7 @@ class Integration(unittest.TestCase):
         folder = Path(self.workspace.name) / "pcf"
         folder.mkdir()
         (folder / "PCF-H2107-045.txt").write_text(
-            "선주 COMMENT: 좌현 발러스트 배관 밸브 등급 상향 요구. "
+            "선주 COMMENT: 좌현 발러스트 배관 밸브 등급 상향 요구. H21070 사례 참조. "
             "빌더 회신: 규정서 기준 LR 등급으로 검토했고 현 설계 유지. 종결: 선주 동의로 Closed.", encoding="utf-8")
         (folder / "배관 기준서.txt").write_text("발러스트 배관 등급 기준 안내.", encoding="utf-8")
         _, payload = self.call("/api/sources", {"path": str(folder)})
@@ -409,11 +409,13 @@ class Integration(unittest.TestCase):
         # PCF 전용 범위(호선)는 파일명·본문 텍스트 매칭으로 좁힌다(데이터화 전 임시 동작).
         _, other_hull = self.call("/api/search", {"query": "", "filters": {"tab": "pcf", "hull": "H9999"}})
         self.assertFalse(other_hull["results"])
+        _, mentioned_hull = self.call("/api/search", {"query": "", "filters": {"tab": "pcf", "hull": "H21070"}})
+        self.assertFalse(mentioned_hull["results"])
         _, this_hull = self.call("/api/search", {"query": "", "filters": {"tab": "pcf", "hull": "H2107"}})
         self.assertTrue(any("PCF-H2107" in row["subject"] for row in this_hull["results"]))
         self.app.external = ExternalAI("https://api.example.invalid/v1/chat/completions",
                                        "test-model", "placeholder-token")
-        _, preview = self.call("/api/pcf/preview", {"query": "밸브 등급 상향 COMMENT 처리", "filters": {"tab": "pcf"}})
+        _, preview = self.call("/api/pcf/preview", {"query": "밸브 등급 상향 COMMENT 처리", "filters": {"tab": "document"}})
         self.assertTrue(preview["results"])
         self.assertTrue(all(row["kind"] == "pcf" for row in preview["results"]))
         with patch("mailsearch.external.http.client.HTTPSConnection") as https:
@@ -424,7 +426,7 @@ class Integration(unittest.TestCase):
                 "status": "answered",
                 "claims": [{"text": "과거 동일 COMMENT은 현 설계 유지로 종결되었습니다.",
                             "citations": [{"source": preview["excerpts"][0]["id"],
-                                           "quote": "현 설계 유지"}]}],
+                                           "quote": "현 설계 유지. 종결: 선주 동의로 Closed."}]}],
             }, ensure_ascii=False)}}]}).encode()
             status, data = self.call("/api/pcf/send",
                 {"review": preview["review"], "excerpts": [item["id"] for item in preview["excerpts"]]})
@@ -434,6 +436,35 @@ class Integration(unittest.TestCase):
                 body = body.encode()
             self.assertIn("선주 교신문(PCF)".encode() if isinstance(body, bytes) else "선주 교신문(PCF)", body)
         self.assertEqual(data["status"], "answered")
+
+    def test_folder_document_body_filter_and_removed_original(self):
+        path = self.mixed_corpus()
+        source = self.call("/api/sources", {"path": str(path)})[1]["source"]
+        await_source(self.store, source, {"ready", "error"})
+        filters = {"tab": "all", "source": source, "body": "변형 발생"}
+        rows = self.call("/api/search", {"filters": filters})[1]["results"]
+        self.assertEqual([row["subject"] for row in rows], ["A17 시험보고서.txt"])
+        self.app.external = ExternalAI("https://api.example.invalid/v1/chat/completions", "model", "key")
+        preview = self.call("/api/external/preview", {"query": "변형 발생", "filters": filters})[1]
+        self.assertEqual(preview["excerpts"][0]["source"]["passage"], rows[0]["passage"])
+        (path / rows[0]["subject"]).unlink()
+        self.assertFalse(self.call("/api/search", {"filters": filters})[1]["results"])
+        self.assertEqual(self.call(f"/api/evidence/{rows[0]['passage']}")[0], 404)
+        self.assertEqual(self.call("/api/external/send", {"review": preview["review"], "excerpts": [1]})[0], 409)
+
+    def test_pcf_comment_boundaries_and_route_bound_review(self):
+        path = Path(self.workspace.name) / "PCF-H2107.txt"
+        path.write_text("COMMENT NO. 101\n배관압력 상향 요청.\nCOMMENT NO. 102\n도장색 변경 종결.", encoding="utf-8")
+        source = self.call("/api/sources", {"path": str(path)})[1]["source"]
+        await_source(self.store, source, {"ready", "error"})
+        row = self.store.lexical("배관압력", {"tab": "pcf"})[0]
+        self.assertIn("101", row["text"])
+        self.assertNotIn("102", row["text"])
+        self.app.external = ExternalAI("https://api.example.invalid/v1/chat/completions", "model", "key")
+        review = self.call("/api/pcf/preview", {"query": "배관압력"})[1]["review"]
+        with patch("mailsearch.external.ExternalAI.answer") as generate:
+            self.assertEqual(self.call("/api/external/send", {"review": review, "excerpts": [1]})[0], 409)
+            generate.assert_not_called()
 
     def test_sources_report_kind_counts(self):
         """사이드바 섹션 구분을 위한 소스별 종류 카운트."""
@@ -799,6 +830,20 @@ class AttachmentsAndCitations(unittest.TestCase):
         self.assertIsNone(delivery_date_answer(question, [approval, cancelled]))
         conflicting = {**base, "text": "4월 29일 납품으로 최종 승인합니다."}
         self.assertIsNone(delivery_date_answer(question, [approval, conflicting]))
+
+    def test_approval_quote_must_support_scope_and_closure(self):
+        row = {
+            "id": 1, "source": 1, "path": "PCF.txt", "folder": "/", "updated": None,
+            "passage": 1, "sent": "", "sender": "", "recipient": "", "subject": "PCF",
+            "text": "시제품만 4T 적용 승인. 양산은 보류.", "attachment": None, "location": "본문",
+        }
+        claim = {"text": "양산 4T 적용 승인", "citations": [{"source": 1, "quote": row["text"]}]}
+        result = {"status": "answered", "claims": [claim]}
+        self.assertEqual(validate(result, [row], pcf=True)["status"], "insufficient")
+        claim["text"] = "시제품 4T 적용 승인"
+        self.assertEqual(validate(result, [row], pcf=True)["status"], "answered")
+        claim["text"] = "이 건은 종결됐습니다."
+        self.assertEqual(validate(result, [row], pcf=True)["status"], "insufficient")
 
     def test_invalid_quote_unproven_amount_and_approval(self):
         row = {
