@@ -120,12 +120,16 @@ svg { width: 21px; height: 21px; flex: none; stroke: currentColor; stroke-width:
 .add-button[aria-expanded="true"], .add-button:hover { background: var(--blush); }
 .add-button svg { width: 16px; height: 16px; }
 .small { min-height: 34px; padding: 4px 12px; font-size: .83rem; }
-.add-form { margin-top: 16px; padding: 11px; background: var(--page); border: 1px solid var(--line); border-radius: 8px; }
+.source-group { margin-top: 15px; padding-top: 13px; border-top: 1px solid var(--line); display: grid; gap: 9px; }
+.source-group:first-of-type { margin-top: 0; padding-top: 0; border-top: 0; }
+.group-title { font-size: .82rem; font-weight: 800; letter-spacing: -.03em; }
+.group-hint { font-size: .7rem; font-weight: 650; color: var(--muted); letter-spacing: 0; }
+.group-add { min-height: 38px; }
+.add-form { padding: 11px; background: var(--page); border: 1px solid var(--line); border-radius: 8px; }
 .add-form label { display: block; font-size: .76rem; font-weight: 750; }
-#path { margin: 7px 0 10px; font-size: .78rem; }
+.add-form input { margin: 7px 0 10px; font-size: .78rem; }
 .form-message { color: var(--accent-dark); font-size: .78rem; overflow-wrap: anywhere; }
 .form-message:not(:empty) { margin-top: 9px; }
-.sources { margin-top: 16px; }
 .source-empty { padding: 16px 9px; border: 1px dashed #a48c77; border-radius: 8px; text-align: center; font-size: .82rem; color: var(--muted); }
 .source-card { padding: 12px 0; border-top: 1px solid var(--line); overflow-wrap: anywhere; }
 .source-name { margin-bottom: 5px; font-size: .87rem; font-weight: 790; }
