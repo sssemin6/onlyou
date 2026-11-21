@@ -14,7 +14,7 @@
 .\start-windows.cmd --readpst "C:\msys64\mingw64\bin\readpst.exe" --pdftotext "C:\tools\poppler\bin\pdftotext.exe"
 ```
 
-4. 열린 브라우저에서 **보관함 추가**를 누른 뒤, Outlook을 닫고 로컬 디스크에 보관한 PST 경로를 등록합니다. 여러 파일은 한 번씩 등록하거나 PST를 모아 둔 폴더를 등록합니다. 폴더를 등록하면 그 안의 .eml 메일과 모든 PST 파일을 함께 가져옵니다. Outlook이 사용하는 데이터 파일 대신 닫혀 있는 PST 사본을 등록하면 파일 교체·갱신 시점을 제어하기 쉽습니다.
+4. 열린 브라우저에서 **보관함 추가**를 누른 뒤, Outlook을 닫고 로컬 디스크에 보관한 PST 경로를 등록합니다. 여러 파일은 한 번씩 등록하거나 PST를 모아 둔 폴더를 등록합니다. 폴더를 등록하면 그 안의 .eml 메일과 모든 PST 파일을 함께 가져오며, 빈 PST나 읽을 수 없는 PST는 건너뛰고 누락으로 표시합니다. Outlook이 사용하는 데이터 파일 대신 닫혀 있는 PST 사본을 등록하면 파일 교체·갱신 시점을 제어하기 쉽습니다.
 5. 터미널에서 **Ctrl+C**를 누르면 앱을 종료합니다. 진행 중이던 색인은 다음 실행에서 **재개**할 수 있습니다.
 
 Linux에서도 SQLite 3.42 이상을 사용하는 Python이 필요합니다. `pst-utils`와 `poppler-utils`를 설치한 뒤 `python3 -m mailsearch`로 실행합니다. 파이썬 앱 자체는 표준 라이브러리만 사용합니다.
