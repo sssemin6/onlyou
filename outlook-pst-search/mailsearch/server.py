@@ -17,7 +17,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from .answer import (DESIGN_INSTRUCTIONS, LocalAI, design_retrieval, delivery_date_answer,
-                     evidence_for, merge_rows, public_row, validate)
+                     evidence_for, merge_rows, numeric_answer, public_row, validate)
 from .bundled import prepare as prepare_bundled
 from .external import DEFAULT_MODEL, DEFAULT_URL, MAX_EXCERPTS, ExternalAI, ExternalRequestError, Reviews
 from .filesystem import local_path
@@ -102,6 +102,9 @@ def filters_from(get):
     attachment = get("attachment", "")
     if attachment in ("yes", "no"):
         filters["attachment"] = attachment
+    source = get("source", "")
+    if source:
+        filters["source"] = int(source)
     for name in ("before", "after"):
         value = get(name, "")
         if value:
@@ -189,6 +192,8 @@ class Handler(BaseHTTPRequestHandler):
         elif route.path == "/api/ping":
             self.server.last_seen = time.time()
             self.send_json(200, {"ok": True})
+        elif route.path == "/api/decisions":
+            self.send_json(200, {"decisions": self.server.store.decisions()})
         elif route.path == "/api/external/settings":
             external = self.server.external
             self.send_json(200, {
@@ -228,6 +233,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.query(route, payload)
             elif route in {"/api/external/send", "/api/design/send"}:
                 self.send_external(payload, design=route == "/api/design/send")
+            elif route == "/api/decisions":
+                self.change_decisions(payload)
             elif route == "/api/external/settings":
                 self.change_external_settings(payload)
             else:
@@ -280,6 +287,15 @@ class Handler(BaseHTTPRequestHandler):
             return
         if route == "/api/design/preview":
             evidence, mode = design_retrieval(store, ai, query, filters, context)
+            if external and (payload.get("rerank") is True or os.environ.get("MAILSEARCH_DESIGN_RERANK") == "1"):
+                # Optional rerank experiment: the same provider reorders retrieval (PRD 02 section 2).
+                try:
+                    order = external.rerank(query, [(row["passage"], row["text"][:400]) for row in evidence[:10]])
+                except (OSError, ValueError, RuntimeError, KeyError, IndexError, TypeError, http.client.HTTPException):
+                    order = None
+                if order:
+                    rank = {identifier: position for position, identifier in enumerate(order)}
+                    evidence.sort(key=lambda row: rank.get(row["passage"], len(rank)))
         else:
             evidence, mode = evidence_for(store, ai, query, filters, context,
                                           semantic=(route in {"/api/answer", "/api/external/preview"}))
@@ -350,6 +366,12 @@ class Handler(BaseHTTPRequestHandler):
             if len(rows) != len(ids):
                 self.send_json(409, {"error": "external_source_changed"})
                 return
+            if design:
+                computed = numeric_answer(review.question, rows)
+                if computed is not None:
+                    self.send_json(200, {**computed, "results": [public_row(row) for row in rows],
+                                         "provider": "external"})
+                    return
             try:
                 if design:
                     result = external.answer(review.question, excerpts,
@@ -371,6 +393,24 @@ class Handler(BaseHTTPRequestHandler):
         finally:
             server.outbound.release()
 
+
+    def change_decisions(self, payload):
+        if payload.get("action") == "remove":
+            with self.server.store.connection() as conn:
+                conn.execute("DELETE FROM decisions WHERE id=?", (int(payload["id"]),))
+            self.send_json(200, {"ok": True})
+            return
+        question, claims, passages = payload.get("question", ""), payload.get("claims"), payload.get("passages")
+        if (not isinstance(question, str) or not question.strip() or not isinstance(claims, list) or not claims
+                or not isinstance(passages, list) or not 1 <= len(passages) <= 20
+                or any(type(number) is not int for number in passages)
+                or len(json.dumps(claims, ensure_ascii=False)) > 20000):
+            raise ValueError("decision")
+        rows = self.server.store.passages(passages)
+        if len(rows) != len(passages):
+            raise ValueError("decision")
+        identifier = self.server.store.save_decision(question.strip()[:450], claims, rows)
+        self.send_json(200, {"id": identifier})
 
     def change_external_settings(self, payload):
         action = payload.get("action")
