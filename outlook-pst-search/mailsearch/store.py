@@ -476,7 +476,8 @@ class Store:
                     scores.append((similarity, row["passage"]))
             ids = [passage for _, passage in sorted(scores, reverse=True)[:limit]]
             found = {row["passage"]: row for row in self.passages(ids, filters, conn)}
-            return [found[pid] for pid in ids if pid in found]
+            weight = {passage: similarity for similarity, passage in scores}
+            return [{**found[pid], "similarity": weight[pid]} for pid in ids if pid in found]
 
     def passages(self, passages, filters=None, conn=None):
         if conn is None:
