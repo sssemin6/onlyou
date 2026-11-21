@@ -198,6 +198,7 @@ def public_row(row):
         "subject": row["subject"], "sender": row["sender"], "recipient": row["recipient"], "sent": row["sent"],
         "as_of": row["updated"], "passage": row["passage"], "attachment": row["attachment"],
         "location": row["location"], "preview": row["text"][:260],
+        "kind": row["kind"] if "kind" in row.keys() else "mail",
     }
 
 
