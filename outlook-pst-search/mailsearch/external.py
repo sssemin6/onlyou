@@ -167,6 +167,7 @@ class Review:
     question: str
     excerpts: tuple[Excerpt, ...]
     generation: object | None
+    pcf: bool = False
 
 
 class Reviews:
@@ -174,7 +175,7 @@ class Reviews:
         self._pending = {}
         self._lock = threading.Lock()
 
-    def create(self, question, rows, generation=None, limit=MAX_EXCERPT_LENGTH):
+    def create(self, question, rows, generation=None, limit=MAX_EXCERPT_LENGTH, *, pcf=False):
         texts = {}
         for row in rows:
             # Keep path, mail metadata, filename and account identifiers out of the request envelope.
@@ -190,7 +191,7 @@ class Reviews:
             return None, None
         token = secrets.token_urlsafe(24)
         now = time.monotonic()
-        review = Review(now + REVIEW_TTL, question, excerpts, generation)
+        review = Review(now + REVIEW_TTL, question, excerpts, generation, pcf)
         with self._lock:
             self._pending = {key: value for key, value in self._pending.items() if value.expires > now}
             if len(self._pending) >= 8:
