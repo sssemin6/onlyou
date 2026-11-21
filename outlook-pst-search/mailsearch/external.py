@@ -18,7 +18,7 @@ MAX_EXCERPTS = 5
 MAX_EXCERPT_LENGTH = 800
 MAX_RESPONSE = 128 * 1024
 HOST = re.compile(r"(?:[A-Za-z0-9-]+\.)*[A-Za-z0-9-]+", re.ASCII)
-PATH = re.compile(r"/(?:[A-Za-z0-9._~-]+/)*chat/completions", re.ASCII)
+PATH = re.compile(r"/(?:[A-Za-z0-9._~-]+/)*(?:chat/completions|messages)", re.ASCII)
 JSON_INSTRUCTIONS = """
 입력 JSON에는 question과 evidence가 있다. 메일 발신자·제목·발송 시간은 별도로 주어지지 않는다.
 응답은 아래 구조의 JSON 객체 하나여야 한다.
@@ -64,6 +64,7 @@ class ExternalAI:
         self.host = endpoint.hostname
         self.port = port if port is not None else 443
         self.path = endpoint.path
+        self.anthropic = endpoint.path.endswith("/messages")
         self.model = model
         self._key = key
         self.review_generation = object()
@@ -98,25 +99,43 @@ class ExternalAI:
             raise ValueError("external_test_reply")
 
     def complete(self, instructions, content, *, token_limit, timeout):
-        options = {
-            "model": self.model,
-            "messages": [
-                {"role": "system", "content": instructions},
-                {"role": "user", "content": content},
-            ],
-            "response_format": {"type": "json_object"},
-            "stream": False,
-        }
-        if self.host == "api.openai.com":
-            options.update(max_completion_tokens=token_limit, store=False)
+        if self.anthropic:
+            # Anthropic Messages protocol: system is a top-level field, max_tokens is
+            # required, and response_format is not supported. The instructions already
+            # request a single JSON object.
+            options = {
+                "model": self.model,
+                "max_tokens": token_limit,
+                "system": instructions,
+                "messages": [{"role": "user", "content": content}],
+                "stream": False,
+            }
+            headers = {
+                "Authorization": f"Bearer {self._key}",
+                "x-api-key": self._key,
+                "anthropic-version": "2023-06-01",
+                "Content-Type": "application/json",
+            }
         else:
-            options["max_tokens"] = token_limit
+            options = {
+                "model": self.model,
+                "messages": [
+                    {"role": "system", "content": instructions},
+                    {"role": "user", "content": content},
+                ],
+                "response_format": {"type": "json_object"},
+                "stream": False,
+            }
+            if self.host == "api.openai.com":
+                options.update(max_completion_tokens=token_limit, store=False)
+            else:
+                options["max_tokens"] = token_limit
+            headers = {"Authorization": f"Bearer {self._key}", "Content-Type": "application/json"}
         # HTTPSConnection uses normal certificate verification and follows neither redirects nor proxies.
         connection = http.client.HTTPSConnection(self.host, self.port, timeout=timeout)
         try:
             connection.request(
-                "POST", self.path, json.dumps(options, ensure_ascii=False).encode("utf-8"),
-                {"Authorization": f"Bearer {self._key}", "Content-Type": "application/json"},
+                "POST", self.path, json.dumps(options, ensure_ascii=False).encode("utf-8"), headers,
             )
             response = connection.getresponse()
             if response.status != 200:
@@ -124,8 +143,12 @@ class ExternalAI:
             raw = response.read(MAX_RESPONSE + 1)
             if len(raw) > MAX_RESPONSE:
                 raise ValueError("external_response_size")
-            message = json.loads(raw)["choices"][0]["message"]
-            return json.loads(message["content"])
+            payload = json.loads(raw)
+            if self.anthropic:
+                text = "".join(block.get("text", "") for block in payload["content"] if isinstance(block, dict))
+            else:
+                text = payload["choices"][0]["message"]["content"]
+            return json.loads(text)
         finally:
             connection.close()
 
