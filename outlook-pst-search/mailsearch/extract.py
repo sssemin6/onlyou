@@ -1,5 +1,6 @@
 """Extract searchable text and preserve attachment locations."""
 import io
+import os
 import re
 import shutil
 import subprocess
@@ -20,6 +21,8 @@ MAX_TEXT = 300_000
 MAX_XML_TOTAL = 48 * 1024**2
 MAX_LOCATIONS = 800
 CREATE_FLAGS = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+DOCUMENT_SUFFIXES = {".txt", ".pdf", ".docx", ".xlsx", ".doc", ".xls"}
+LEGACY_SUFFIXES = {".doc": ".docx", ".xls": ".xlsx"}
 
 
 class MailHTML(HTMLParser):
@@ -163,11 +166,44 @@ def office_text(data, suffix):
                     yield f"{sheet.get('name', '시트')}!{cells[0][0]}~{cells[-1][0]}", " | ".join(f"{ref} {value}" for ref, value in cells)
 
 
-def extract_attachment(name, part, temporary, pdf_command):
-    suffix = Path(name).suffix.lower()
+def office_binary():
+    """Locate a read-only LibreOffice converter for legacy DOC/XLS files."""
+    candidates = [shutil.which("soffice"), shutil.which("soffice.exe")]
+    for root in (os.environ.get("PROGRAMFILES"), "C:\\Program Files", "C:\\Program Files (x86)"):
+        if root:
+            candidates.append(Path(root) / "LibreOffice" / "program" / "soffice.exe")
+    for candidate in candidates:
+        if candidate and Path(candidate).is_file():
+            return str(candidate)
+    return None
+
+
+def convert_legacy(source, suffix, temporary):
+    """Convert a legacy Office file to its OOXML form without running the original."""
+    binary = office_binary()
+    if not binary:
+        return None, "변환기 미설치(구형 Office)"
+    with tempfile.TemporaryDirectory(dir=temporary, prefix="convert-") as directory:
+        target = Path(directory) / ("input" + suffix)
+        shutil.copyfile(source, target)
+        try:
+            subprocess.run(
+                [binary, "--headless", "--convert-to", LEGACY_SUFFIXES[suffix], "--outdir", directory, str(target)],
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                timeout=90, check=True, creationflags=CREATE_FLAGS,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None, "추출 실패 또는 암호화"
+        converted = Path(directory) / ("input" + LEGACY_SUFFIXES[suffix])
+        if not converted.is_file():
+            return None, "추출 실패 또는 암호화"
+        return converted.read_bytes(), None
+
+
+def extract_bytes(content, suffix, temporary, pdf_command):
+    """(status, [(location, text)]) for document bytes; never raises."""
     if suffix not in {".txt", ".pdf", ".docx", ".xlsx"}:
         return "미지원 형식", []
-    content = part.get_payload(decode=True)
     if not content:
         return "텍스트 없음", []
     if len(content) > MAX_ATTACHMENT:
@@ -211,3 +247,26 @@ def extract_attachment(name, part, temporary, pdf_command):
     except (ValueError, OSError, KeyError, IndexError, RuntimeError, ET.ParseError,
             zipfile.BadZipFile, subprocess.SubprocessError):
         return "추출 실패 또는 암호화", []
+
+
+def extract_document(path, temporary, pdf_command):
+    """(status, [(location, text)]) for a standalone document file."""
+    suffix = path.suffix.lower()
+    if suffix not in DOCUMENT_SUFFIXES:
+        return "미지원 형식", []
+    if suffix in LEGACY_SUFFIXES:
+        content, failure = convert_legacy(path, suffix, temporary)
+        if content is None:
+            return failure, []
+        return extract_bytes(content, LEGACY_SUFFIXES[suffix], temporary, pdf_command)
+    try:
+        if path.stat().st_size > MAX_ATTACHMENT:
+            return "용량 초과", []
+        content = path.read_bytes()
+    except OSError:
+        return "추출 실패 또는 암호화", []
+    return extract_bytes(content, suffix, temporary, pdf_command)
+
+
+def extract_attachment(name, part, temporary, pdf_command):
+    return extract_bytes(part.get_payload(decode=True), Path(name).suffix.lower(), temporary, pdf_command)
