@@ -367,6 +367,9 @@ class Integration(unittest.TestCase):
         status, data = self.call("/api/search", {"query": "A-17", "filters": {"sender": "buy@example.invalid"}})
         self.assertEqual(status, 200)
         self.assertIn("a-17", data["results"][0]["matched"])
+        snippets = [row["snippet"] for row in data["results"] if row.get("snippet")]
+        self.assertTrue(snippets)
+        self.assertTrue(all("a-17" in snippet.casefold() for snippet in snippets))
         self.assertTrue(any(row.get("similarity") is not None for row in data["results"]))
         subjects = {row["subject"] for row in data["results"]}
         self.assertTrue({"한빛 A-17 출하 일정", "Re: 한빛 A-17 출하 일정"} <= subjects)
