@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="light">
   <meta name="mail-session" content="__LOCAL_SESSION__">
-  <title>보관 메일 검색</title>
+  <title>업무 자료 검색</title>
   <link rel="stylesheet" href="/style.css">
   <script src="/app.js" defer></script>
 </head>
@@ -16,7 +16,7 @@
         <span class="brand-icon" aria-hidden="true">
           <svg viewBox="0 0 24 24" fill="none"><rect x="3.5" y="5.5" width="17" height="13" rx="2"/><path d="m4 7 8 6 8-6"/></svg>
         </span>
-        보관 메일 검색
+        업무 자료 검색
       </div>
       <div class="masthead-actions">
         <span class="local">
@@ -35,32 +35,19 @@
     <main>
       <section class="hero" aria-labelledby="page-title">
         <div class="hero-copy">
-          <h1 id="page-title">필요한 메일을<br><span>다시 찾으세요.</span></h1>
-          <p>품번, 발신자, 기억나는 문장으로 보관 메일을 찾아보세요.</p>
-        </div>
-        <div class="hero-art" aria-hidden="true">
-          <div class="art-orbit"></div>
-          <div class="art-paper art-paper-back"></div>
-          <div class="art-paper art-paper-front">
-            <div class="art-paper-tab"></div>
-            <div class="art-lines"></div>
-          </div>
-          <div class="art-envelope"></div>
-          <div class="art-glass"></div>
-          <div class="art-star">
-            <svg viewBox="0 0 40 40" fill="none"><path d="M20 6v28M6 20h28M10 10l20 20m0-20L10 30"/></svg>
-          </div>
-          <span class="art-plus">+</span>
+          <h1 id="page-title">메일·문서·PCF 검색</h1>
+          <p>자료를 검색하고 AI 답변에 인용된 원문을 확인하세요.</p>
         </div>
       </section>
 
       <div class="tabs" role="tablist" aria-label="검색 대상">
+        <button type="button" id="tab-all" class="tab" role="tab" aria-selected="false">전체</button>
         <button type="button" id="tab-mail" class="tab active" role="tab" aria-selected="true">메일</button>
         <button type="button" id="tab-doc" class="tab" role="tab" aria-selected="false">문서</button>
         <button type="button" id="tab-pcf" class="tab" role="tab" aria-selected="false">PCF</button>
       </div>
 
-      <form id="search-form" class="search-form" role="search" aria-label="보관 메일 검색">
+      <form id="search-form" class="search-form" role="search" aria-label="업무 자료 검색">
         <label for="query" class="search-label">검색어 또는 질문</label>
         <div class="search-line">
           <div class="query-box">
@@ -71,7 +58,7 @@
           <button id="submit-search" class="button primary" name="intent" value="search" type="submit">검색</button>
           <button id="submit-ask" class="button ai-button" name="intent" value="ask" type="submit" title="Ctrl+Enter">
             <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M12 3c.7 4.4 3.6 7.3 8 8-4.4.7-7.3 3.6-8 8-.7-4.4-3.6-7.3-8-8 4.4-.7 7.3-3.6 8-8Zm7 13v5m-2.5-2.5h5"/></svg>
-            AI에게 질문
+            AI 근거 찾기
           </button>
         </div>
         <details class="filters" id="filter-panel">
@@ -82,18 +69,20 @@
           </summary>
           <div class="filter-body">
             <div class="filter-grid">
-              <label data-show="mail document">주제<input id="subject" maxlength="200"></label>
-              <label data-show="mail document">본문<input id="body" maxlength="200"></label>
+              <label>자료 보관함<select id="source"><option value="">전체 보관함</option></select></label>
+              <label data-show="all mail document">제목<input id="subject" maxlength="200"></label>
+              <label data-show="all mail document">본문<input id="body" maxlength="200"></label>
               <label data-show="mail">발신자<input id="sender" maxlength="200"></label>
               <label data-show="mail">수신자<input id="recipient" maxlength="200"></label>
               <label data-show="mail">첨부<select id="attachment"><option value="">전체</option><option value="yes">있음</option><option value="no">없음</option></select></label>
-              <label data-show="mail document">시작일<input id="after" type="date"></label>
-              <label data-show="mail document">종료일<input id="before" type="date"></label>
+              <label data-show="all mail document">시작일<input id="after" type="date"></label>
+              <label data-show="all mail document">종료일<input id="before" type="date"></label>
               <label data-show="pcf">선급<input id="class" maxlength="200" placeholder="예: KR, LR"></label>
               <label data-show="pcf">FLAG<input id="flag" maxlength="200"></label>
               <label data-show="pcf">선주<input id="owner" maxlength="200"></label>
               <label data-show="pcf">호선<input id="hull" maxlength="200" placeholder="예: H2107"></label>
               <label data-show="pcf">도면명<input id="drawing" maxlength="200"></label>
+              <p id="pcf-scope-help" class="filter-hint" hidden>PCF 문서에서 읽은 항목값과 일치하는 자료를 찾습니다.</p>
             </div>
             <button id="clear-filters" type="button" class="text-button" hidden>검색 범위 초기화</button>
           </div>
@@ -105,6 +94,16 @@
 
       <p id="notice" class="notice" role="status"></p>
 
+      <section id="review" class="answer review" aria-labelledby="review-title" hidden>
+        <h2 id="review-title">AI로 보낼 근거</h2>
+        <p id="review-destination" class="review-destination"></p>
+        <p id="review-question" class="review-question"></p>
+        <div id="review-excerpts" class="review-excerpts"></div>
+        <div class="review-actions">
+          <button id="review-cancel" type="button" class="text-button">취소</button>
+          <button id="review-send" type="button" class="button primary">선택한 근거로 답변</button>
+        </div>
+      </section>
       <section id="answer" class="answer" aria-live="polite" hidden></section>
       <section id="result-section" class="result-section" hidden aria-labelledby="result-heading">
         <h2 id="result-heading">검색 결과</h2>
@@ -119,56 +118,23 @@
         </span>
         <h2 id="archive-heading">자료 보관함</h2>
       </div>
-      <section class="source-group" data-kind="mail" aria-label="메일 자료">
-        <h3 class="group-title">메일</h3>
-        <button type="button" class="button add-button group-add" aria-controls="add-form-mail" aria-expanded="false">
-          <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
-          메일 추가
-        </button>
-        <form id="add-form-mail" class="add-form" hidden>
-          <label for="path-mail">PST 또는 EML 폴더 경로</label>
-          <input id="path-mail" placeholder="C:\메일보관\2025.pst 또는 EML 폴더" required spellcheck="false">
-          <button type="submit" class="button small primary">등록</button>
-          <p class="form-message add-notice" role="status"></p>
-        </form>
-        <div class="sources" data-kind="mail" aria-label="등록한 메일 자료"></div>
-      </section>
-      <section class="source-group" data-kind="document" aria-label="문서 자료">
-        <h3 class="group-title">문서</h3>
-        <button type="button" class="button add-button group-add" aria-controls="add-form-doc" aria-expanded="false">
-          <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
-          문서 추가
-        </button>
-        <form id="add-form-doc" class="add-form" hidden>
-          <label for="path-doc">문서 파일 또는 폴더 경로</label>
-          <input id="path-doc" placeholder="문서 폴더 또는 PDF·DOCX·XLSX·TXT 파일" required spellcheck="false">
-          <button type="submit" class="button small primary">등록</button>
-          <p class="form-message add-notice" role="status"></p>
-        </form>
-        <div class="sources" data-kind="document" aria-label="등록한 문서 자료"></div>
-      </section>
-      <section class="source-group" data-kind="pcf" aria-label="PCF 자료">
-        <h3 class="group-title">PCF <span class="group-hint">선주 교신문</span></h3>
-        <button type="button" class="button add-button group-add" aria-controls="add-form-pcf" aria-expanded="false">
-          <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
-          PCF 문서 추가
-        </button>
-        <form id="add-form-pcf" class="add-form" hidden>
-          <label for="path-pcf">PCF 문서 파일 또는 폴더 경로</label>
-          <input id="path-pcf" placeholder="PCF 문서 폴더 또는 파일 (파일명에 PCF가 들어간 문서)" required spellcheck="false">
-          <button type="submit" class="button small primary">등록</button>
-          <p class="form-message add-notice" role="status"></p>
-        </form>
-        <div class="sources" data-kind="pcf" aria-label="등록한 PCF 자료"></div>
-      </section>
+      <button type="button" class="button add-button" id="add-open" aria-controls="add-form" aria-expanded="false">+ 자료 추가</button>
+      <form id="add-form" class="add-form" hidden>
+        <label for="source-path">파일 또는 폴더 경로</label>
+        <input id="source-path" placeholder="C:\업무자료\프로젝트A" required spellcheck="false">
+        <p class="filter-hint">PST·EML, PDF·Word·Excel·TXT 파일을 등록합니다. PCF가 파일명에 있는 문서는 PCF 탭에서 찾을 수 있습니다.</p>
+        <button type="submit" class="button small primary">등록</button>
+        <p class="form-message" id="add-notice" role="status"></p>
+      </form>
+      <div id="sources" class="sources" aria-label="등록한 자료"></div>
       <div class="model-panels">
         <div class="model-panel">
           <span class="model-dot" aria-hidden="true"></span>
-          <p id="model-status">로컬 AI 설정 확인 중</p>
+          <p id="model-status">로컬 의미 검색 확인 중</p>
         </div>
         <div class="model-panel" id="external-panel">
           <span class="model-dot" aria-hidden="true"></span>
-          <p id="external-status">외부 API 연결 전</p>
+          <p id="external-status">답변 API 연결 전</p>
         </div>
       </div>
     </aside>
@@ -177,7 +143,7 @@
   <dialog id="settings-dialog" class="settings-dialog" aria-labelledby="settings-title">
     <form id="settings-form" autocomplete="off">
       <header class="viewer-header">
-        <h2 id="settings-title">외부 AI API 설정</h2>
+        <h2 id="settings-title">AI 답변 API 설정</h2>
         <button type="button" class="square" id="settings-close" aria-label="API 설정 닫기">×</button>
       </header>
       <div class="viewer-content">
@@ -185,7 +151,7 @@
         <div class="settings-fields">
           <label for="settings-url">API 주소</label>
           <input id="settings-url" type="url" maxlength="512" required spellcheck="false" aria-describedby="settings-endpoint-help">
-          <p id="settings-endpoint-help">OpenAI 호환 주소는 /chat/completions로 끝나는 전체 HTTPS 주소를 입력하세요.</p>
+          <p id="settings-endpoint-help">/chat/completions 또는 /messages로 끝나는 전체 HTTPS 주소를 입력하세요.</p>
           <label for="settings-model">모델명</label>
           <input id="settings-model" maxlength="150" required spellcheck="false">
           <label for="settings-key">API 키</label>
