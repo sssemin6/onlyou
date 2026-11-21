@@ -23,6 +23,10 @@ MAX_LOCATIONS = 800
 CREATE_FLAGS = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 DOCUMENT_SUFFIXES = {".txt", ".pdf", ".docx", ".xlsx", ".doc", ".xls"}
 LEGACY_SUFFIXES = {".doc": ".docx", ".xls": ".xlsx"}
+OCR_PAGE_MIN_TEXT = 30   # pdftotext pages shorter than this are scan candidates
+OCR_MIN_RESULT = 20      # shorter OCR output is dropped as low confidence
+OCR_PAGE_LIMIT = 10      # maximum pages OCR'd per file
+OCR_PAGE_TIMEOUT = 30    # seconds per page for rendering and reading
 
 
 class MailHTML(HTMLParser):
@@ -200,6 +204,74 @@ def convert_legacy(source, suffix, temporary):
         return converted.read_bytes(), None
 
 
+def tesseract_binary():
+    """Locate the tesseract OCR engine, honoring MAILSEARCH_TESSERACT first."""
+    candidates = [os.environ.get("MAILSEARCH_TESSERACT"), shutil.which("tesseract"), shutil.which("tesseract.exe")]
+    for root in (os.environ.get("PROGRAMFILES"), "C:\\Program Files", "C:\\Program Files (x86)"):
+        if root:
+            candidates.append(Path(root) / "Tesseract-OCR" / "tesseract.exe")
+    for candidate in candidates:
+        if candidate and Path(candidate).is_file():
+            return str(candidate)
+    return None
+
+
+def pdftoppm_binary():
+    """Locate a page renderer for OCR; Git for Windows ships a portable one."""
+    candidates = [shutil.which("pdftoppm"), shutil.which("pdftoppm.exe")]
+    for root in (os.environ.get("PROGRAMFILES"), "C:\\Program Files", "C:\\Program Files (x86)"):
+        if root:
+            candidates.append(Path(root) / "Git" / "mingw64" / "bin" / "pdftoppm.exe")
+    for candidate in candidates:
+        if candidate and Path(candidate).is_file():
+            return str(candidate)
+    return None
+
+
+def ocr_page(input_pdf, page, renderer, reader):
+    """Render one PDF page and read it: kor+eng, then eng, then the default model."""
+    stem = input_pdf.parent / f"ocr-{page}"
+    try:
+        subprocess.run(
+            [renderer, "-f", str(page), "-l", str(page), "-singlefile", "-r", "200", "-png",
+             str(input_pdf), str(stem)],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            timeout=OCR_PAGE_TIMEOUT, check=True, creationflags=CREATE_FLAGS,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    image = stem.with_suffix(".png")
+    if not image.is_file():
+        return None
+    for language in ("kor+eng", "eng", ""):
+        command = [reader] + (["-l", language] if language else []) + [str(image), "stdout"]
+        try:
+            done = subprocess.run(
+                command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                timeout=OCR_PAGE_TIMEOUT, check=True, creationflags=CREATE_FLAGS,
+            )
+        except (OSError, subprocess.SubprocessError):
+            continue
+        return clean(done.stdout.decode("utf-8", errors="replace"))
+    return None
+
+
+def pdf_pages(input_pdf, pages):
+    """Locate page text; near-empty pages fall back to OCR when tools exist."""
+    locations = [(f"{index}페이지", value) for index, value in enumerate(pages, 1)]
+    scanned = [index for index, value in enumerate(pages, 1) if len(clean(value)) < OCR_PAGE_MIN_TEXT]
+    if not scanned:
+        return locations
+    renderer, reader = pdftoppm_binary(), tesseract_binary()
+    if not renderer or not reader:
+        return locations
+    for page in scanned[:OCR_PAGE_LIMIT]:
+        text = ocr_page(input_pdf, page, renderer, reader)
+        if text is not None and len(text) >= OCR_MIN_RESULT:
+            locations[page - 1] = (f"{page}페이지(OCR)", text)
+    return locations
+
+
 def extract_bytes(content, suffix, temporary, pdf_command):
     """(status, [(location, text)]) for document bytes; never raises."""
     if suffix not in {".txt", ".pdf", ".docx", ".xlsx"}:
@@ -227,7 +299,7 @@ def extract_bytes(content, suffix, temporary, pdf_command):
                 with output_txt.open("rb") as output:
                     buffer = output.read(MAX_TEXT * 4 + 1)
                 pages = buffer[:MAX_TEXT * 4].decode("utf-8", errors="replace").split("\f")
-                locations = [(f"{index}페이지", value) for index, value in enumerate(pages, 1)]
+                locations = pdf_pages(input_pdf, pages)
         else:
             locations = office_text(content, suffix)
         result = []
