@@ -12,7 +12,7 @@
 ### AI 연결
 - 사이드바에 로컬 AI·외부 API 연결 상태 표시(연결 시 모델명 표기).
 - 외부 API 질문(Ctrl+Enter 포함)이 전송 검토 다이얼로그 없이 자동 전송. AI 답변의 "외부 API" 배지 제거.
-- 중앙 임베딩 서버(NAS) 지원: `--embedding-url`, `start.cmd`의 `EMBEDDING_URL`/`EMBEDDING_MODEL` 설정. 추천 모델 `qwen3-embedding:4b`(2.5GB) / 여유 부족 시 `0.6b`(639MB).
+- 임베딩 모델 저장소를 NAS 경로로 지정 가능(`OLLAMA_MODELS`, setup-windows.cmd에서 경로 입력). 각 PC의 Ollama가 NAS의 모델 파일을 읽어 로컬에서 임베딩. 추천 모델 `qwen3-embedding:0.6b`(639MB, bge-m3보다 우수) / 여유 충분 시 `4b`(2.5GB).
 - z.ai 등 Anthropic Messages 호환 게이트웨이 지속 개선(의미 검색 근거 사용).
 
 ### 성능
