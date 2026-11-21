@@ -269,7 +269,14 @@ class Store:
 
     def sources(self):
         with self.connection() as conn:
-            return [dict(row) for row in conn.execute("SELECT * FROM sources ORDER BY id")]
+            # Per-kind item counts feed the sidebar's mail/document/PCF sections.
+            counts = defaultdict(dict)
+            for row in conn.execute(
+                f"SELECT m.source source,m.kind kind,COUNT(*) n FROM mails m {JOIN} GROUP BY m.source,m.kind"
+            ):
+                counts[row["source"]][row["kind"]] = row["n"]
+            return [{**dict(row), "counts": counts.get(row["id"], {})}
+                    for row in conn.execute("SELECT * FROM sources ORDER BY id")]
 
     def allowed_sources(self, source=None):
         ids = []
