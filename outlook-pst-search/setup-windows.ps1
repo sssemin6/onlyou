@@ -62,7 +62,7 @@ if ($answer -eq "n") {
         Start-Sleep -Seconds 3
         Write-Host "모델 저장소를 $answer 로 지정했습니다. 현재 목록:"
         ollama list
-        Write-Host "목록이 비어 있으면 아무 PC 한 대에서 'ollama pull qwen3-embedding:0.6b'를 한 번만 실행하세요."
+        Write-Host "목록이 비어 있으면 아무 PC 한 대에서 'ollama pull bge-m3'를 한 번만 실행하세요."
     } else {
         $running = $false
         try { Invoke-RestMethod "http://127.0.0.1:11434/api/tags" -TimeoutSec 2 | Out-Null; $running = $true } catch {}
@@ -70,8 +70,8 @@ if ($answer -eq "n") {
             Start-Process -WindowStyle Hidden (Get-Command ollama).Source -ArgumentList "serve"
             Start-Sleep -Seconds 3
         }
-        ollama pull qwen3-embedding:0.6b
-        if ($LASTEXITCODE -ne 0) { Write-Host "모델 내려받기에 실패했습니다. 네트워크 상태를 확인하고 'ollama pull qwen3-embedding:0.6b'를 다시 실행하세요." }
+        ollama pull bge-m3
+        if ($LASTEXITCODE -ne 0) { Write-Host "모델 내려받기에 실패했습니다. 네트워크 상태를 확인하고 'ollama pull bge-m3'를 다시 실행하세요." }
     }
 }
 
