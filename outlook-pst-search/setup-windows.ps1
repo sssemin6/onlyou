@@ -38,7 +38,7 @@ if (Test-Path "$PSScriptRoot\vendor\readpst-win64\readpst.exe") {
 }
 
 Write-Host "== 3/3 의미 검색 모델(선택)"
-$answer = Read-Host "임베딩 모델 준비 (Enter=이 PC에 내려받기, n=건너뛰기, 또는 NAS 모델 경로 예: \\nas\ollama\models)"
+$answer = Read-Host "의미 검색용 Ollama를 설치할까요? bge-m3 모델은 저장소에 포함되어 있습니다 (Enter=설치, n=건너뛰기)"
 if ($answer -eq "n") {
     Write-Host "건너뛰었습니다. 일반(키워드) 검색과 외부 API 답변은 그대로 사용할 수 있습니다."
 } else {
@@ -49,30 +49,10 @@ if ($answer -eq "n") {
             Write-Host "자동 설치에 실패했습니다. https://ollama.com 에서 직접 설치한 뒤 다시 실행하세요."
         }
     }
-    $env:Path = "$env:LOCALAPPDATA\Programs\Ollama;$env:Path"
-    if (-not (Get-Command ollama -ErrorAction SilentlyContinue)) {
-        Write-Host "ollama 명령을 찾지 못했습니다. 설치 후 다시 실행하세요."
-    } elseif ($answer) {
-        # 모델 파일은 NAS에 한 벌만 두고 이 PC의 Ollama가 읽어서 임베딩한다.
-        setx OLLAMA_MODELS "$answer" | Out-Null
-        $env:OLLAMA_MODELS = "$answer"
-        Get-Process -Name "ollama*" -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-        Start-Sleep -Seconds 2
-        Start-Process -WindowStyle Hidden "$env:LOCALAPPDATA\Programs\Ollama\ollama.exe" -ArgumentList "serve"
-        Start-Sleep -Seconds 3
-        Write-Host "모델 저장소를 $answer 로 지정했습니다. 현재 목록:"
-        ollama list
-        Write-Host "목록이 비어 있으면 아무 PC 한 대에서 'ollama pull bge-m3'를 한 번만 실행하세요."
-    } else {
-        $running = $false
-        try { Invoke-RestMethod "http://127.0.0.1:11434/api/tags" -TimeoutSec 2 | Out-Null; $running = $true } catch {}
-        if (-not $running) {
-            Start-Process -WindowStyle Hidden (Get-Command ollama).Source -ArgumentList "serve"
-            Start-Sleep -Seconds 3
-        }
-        ollama pull bge-m3
-        if ($LASTEXITCODE -ne 0) { Write-Host "모델 내려받기에 실패했습니다. 네트워크 상태를 확인하고 'ollama pull bge-m3'를 다시 실행하세요." }
-    }
+    # Ollama는 PC 시작 때 자동 실행되지 않게 하고, 앱이 필요할 때만 실행합니다.
+    Remove-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run" -Name "Ollama" -ErrorAction SilentlyContinue
+    Get-Process -Name "ollama app" -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+    Write-Host "Ollama 자동 실행을 해제했습니다. 앱이 임베딩이 필요할 때만 백그라운드로 시작합니다."
 }
 
 Write-Host ""
