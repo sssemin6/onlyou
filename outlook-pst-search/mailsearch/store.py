@@ -557,6 +557,19 @@ class Store:
         found = {row["passage"]: row for row in self.passages(linked[:6], filters)}
         return [found[item] for item in linked[:6] if item in found]
 
+    def neighbors(self, mail, passage, conn=None):
+        """Passages of the same mail or document directly around the given passage."""
+        if conn is None:
+            with self.connection() as conn:
+                return self.neighbors(mail, passage, conn)
+        ids = [row[0] for row in conn.execute("SELECT id FROM passages WHERE mail=? ORDER BY id", (mail,))]
+        try:
+            index = ids.index(passage)
+        except ValueError:
+            return []
+        near = ids[max(0, index - 1):index] + ids[index + 1:index + 2]
+        return self.passages(near, conn=conn) if near else []
+
     def open_passage(self, passage):
         where, params = self.scope({})
         with self.connection() as conn:
