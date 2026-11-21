@@ -14,7 +14,7 @@ Outlook PST 보관 메일을 로컬에서 색인해 검색하고, 원문 인용�
 py -3 -m unittest discover -s tests          # 전체 테스트(변경 후 반드시 통과 확인)
 ```
 
-서버 인자: `--port`(기본 8765), `--readpst`, `--pdftotext`, `--model`(로컬 생성), `--embedding-model`, `--ollama-port`(기본 11435), `--embedding-url`(공유 임베딩 서버, 예: `http://192.168.0.10:11434`). 외부 AI는 `MAILSEARCH_EXTERNAL_URL/MODEL/API_KEY` 환경 변수 또는 GUI API 설정.
+서버 인자: `--port`(기본 8765), `--readpst`, `--pdftotext`, `--model`(로컬 생성), `--embedding-model`, `--ollama-port`(기본 11435). 외부 AI는 `MAILSEARCH_EXTERNAL_URL/MODEL/API_KEY` 환경 변수 또는 GUI API 설정. 임베딩은 항상 각 PC의 루프백 Ollama가 수행하며, 모델 파일 자체는 `OLLAMA_MODELS` 경로(NAS 공유 가능)에 둘 수 있다.
 
 ## 모듈 지도
 
@@ -23,7 +23,7 @@ py -3 -m unittest discover -s tests          # 전체 테스트(변경 후 반�
 | `mailsearch/server.py` | 루프백 HTTP 서버, 라우팅, 세션 토큰, CSP, 외부 API 설정/전송, 검색 질의 하이브리드 병합 |
 | `mailsearch/indexer.py` | 백그라운드 가져오기(단일 워커 스레드), readpst 실행, 버전 원자 스왑, 증분 갱신 |
 | `mailsearch/store.py` | SQLite 스키마(sources/mails/passages/terms/vectors/pst_files), 키워드·의미·정확 검색 |
-| `mailsearch/answer.py` | Ollama 연결(생성=루프백, 임베딩=원격 URL 가능), 근거 검색 `evidence_for`, 답변 검증 `validate` |
+| `mailsearch/answer.py` | 루프백 Ollama 연결(생성·임베딩), 근거 검색 `evidence_for`, 답변 검증 `validate` |
 | `mailsearch/external.py` | 외부 AI 전송(OpenAI 호환 + Anthropic Messages 호환), 발췌문 리뷰 토큰 |
 | `mailsearch/extract.py` | EML 파싱, 첨부 텍스트 추출(PDF/DOCX/XLSX/TXT) |
 | `mailsearch/static/` | UI(`index.html`/`app.js`/`style.css`) |
