@@ -305,6 +305,50 @@ class Integration(unittest.TestCase):
         self.assertEqual(self.call("/api/ping", token=False)[0], 403)
         self.assertEqual(self.call("/api/ping")[0], 200)
 
+    def document_zip(self, documents):
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w") as zipped:
+            for path, data in documents.items():
+                zipped.writestr(path, data)
+        return buffer.getvalue()
+
+    def test_document_folder_registration_opens_cells_and_sections(self):
+        folder = Path(self.workspace.name) / "docs"
+        folder.mkdir()
+        (folder / "요구사항.txt").write_text("A17 브래킷 두께는 진공 성형 조건에서 4T로 확정한다.", encoding="utf-8")
+        (folder / "양산BOM.xlsx").write_bytes(self.document_zip({
+            "xl/workbook.xml": '<workbook xmlns:r="relationship"><sheets><sheet name="양산 BOM" r:id="sheet1"/></sheets></workbook>',
+            "xl/_rels/workbook.xml.rels": '<Relationships><Relationship Id="sheet1" Target="worksheets/sheet1.xml"/></Relationships>',
+            "xl/worksheets/sheet1.xml": '<worksheet><row><c r="F18" t="inlineStr"><is><t>3T</t></is></c></row></worksheet>',
+        }))
+        status, payload = self.call("/api/sources", {"path": str(folder)})
+        self.assertEqual(status, 202)
+        row = await_source(self.store, payload["source"], {"ready", "error", "empty"})
+        self.assertEqual((row["state"], row["done"]), ("ready", 2))
+        found = self.call("/api/search", {"query": '"3T"', "filters": {}})[1]["results"]
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0]["attachment"], "양산BOM.xlsx")
+        evidence = self.call(f"/api/evidence/{found[0]['passage']}")[1]
+        self.assertEqual(evidence["location"], "양산 BOM!F18~F18")
+        self.assertTrue(self.call("/api/search", {"query": "진공 성형 조건에서", "filters": {}})[1]["results"])
+        # Refresh adopts unchanged documents and indexes only the new file.
+        (folder / "개정.txt").write_text("전 모델 4T 적용 제안.", encoding="utf-8")
+        self.call("/api/source-action", {"source": payload["source"], "action": "refresh"})
+        updated = await_source(self.store, payload["source"], {"ready", "error", "empty"})
+        self.assertEqual((updated["state"], updated["done"]), ("ready", 3))
+
+    def test_single_document_file_registration(self):
+        target = Path(self.workspace.name) / "기준서.txt"
+        target.write_text("§4.2 공차는 ±0.05 mm.", encoding="utf-8")
+        status, payload = self.call("/api/sources", {"path": str(target)})
+        self.assertEqual(status, 202)
+        row = await_source(self.store, payload["source"], {"ready", "error", "empty"})
+        self.assertEqual((row["state"], row["done"]), ("ready", 1))
+        found = self.call("/api/search", {"query": "공차", "filters": {}})[1]["results"]
+        self.assertTrue(found)
+        evidence = self.call(f"/api/evidence/{found[0]['passage']}")[1]
+        self.assertIn("±0.05", evidence["text"])
+
     def test_external_review_sends_only_selected_excerpt_once(self):
         self.import_mail()
         question = "한빛 A-17 납품일은 언제 확정됐어?"
