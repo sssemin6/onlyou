@@ -25,7 +25,6 @@ DOCUMENT_SUFFIXES = {".txt", ".pdf", ".docx", ".xlsx", ".doc", ".xls"}
 LEGACY_SUFFIXES = {".doc": ".docx", ".xls": ".xlsx"}
 OCR_PAGE_MIN_TEXT = 30   # pdftotext pages shorter than this are scan candidates
 OCR_MIN_RESULT = 20      # shorter OCR output is dropped as low confidence
-OCR_PAGE_LIMIT = 10      # maximum pages OCR'd per file
 OCR_PAGE_TIMEOUT = 30    # seconds per page for rendering and reading
 
 
@@ -228,7 +227,7 @@ def pdftoppm_binary():
     return None
 
 
-def ocr_page(input_pdf, page, renderer, reader):
+def ocr_page(input_pdf, page, renderer, reader, check):
     """Render one PDF page and read it: kor+eng, then eng, then the default model."""
     stem = input_pdf.parent / f"ocr-{page}"
     try:
@@ -244,6 +243,7 @@ def ocr_page(input_pdf, page, renderer, reader):
     if not image.is_file():
         return None
     for language in ("kor+eng", "eng", ""):
+        check()
         command = [reader] + (["-l", language] if language else []) + [str(image), "stdout"]
         try:
             done = subprocess.run(
@@ -256,23 +256,26 @@ def ocr_page(input_pdf, page, renderer, reader):
     return None
 
 
-def pdf_pages(input_pdf, pages):
+def pdf_pages(input_pdf, pages, check):
     """Locate page text; near-empty pages fall back to OCR when tools exist."""
     locations = [(f"{index}페이지", value) for index, value in enumerate(pages, 1)]
     scanned = [index for index, value in enumerate(pages, 1) if len(clean(value)) < OCR_PAGE_MIN_TEXT]
     if not scanned:
-        return locations
+        return locations, None
     renderer, reader = pdftoppm_binary(), tesseract_binary()
-    if not renderer or not reader:
-        return locations
-    for page in scanned[:OCR_PAGE_LIMIT]:
-        text = ocr_page(input_pdf, page, renderer, reader)
-        if text is not None and len(text) >= OCR_MIN_RESULT:
-            locations[page - 1] = (f"{page}페이지(OCR)", text)
-    return locations
+    completed = 0
+    if renderer and reader:
+        for page in scanned:
+            check()
+            text = ocr_page(input_pdf, page, renderer, reader, check)
+            if text is not None and len(text) >= OCR_MIN_RESULT:
+                locations[page - 1] = (f"{page}페이지(OCR)", text)
+                completed += 1
+    status = f"일부 색인 · OCR {completed}/{len(scanned)}쪽" if completed < len(scanned) else None
+    return locations, status
 
 
-def extract_bytes(content, suffix, temporary, pdf_command):
+def extract_bytes(content, suffix, temporary, pdf_command, *, check=lambda: None):
     """(status, [(location, text)]) for document bytes; never raises."""
     if suffix not in {".txt", ".pdf", ".docx", ".xlsx"}:
         return "미지원 형식", []
@@ -281,6 +284,7 @@ def extract_bytes(content, suffix, temporary, pdf_command):
     if len(content) > MAX_ATTACHMENT:
         return "용량 초과", []
     try:
+        ocr_status = None
         if suffix == ".txt":
             locations = [("본문", decode(content))]
         elif suffix == ".pdf":
@@ -299,7 +303,9 @@ def extract_bytes(content, suffix, temporary, pdf_command):
                 with output_txt.open("rb") as output:
                     buffer = output.read(MAX_TEXT * 4 + 1)
                 pages = buffer[:MAX_TEXT * 4].decode("utf-8", errors="replace").split("\f")
-                locations = pdf_pages(input_pdf, pages)
+                if pages and not pages[-1]:
+                    pages.pop()
+                locations, ocr_status = pdf_pages(input_pdf, pages, check)
         else:
             locations = office_text(content, suffix)
         result = []
@@ -315,13 +321,15 @@ def extract_bytes(content, suffix, temporary, pdf_command):
             limited |= len(text) > remaining
             result.append((location, text[:remaining]))
             remaining -= len(text[:remaining])
-        return ("일부 색인" if limited else "완료") if result else "텍스트 없음", result
+        if not result:
+            return ocr_status or "텍스트 없음", result
+        return ("일부 색인" if limited else ocr_status or "완료"), result
     except (ValueError, OSError, KeyError, IndexError, RuntimeError, ET.ParseError,
             zipfile.BadZipFile, subprocess.SubprocessError):
         return "추출 실패 또는 암호화", []
 
 
-def extract_document(path, temporary, pdf_command):
+def extract_document(path, temporary, pdf_command, *, check=lambda: None):
     """(status, [(location, text)]) for a standalone document file."""
     suffix = path.suffix.lower()
     if suffix not in DOCUMENT_SUFFIXES:
@@ -330,15 +338,15 @@ def extract_document(path, temporary, pdf_command):
         content, failure = convert_legacy(path, suffix, temporary)
         if content is None:
             return failure, []
-        return extract_bytes(content, LEGACY_SUFFIXES[suffix], temporary, pdf_command)
+        return extract_bytes(content, LEGACY_SUFFIXES[suffix], temporary, pdf_command, check=check)
     try:
         if path.stat().st_size > MAX_ATTACHMENT:
             return "용량 초과", []
         content = path.read_bytes()
     except OSError:
         return "추출 실패 또는 암호화", []
-    return extract_bytes(content, suffix, temporary, pdf_command)
+    return extract_bytes(content, suffix, temporary, pdf_command, check=check)
 
 
-def extract_attachment(name, part, temporary, pdf_command):
-    return extract_bytes(part.get_payload(decode=True), Path(name).suffix.lower(), temporary, pdf_command)
+def extract_attachment(name, part, temporary, pdf_command, *, check=lambda: None):
+    return extract_bytes(part.get_payload(decode=True), Path(name).suffix.lower(), temporary, pdf_command, check=check)
