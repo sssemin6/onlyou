@@ -80,6 +80,13 @@
             <button id="clear-filters" type="button" class="text-button" hidden>검색 범위 초기화</button>
           </div>
         </details>
+        <div id="provider-control" class="provider-control" hidden>
+          <label for="provider">답변 제공자</label>
+          <select id="provider">
+            <option value="local" selected>로컬 AI</option>
+            <option value="external">외부 API</option>
+          </select>
+        </div>
         <div id="context" class="context" hidden>
           <span id="context-text"></span><button type="button" id="clear-context" class="text-button">지우기</button>
         </div>
@@ -134,6 +141,31 @@
     </aside>
   </div>
 
+  <dialog id="review-dialog" class="review-dialog" aria-labelledby="review-title">
+    <form id="review-form">
+      <header class="viewer-header">
+        <h2 id="review-title">외부 API 전송 검토</h2>
+        <button type="button" class="square" id="review-close" aria-label="전송 검토 닫기">×</button>
+      </header>
+      <div class="viewer-content">
+        <dl class="viewer-meta">
+          <dt>연결 대상</dt><dd id="review-destination"></dd>
+          <dt>모델</dt><dd id="review-model"></dd>
+        </dl>
+        <p class="review-hint">아래 질문과 선택한 발췌문이 외부 API로 전송됩니다. 민감한 내용이 있는 발췌문은 선택을 해제하세요.</p>
+        <h3>전송할 질문</h3>
+        <pre id="review-question"></pre>
+        <fieldset class="review-fieldset">
+          <legend>전송할 메일 발췌문</legend>
+          <div id="review-excerpts"></div>
+        </fieldset>
+      </div>
+      <footer class="review-actions">
+        <button type="button" id="review-cancel" class="button">취소</button>
+        <button type="submit" id="review-send" class="button primary">외부 API로 보내기</button>
+      </footer>
+    </form>
+  </dialog>
   <dialog id="viewer" aria-labelledby="viewer-title">
     <header class="viewer-header">
       <h2 id="viewer-title">원문</h2>

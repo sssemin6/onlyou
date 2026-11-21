@@ -16,6 +16,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from .answer import LocalAI, delivery_date_answer, evidence_for, public_row, validate
+from .external import MAX_EXCERPTS, ExternalAI, Reviews
 from .filesystem import local_path
 from .indexer import ImportIssue, Indexer
 from .store import Store
@@ -56,9 +57,12 @@ class SessionLock:
 class App(ThreadingHTTPServer):
     daemon_threads = True
 
-    def __init__(self, port, store, indexer, ai):
+    def __init__(self, port, store, indexer, ai, external=None):
         super().__init__(("127.0.0.1", port), Handler)
         self.store, self.indexer, self.ai = store, indexer, ai
+        self.external = external
+        self.reviews = Reviews()
+        self.outbound = threading.BoundedSemaphore(1)
         self.token = secrets.token_urlsafe(32)
         self.generation = threading.BoundedSemaphore(1)
         self.origin = f"http://127.0.0.1:{self.server_port}"
@@ -155,6 +159,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(200, {
                 "sources": [{**row, "available": row["id"] in ids} for row in sources],
                 "model": self.server.ai.model, "embedding": self.server.ai.embedding_model,
+                "external": self.server.external.public if self.server.external else None,
             })
         elif re.fullmatch(r"/api/evidence/\d{1,16}", route.path):
             row = self.server.store.open_passage(int(route.path.rsplit("/", 1)[-1]))
@@ -185,8 +190,10 @@ class Handler(BaseHTTPRequestHandler):
             elif route == "/api/source-action":
                 self.server.indexer.command(int(payload["source"]), payload["action"])
                 self.send_json(202, {})
-            elif route in {"/api/search", "/api/candidates", "/api/answer"}:
+            elif route in {"/api/search", "/api/candidates", "/api/answer", "/api/external/preview"}:
                 self.query(route, payload)
+            elif route == "/api/external/send":
+                self.send_external(payload)
             else:
                 self.send_json(404, {"error": "not_found"})
         except (ValueError, TypeError, KeyError, OverflowError):
@@ -213,7 +220,18 @@ class Handler(BaseHTTPRequestHandler):
         if not query:
             self.send_json(400, {"error": "question_required"})
             return
+        if route == "/api/external/preview" and not self.server.external:
+            self.send_json(403, {"error": "external_disabled"})
+            return
         evidence, mode = evidence_for(store, ai, query, filters, context, semantic=(route == "/api/answer"))
+        if route == "/api/external/preview":
+            token, review = self.server.reviews.create(query, evidence)
+            self.send_json(200, {
+                **self.server.external.public, "review": token, "question": query,
+                "excerpts": [{"id": item.number, "text": item.text} for item in review.excerpts] if review else [],
+                "results": [public_row(row) for row in evidence],
+            })
+            return
         rows = [public_row(row) for row in evidence]
         if route == "/api/candidates":
             self.send_json(200, {"results": rows})
@@ -241,6 +259,48 @@ class Handler(BaseHTTPRequestHandler):
                 self.server.generation.release()
         self.send_json(200, {**result, "results": rows, "retrieval": mode})
 
+    def send_external(self, payload):
+        server = self.server
+        if not server.external:
+            self.send_json(403, {"error": "external_disabled"})
+            return
+        token, selected = payload.get("review"), payload.get("excerpts")
+        if (not isinstance(token, str) or not re.fullmatch(r"[\w-]{32}", token, re.ASCII)
+                or not isinstance(selected, list) or not 1 <= len(selected) <= MAX_EXCERPTS
+                or any(type(number) is not int for number in selected)):
+            raise ValueError("external_review")
+        if not server.outbound.acquire(blocking=False):
+            self.send_json(409, {"error": "external_busy"})
+            return
+        try:
+            review = server.reviews.take(token)
+            if review is None:
+                self.send_json(409, {"error": "external_review_expired"})
+                return
+            excerpts = [item for item in review.excerpts if item.number in selected]
+            if len(excerpts) != len(selected):
+                raise ValueError("external_excerpts")
+            ids = [item.passage for item in excerpts]
+            rows = server.store.passages(ids)
+            if len(rows) != len(ids):
+                self.send_json(409, {"error": "external_source_changed"})
+                return
+            try:
+                result = server.external.answer(review.question, excerpts)
+            except (OSError, ValueError, RuntimeError, KeyError, IndexError, TypeError, http.client.HTTPException):
+                self.send_json(200, {
+                    "status": "external_unavailable", "claims": [], "results": [], "provider": "external",
+                })
+                return
+            visible = {row["passage"]: row for row in server.store.passages(ids)}
+            verified = [{**visible[item.passage], "text": item.text} for item in excerpts if item.passage in visible]
+            checked = validate(result, verified, review.question, text_for=lambda row: row["text"])
+            self.send_json(200, {
+                **checked, "results": [public_row(row) for row in verified], "provider": "external",
+            })
+        finally:
+            server.outbound.release()
+
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Outlook PST mail search on this PC")
@@ -257,13 +317,20 @@ def main(argv=None):
     if not 0 < args.ollama_port < 65536 or not 0 <= args.port < 65536 or args.port == args.ollama_port:
         parser.error("Invalid port configuration")
     try:
+        external = ExternalAI.from_environment()
+    except ValueError:
+        external = None
+        print("External API disabled: check MAILSEARCH_EXTERNAL_MODEL, MAILSEARCH_EXTERNAL_URL and MAILSEARCH_EXTERNAL_API_KEY.", file=sys.stderr)
+    finally:
+        os.environ.pop("MAILSEARCH_EXTERNAL_API_KEY", None)
+    try:
         root = local_path(args.data)
         root.mkdir(mode=0o700, parents=True, exist_ok=True)
         ai = LocalAI(args.model, args.embedding_model, args.ollama_port)
         with SessionLock(root):
             store = Store(root)
             indexer = Indexer(store, args.readpst, args.pdftotext, ai)
-            with App(args.port, store, indexer, ai) as app:
+            with App(args.port, store, indexer, ai, external) as app:
                 indexer.wake()
                 print(app.origin, flush=True)
                 if not args.no_browser:

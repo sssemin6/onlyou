@@ -8,11 +8,13 @@ import threading
 import time
 import unittest
 import zipfile
+from unittest.mock import patch
 from email.message import EmailMessage
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from mailsearch.answer import LocalAI, delivery_date_answer, validate
+from mailsearch.external import ExternalAI, Excerpt, Reviews
 from mailsearch.extract import extract_attachment
 from mailsearch.indexer import Indexer
 from mailsearch.server import App
@@ -114,6 +116,63 @@ class Integration(unittest.TestCase):
         self.assertIsNone(row["issue"])
         self.assertEqual((row["done"], row["omitted"]), (4, 1))
         return source
+
+    def test_external_review_sends_only_selected_excerpt_once(self):
+        self.import_mail()
+        question = "한빛 A-17 납품일은 언제 확정됐어?"
+        query = {"query": question, "context": "이전 질문은 장비 구매 정보입니다."}
+        self.assertEqual(self.call("/api/external/preview", query)[0], 403)
+        self.app.external = ExternalAI("https://api.openai.com/v1/chat/completions", "test-model", "placeholder-token")
+        target = "요청 주신 4월 25일 납품으로 최종 승인합니다."
+        with patch("mailsearch.external.http.client.HTTPSConnection") as https:
+            self.assertEqual(self.call("/api/answer", query)[1]["status"], "answered")
+            status, preview = self.call("/api/external/preview", query)
+            self.assertEqual(status, 200)
+            self.assertGreater(len(preview["excerpts"]), 1)
+            self.assertEqual(preview["question"], question)
+            self.assertNotIn("placeholder-token", json.dumps(self.call("/api/sources")[1]))
+            https.assert_not_called()
+            chosen = next(item for item in preview["excerpts"] if target in item["text"])
+            approval = {"review": preview["review"], "excerpts": [chosen["id"]], "query": "ignored"}
+            self.assertEqual(self.call("/api/external/send", approval, token=False)[0], 403)
+            https.assert_not_called()
+            connection = https.return_value
+            reply = connection.getresponse.return_value
+            reply.status = 200
+            result = {"status": "answered", "claims": [
+                {"text": "최종 승인 납품일은 4월 25일입니다.", "citations": [{"source": chosen["id"], "quote": target}]},
+            ]}
+            reply.read.return_value = json.dumps({"choices": [{"message": {"content": json.dumps(result)}}]}).encode()
+            status, data = self.call("/api/external/send", approval)
+            self.assertEqual(status, 200)
+            self.assertEqual(data["status"], "answered")
+            self.assertEqual(data["provider"], "external")
+            source = data["claims"][0]["citations"][0]["passage"]
+            self.assertIn(target, self.call(f"/api/evidence/{source}")[1]["text"])
+            method, path, body, headers = connection.request.call_args.args
+            self.assertEqual((method, path), ("POST", "/v1/chat/completions"))
+            self.assertEqual(headers["Authorization"], "Bearer placeholder-token")
+            sent = json.loads(body)
+            self.assertFalse(sent["store"])
+            self.assertEqual(sent["model"], "test-model")
+            user_data = json.loads(sent["messages"][1]["content"])
+            self.assertEqual(user_data, {"question": question, "evidence": [{"source": chosen["id"], "text": chosen["text"]}]})
+            self.assertNotIn("buy@example.invalid", sent["messages"][1]["content"])
+            self.assertEqual(self.call("/api/external/send", approval)[0], 409)
+            self.assertEqual(connection.request.call_count, 1)
+
+    def test_external_review_refuses_changed_archive_and_unreviewed_selection(self):
+        self.import_mail()
+        self.app.external = ExternalAI("https://gateway.example.invalid/v1/chat/completions", "test-model", "placeholder-token")
+        query = {"query": "한빛 A-17"}
+        _, bad = self.call("/api/external/preview", query)
+        _, stale = self.call("/api/external/preview", query)
+        with patch("mailsearch.external.http.client.HTTPSConnection") as https:
+            self.assertEqual(self.call("/api/external/send", {"review": bad["review"], "excerpts": [99]})[0], 400)
+            self.mail.rename(self.mail.with_name("moved"))
+            self.assertEqual(self.call("/api/external/send", {"review": stale["review"], "excerpts": [1]})[1]["error"],
+                             "external_source_changed")
+            https.assert_not_called()
 
     def test_fast_and_attachment_search(self):
         source = self.import_mail()
@@ -219,6 +278,41 @@ class Integration(unittest.TestCase):
         self.assertEqual(indexed["failed"], 0)
         self.assertEqual(hashlib.sha256(path.read_bytes()).digest(), original_digest)
         self.assertTrue(self.call("/api/search", {"query": "", "filters": {"source": source}})[1]["results"])
+
+
+class ExternalTransport(unittest.TestCase):
+    def test_https_endpoint_only_and_no_redirect(self):
+        for url in ("http://api.example.invalid/v1/chat/completions",
+                    "https://user@api.example.invalid/v1/chat/completions",
+                    "https://api.example.invalid/v1/chat/completions?key=sample",
+                    "https://api.example.invalid/v1/chat/completions#other",
+                    "https://api.example.invalid/v1/embeddings"):
+            with self.subTest(url=url), self.assertRaises(ValueError):
+                ExternalAI(url, "test", "placeholder-token")
+        ai = ExternalAI("https://gateway.example.invalid/v1/chat/completions", "test", "placeholder-token")
+        with patch("mailsearch.external.http.client.HTTPSConnection") as https:
+            con = https.return_value
+            con.getresponse.return_value.status = 307
+            with self.assertRaises(RuntimeError):
+                ai.answer("테스트", [Excerpt(1, 91, "테스트 근거")])
+            https.assert_called_once_with("gateway.example.invalid", 443, timeout=35)
+            con.request.assert_called_once()
+            con.close.assert_called_once()
+
+    def test_review_expiry_and_size_limits(self):
+        reviews = Reviews()
+        rows = [{"passage": n, "text": "A" * 800 + "불필요한 뒷부분", "location": f"{n}페이지"}
+                for n in range(1, 9)]
+        for row in rows:
+            row["text"] = str(row["passage"]) + row["text"]
+        rows.insert(0, {"passage": 99, "text": "계약서_기밀.pdf", "location": "파일명"})
+        with patch("mailsearch.external.time.monotonic", return_value=100):
+            token, review = reviews.create("질문", rows)
+        self.assertEqual(len(review.excerpts), 5)
+        self.assertEqual(review.excerpts[0].passage, 1)
+        self.assertTrue(all(len(item.text) == 800 for item in review.excerpts))
+        with patch("mailsearch.external.time.monotonic", return_value=401):
+            self.assertIsNone(reviews.take(token))
 
 
 class AttachmentsAndCitations(unittest.TestCase):

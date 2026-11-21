@@ -40,6 +40,28 @@ ollama serve
 
 설정 이전에 등록한 보관함은 **갱신**으로 의미 검색 색인을 생성합니다. 재색인 중 기존 버전으로 검색할 수 있습니다. 앱은 루프백 Ollama 포트에만 연결하고 로컬 목록에서 확인한 모델만 사용합니다. Ollama의 클라우드 기능과 외부 통신은 폐쇄망 방화벽 정책으로도 차단해 주세요.
 
+### 외부 AI API 연결
+
+외부 전송이 허용된 PC에서 OpenAI API 또는 JSON 모드를 지원하는 OpenAI 호환 게이트웨이를 연결할 수 있습니다. 환경 변수에 모델과 키를 설정해 실행하면 **답변 제공자** 메뉴가 나타납니다. 초기 선택은 **로컬 AI**입니다.
+
+아래 예시는 OpenAI의 `gpt-4.1-mini`를 사용합니다. 키는 PowerShell의 입력 화면에 붙여 넣고 Enter로 입력합니다.
+
+```powershell
+$env:MAILSEARCH_EXTERNAL_MODEL = "gpt-4.1-mini"
+$secret = Read-Host "OpenAI API 키" -AsSecureString
+$env:MAILSEARCH_EXTERNAL_API_KEY = [System.Net.NetworkCredential]::new("", $secret).Password
+try {
+    .\start-windows.cmd --readpst "C:\msys64\mingw64\bin\readpst.exe"
+} finally {
+    Remove-Item Env:MAILSEARCH_EXTERNAL_API_KEY -ErrorAction SilentlyContinue
+}
+```
+
+- 기본 주소는 `https://api.openai.com/v1/chat/completions`입니다. 다른 제공자를 쓰려면 `MAILSEARCH_EXTERNAL_URL`에 `/chat/completions`로 끝나는 전체 HTTPS 주소를 지정하고, 해당 제공자의 모델명과 키를 사용합니다. Bearer 인증과 JSON 객체 응답을 지원해야 합니다. 로컬 AI도 함께 쓰려면 기존 `--model`과 `--embedding-model` 옵션을 추가합니다.
+- GUI에서 **외부 API → AI에게 질문**을 선택하면 전송 주소, 모델, 이번 질문, 메일·첨부에서 뽑은 텍스트를 검토할 수 있습니다. 발췌문은 최대 5개, 각 800자입니다. 필요 없는 항목의 선택을 해제하고 **외부 API로 보내기**를 누르면 표시된 질문과 선택한 발췌문이 제공자에게 전송됩니다.
+- 검색, PST 색인, 이전 질문 맥락과 계정·메일의 별도 메타데이터는 로컬에서 처리합니다. 발췌문 안에 이미 포함된 이름, 주소, 본문 정보는 그대로 표시되므로 전송 전에 확인하세요. API 키는 앱 프로세스에서만 사용하며 GUI에는 전달하지 않습니다.
+- 외부 설정을 비워 두면 로컬 모드로 실행됩니다. 외부 API를 쓰면 제공자의 요금과 데이터 처리 정책이 적용됩니다.
+
 ## 해보기
 
 - **검색**은 품번, 발신자, 본문, 첨부명을 찾습니다. 키보드에서 `/`를 누르면 검색창으로 이동합니다. `Enter`로 일반 검색을 실행할 수 있습니다.
