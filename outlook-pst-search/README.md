@@ -12,7 +12,7 @@
 4. 열린 브라우저에서 **보관함 추가**를 누른 뒤, Outlook을 닫고 로컬 디스크에 보관한 PST 경로를 등록합니다. 여러 파일은 한 번씩 등록하거나 PST를 모아 둔 폴더를 등록합니다. 폴더를 등록하면 그 안의 .eml 메일, 모든 PST, 문서 파일(PDF·DOCX·XLSX·TXT)을 함께 가져오며, 빈 PST나 읽을 수 없는 PST는 건너뛰고 누락으로 표시합니다. 문서 파일 하나만 따로 등록할 수도 있습니다. Outlook이 사용하는 데이터 파일 대신 닫혀 있는 PST 사본을 등록하면 파일 교체·갱신 시점을 제어하기 쉽습니다.
 5. 브라우저에서 앱 탭을 모두 닫으면 앱도 종료됩니다(마지막 탭을 닫은 뒤 최대 10여 초 걸릴 수 있습니다). 콘솔로 실행한 경우 **Ctrl+C**로 종료합니다. 진행 중이던 색인은 다음 실행에서 **재개**할 수 있습니다.
 
-인터넷이 막혀 setup-windows.cmd를 쓸 수 없거나 직접 준비하려면 FTS5가 포함된 **SQLite 3.42 이상**을 사용하는 **Python 3.12 이상**을 설치하세요. SQLite 버전은 `py -3 -c "import sqlite3; print(sqlite3.sqlite_version)"`으로 확인합니다. readpst는 저장소의 `vendor\readpst-win64\readpst.exe`를 그대로 쓰거나 [MSYS2 MinGW libpst](https://packages.msys2.org/packages/mingw-w64-x86_64-libpst)에서 직접 준비합니다. 텍스트 PDF 첨부를 색인하려면 [Poppler](https://poppler.freedesktop.org/)의 `pdftotext`도 준비합니다. PowerShell에서 앱 폴더로 이동하고 실행합니다. 도구가 PATH에 있으면 `--readpst`와 `--pdftotext`를 생략할 수 있습니다.
+인터넷이 막혀 setup-windows.cmd를 쓸 수 없거나 직접 준비하려면 FTS5가 포함된 **SQLite 3.42 이상**을 사용하는 **Python 3.12 이상**을 설치하세요. SQLite 버전은 `py -3 -c "import sqlite3; print(sqlite3.sqlite_version)"`으로 확인합니다. readpst는 저장소의 `vendor\readpst-win64\readpst.exe`를 그대로 쓰거나 [MSYS2 MinGW libpst](https://packages.msys2.org/packages/mingw-w64-x86_64-libpst)에서 직접 준비합니다. 텍스트 PDF 첨부를 색인하려면 `pdftotext`가 필요한데, Git for Windows가 설치된 PC에서는 그에 포함된 `pdftotext`를 자동으로 사용하므로 별도 설치가 없어도 됩니다. 없다면 [Poppler](https://poppler.freedesktop.org/)에서 준비합니다. PowerShell에서 앱 폴더로 이동하고 실행합니다. 도구가 PATH에 있으면 `--readpst`와 `--pdftotext`를 생략할 수 있습니다.
 
 ```powershell
 .\start-windows.cmd --readpst "C:\msys64\mingw64\bin\readpst.exe" --pdftotext "C:\tools\poppler\bin\pdftotext.exe"
