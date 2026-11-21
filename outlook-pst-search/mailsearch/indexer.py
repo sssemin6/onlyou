@@ -191,26 +191,33 @@ class Indexer:
             header = stream.read(12)
         return len(header) == 12 and header[:4] == b"!BDN" and header[8:10] == b"SM"
 
-    def import_folder_psts(self, folder, stage, event):
+    def import_folder_psts(self, folder, stage, event, known=None):
         """Also import PST files kept inside a registered mail folder.
 
-        Empty or unreadable PST files are skipped and counted so the rest of the
-        folder still imports; locking and mid-import changes still fail the source.
+        PSTs whose signature matches the last committed import are carried over
+        from that version instead of being re-exported and re-indexed. Empty or
+        unreadable PST files are skipped and counted so the rest of the folder
+        still imports; locking and mid-import changes still fail the source.
         """
-        extras = []
+        extras, carried = [], []
         skipped = 0
+        signatures = {}
         files = sorted(path for path in folder.rglob("*")
                        if path.suffix.lower() == ".pst" and path.is_file() and not path.is_symlink())
         for pst in files:
             self.check(event)
             label = pst.relative_to(folder).as_posix() + "/"
+            signature = read_signature(pst)
+            if (known or {}).get(label) == signature:
+                carried.append(label)
+                signatures[label] = signature
+                continue
             slot = stage / ("pst-" + hashlib.sha1(label.encode("utf-8")).hexdigest()[:16])
             slot.mkdir(parents=True, exist_ok=True, mode=0o700)
             try:
                 with stable_input(pst):
                     if not self.pst_header(pst):
                         raise ImportIssue("pst_invalid")
-                    signature = read_signature(pst)
                     output = self.export(pst, slot, event)
                     if read_signature(pst) != signature:
                         raise ImportIssue("changed")
@@ -222,7 +229,8 @@ class Indexer:
                     continue
                 raise
             extras.append((output, label))
-        return extras, skipped
+            signatures[label] = signature
+        return extras, carried, skipped, signatures
 
     def export(self, path, stage, event):
         output = stage / "eml"
@@ -276,7 +284,7 @@ class Indexer:
                     yield path, relative.as_posix(), "/" + ("" if relative.parent == Path(".") else relative.parent.as_posix())
 
     def process(self, row, event):
-        source, version = row["id"], row["pending"]
+        source, version, previous = row["id"], row["pending"], row["active"]
         path = Path(row["path"])
         stage = self.spool / str(source) / str(version)
         stage.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -291,7 +299,7 @@ class Indexer:
             conn.execute("UPDATE sources SET signature=?,state='extracting' WHERE id=? AND state='queued'", (signature, source))
         self.check(event)
         is_pst = row["kind"] == "pst"
-        extras = ()
+        extras, carried, signatures = (), (), None
         if is_pst:
             try:
                 with stable_input(path):
@@ -307,13 +315,15 @@ class Indexer:
         else:
             root = path
             if path.is_dir():
-                extras, skipped_psts = self.import_folder_psts(path, stage, event)
+                extras, carried, skipped_psts, signatures = self.import_folder_psts(
+                    path, stage, event, self.store.pst_files(source))
                 if skipped_psts:
                     with self.store.connection() as conn:
                         conn.execute("UPDATE sources SET omitted=omitted+? WHERE id=?", (skipped_psts, source))
         self.check(event)
         self.state(source, "headers")
-        self.index_headers(root, source, version, event, numbered=is_pst, extras=extras)
+        self.index_headers(root, source, version, event, numbered=is_pst, extras=extras,
+                           previous=previous, carried=carried)
         self.check(event)
         progress = self.store.source(source)
         empty_eml = progress["done"] == 0 and not progress["failed"] and not is_pst
@@ -337,6 +347,8 @@ class Indexer:
                 )
                 conn.execute("DELETE FROM mails WHERE source=? AND version<>?", (source, version))
                 conn.execute("DELETE FROM problems WHERE source=? AND version<>?", (source, version))
+                if signatures is not None:
+                    self.store.save_pst_files(conn, source, signatures)
         shutil.rmtree(stage, ignore_errors=True)
 
     def scan_entries(self, root, *, numbered, extras=()):
@@ -354,9 +366,16 @@ class Indexer:
                 return output / item[len(prefix):]
         return root / item
 
-    def index_headers(self, root, source, version, event, *, numbered=False, extras=()):
+    def index_headers(self, root, source, version, event, *, numbered=False, extras=(), previous=None, carried=()):
         with self.store.connection() as conn:
             batch = 0
+            for prefix in carried:
+                self.check(event)
+                adopted = self.store.carry_prefix(conn, source, previous, version, prefix)
+                if adopted:
+                    conn.execute("UPDATE sources SET done=done+? WHERE id=?", (adopted, source))
+                    batch += adopted
+                    conn.commit()
             for path, item, folder in self.scan_entries(root, numbered=numbered, extras=extras):
                 self.check(event)
                 if conn.execute("SELECT 1 FROM mails WHERE source=? AND version=? AND item=?", (source, version, item)).fetchone():
@@ -369,7 +388,8 @@ class Indexer:
                     conn.execute("INSERT INTO problems VALUES(?,?,?,'parse')", (source, version, item))
                     conn.execute("UPDATE sources SET failed=failed+1 WHERE id=?", (source,))
                 else:
-                    self.store.add_mail(conn, source, version, item, mail)
+                    if previous is None or not self.store.try_adopt(conn, source, previous, version, item, mail):
+                        self.store.add_mail(conn, source, version, item, mail)
                     conn.execute("UPDATE sources SET done=done+1 WHERE id=?", (source,))
                 batch += 1
                 if batch % 32 == 0:
