@@ -421,6 +421,89 @@ class Integration(unittest.TestCase):
             citation = claim["citations"][0]
             self.assertEqual(self.call(f"/api/evidence/{citation['passage']}")[0], 200)
 
+    def test_design_numeric_difference_short_circuits_external(self):
+        folder = Path(self.workspace.name) / "numeric"
+        folder.mkdir()
+        (folder / "계측.xlsx").write_bytes(self.document_zip({
+            "xl/workbook.xml": '<workbook xmlns:r="relationship"><sheets><sheet name="계측" r:id="sheet1"/></sheets></workbook>',
+            "xl/_rels/workbook.xml.rels": '<Relationships><Relationship Id="sheet1" Target="worksheets/sheet1.xml"/></Relationships>',
+            "xl/worksheets/sheet1.xml": '<worksheet><row><c r="B5" t="inlineStr"><is><t>변형 0.18 mm</t></is></c></row>'
+                                         '<row><c r="B6" t="inlineStr"><is><t>허용 0.20 mm</t></is></c></row></worksheet>',
+        }))
+        _, payload = self.call("/api/sources", {"path": str(folder)})
+        row = await_source(self.store, payload["source"], {"ready", "error", "empty"})
+        self.assertEqual((row["state"], row["done"]), ("ready", 1))
+        self.app.external = ExternalAI("https://api.example.invalid/v1/chat/completions",
+                                       "test-model", "placeholder-token")
+        query = {"query": "A17 변형과 허용 값의 차이는 몇 mm인가?", "filters": {}}
+        _, preview = self.call("/api/design/preview", query)
+        with patch("mailsearch.external.http.client.HTTPSConnection") as https:
+            status, data = self.call("/api/design/send",
+                {"review": preview["review"], "excerpts": [item["id"] for item in preview["excerpts"]]})
+            https.assert_not_called()
+        self.assertEqual(status, 200)
+        self.assertEqual(data["status"], "answered")
+        self.assertIn("0.02 mm", data["claims"][0]["text"])
+        self.assertEqual(len(data["claims"][0]["citations"]), 2)
+        for citation in data["claims"][0]["citations"]:
+            self.assertEqual(self.call(f"/api/evidence/{citation['passage']}")[0], 200)
+
+    def test_design_preview_optional_rerank(self):
+        self.import_mail()
+        self.app.external = ExternalAI("https://api.example.invalid/v1/chat/completions",
+                                       "test-model", "placeholder-token")
+        query = {"query": "한빛 납품 승인", "filters": {}}
+        _, baseline = self.call("/api/design/preview", query)
+        self.assertTrue(baseline["results"])
+        top = [row["passage"] for row in baseline["results"][:10]]
+        with patch("mailsearch.external.http.client.HTTPSConnection") as https:
+            connection = https.return_value
+            reply = connection.getresponse.return_value
+            reply.status = 200
+            reply.read.return_value = json.dumps(
+                {"choices": [{"message": {"content": json.dumps({"order": list(reversed(top))})}}]}).encode()
+            status, preview = self.call("/api/design/preview", {**query, "rerank": True})
+            self.assertEqual(status, 200)
+            self.assertEqual([row["passage"] for row in preview["results"][:len(top)]], list(reversed(top)))
+            self.assertEqual(connection.request.call_count, 1)
+
+    def test_design_scope_limits_sources(self):
+        self.import_mail()
+        folder = self.design_corpus()
+        _, payload = self.call("/api/sources", {"path": str(folder)})
+        await_source(self.store, payload["source"], {"ready", "error", "empty"})
+        self.app.external = ExternalAI("https://api.example.invalid/v1/chat/completions",
+                                       "test-model", "placeholder-token")
+        _, preview = self.call("/api/design/preview",
+            {"query": "A17 브래킷 두께 변경 이력", "filters": {"source": payload["source"]}})
+        self.assertTrue(preview["results"])
+        self.assertTrue(all(row["source"] == payload["source"] for row in preview["results"]))
+
+    def test_saved_design_decision_flags_recheck(self):
+        folder = self.design_corpus()
+        _, payload = self.call("/api/sources", {"path": str(folder)})
+        source = payload["source"]
+        await_source(self.store, source, {"ready", "error", "empty"})
+        self.app.external = ExternalAI("https://api.example.invalid/v1/chat/completions",
+                                       "test-model", "placeholder-token")
+        _, preview = self.call("/api/design/preview", {"query": "A17 두께 이력", "filters": {}})
+        passages = [row["passage"] for row in preview["results"]][:3]
+        status, saved = self.call("/api/decisions", {"question": "A17 두께 이력",
+                                                     "claims": [{"text": "기록", "citations": []}], "passages": passages})
+        self.assertEqual(status, 200)
+        listed = self.call("/api/decisions")[1]["decisions"]
+        self.assertEqual(len(listed), 1)
+        self.assertEqual(listed[0]["review"], "ok")
+        for name in ("A17 시험보고서.txt", "승인.eml", "양산BOM RevC.xlsx", "개정초안.docx"):
+            with (folder / name).open("ab") as stream:
+                stream.write(b" revised")
+        self.call("/api/source-action", {"source": source, "action": "refresh"})
+        await_source(self.store, source, {"ready", "error", "empty"})
+        listed = self.call("/api/decisions")[1]["decisions"]
+        self.assertEqual(listed[0]["review"], "recheck")
+        self.call("/api/decisions", {"action": "remove", "id": listed[0]["id"]})
+        self.assertEqual(self.call("/api/decisions")[1]["decisions"], [])
+
     def test_external_review_sends_only_selected_excerpt_once(self):
         self.import_mail()
         question = "한빛 A-17 납품일은 언제 확정됐어?"
