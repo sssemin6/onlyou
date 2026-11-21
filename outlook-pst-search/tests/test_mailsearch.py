@@ -349,8 +349,8 @@ class Integration(unittest.TestCase):
         evidence = self.call(f"/api/evidence/{found[0]['passage']}")[1]
         self.assertIn("±0.05", evidence["text"])
 
-    def design_corpus(self):
-        """The PRD 02 section-5 acceptance corpus: report, approval mail, BOM, draft."""
+    def mixed_corpus(self):
+        """A mixed corpus: one mail plus three documents."""
         folder = Path(self.workspace.name) / "design"
         folder.mkdir()
         (folder / "A17 시험보고서.txt").write_text(
@@ -372,117 +372,10 @@ class Integration(unittest.TestCase):
             "word/document.xml": "<document><p><r><t>A17 전 모델 4T 적용 제안 초안입니다.</t></r></p></document>"}))
         return folder
 
-    def test_design_history_question_acceptance_scenario(self):
-        folder = self.design_corpus()
-        status, payload = self.call("/api/sources", {"path": str(folder)})
-        self.assertEqual(status, 202)
-        row = await_source(self.store, payload["source"], {"ready", "error", "empty"})
-        self.assertEqual((row["state"], row["done"]), ("ready", 4))
-        query = {"query": "A17 브래킷 두께가 왜 바뀌었고 양산에도 적용됐나?", "filters": {}}
-        self.assertEqual(self.call("/api/design/preview", query)[0], 403)
-        self.app.external = ExternalAI("https://api.example.invalid/v1/chat/completions",
-                                       "test-model", "placeholder-token")
-        status, preview = self.call("/api/design/preview", query)
-        self.assertEqual(status, 200)
-        texts = " ".join(item["text"] for item in preview["excerpts"])
-        self.assertIn("시제품만 4T", texts)
-        self.assertIn("3T", texts)
-        self.assertIn("제안 초안", texts)
-        self.assertIn("0.18", texts)
-        with patch("mailsearch.external.http.client.HTTPSConnection") as https:
-            connection = https.return_value
-            reply = connection.getresponse.return_value
-            reply.status = 200
-            def excerpt_with(fragment):
-                return next(item for item in preview["excerpts"] if fragment in item["text"])
-            prototype, bom, draft, report = (excerpt_with("시제품만 4T"), excerpt_with("3T"),
-                                             excerpt_with("초안"), excerpt_with("0.18"))
-            result = {"status": "answered", "claims": [
-                {"text": "시제품 4T 적용은 승인되었습니다.",
-                 "citations": [{"source": prototype["id"], "quote": "시제품만 4T 적용을 승인합니다."}]},
-                {"text": "양산 BOM Rev.C의 두께는 3T입니다.",
-                 "citations": [{"source": bom["id"], "quote": "F18 3T"}]},
-                {"text": "전 모델 4T는 개정 초안 제안이며, 양산 4T 적용 승인은 확인되지 않습니다.",
-                 "citations": [{"source": draft["id"], "quote": "전 모델 4T 적용 제안 초안입니다."}]},
-                {"text": "시험 보고서 12쪽의 최대 변형량은 0.18 mm입니다.",
-                 "citations": [{"source": report["id"], "quote": "12쪽: 변형 발생 최대 0.18 mm"}]},
-                {"text": "양산 4T 적용이 승인되었습니다.",
-                 "citations": [{"source": prototype["id"], "quote": "시제품만 4T 적용을 승인합니다."}]},
-            ]}
-            reply.read.return_value = json.dumps(
-                {"choices": [{"message": {"content": json.dumps(result, ensure_ascii=False)}}]}).encode()
-            status, data = self.call("/api/design/send",
-                {"review": preview["review"], "excerpts": [item["id"] for item in preview["excerpts"]]})
-        self.assertEqual(status, 200)
-        self.assertEqual(data["status"], "partial")  # the unproven 양산 approval claim is dropped
-        self.assertEqual(len(data["claims"]), 4)
-        self.assertFalse(any("양산 4T 적용이 승인" in claim["text"] for claim in data["claims"]))
-        for claim in data["claims"]:
-            citation = claim["citations"][0]
-            self.assertEqual(self.call(f"/api/evidence/{citation['passage']}")[0], 200)
-
-    def test_design_numeric_difference_short_circuits_external(self):
-        folder = Path(self.workspace.name) / "numeric"
-        folder.mkdir()
-        (folder / "계측.xlsx").write_bytes(self.document_zip({
-            "xl/workbook.xml": '<workbook xmlns:r="relationship"><sheets><sheet name="계측" r:id="sheet1"/></sheets></workbook>',
-            "xl/_rels/workbook.xml.rels": '<Relationships><Relationship Id="sheet1" Target="worksheets/sheet1.xml"/></Relationships>',
-            "xl/worksheets/sheet1.xml": '<worksheet><row><c r="B5" t="inlineStr"><is><t>변형 0.18 mm</t></is></c></row>'
-                                         '<row><c r="B6" t="inlineStr"><is><t>허용 0.20 mm</t></is></c></row></worksheet>',
-        }))
-        _, payload = self.call("/api/sources", {"path": str(folder)})
-        row = await_source(self.store, payload["source"], {"ready", "error", "empty"})
-        self.assertEqual((row["state"], row["done"]), ("ready", 1))
-        self.app.external = ExternalAI("https://api.example.invalid/v1/chat/completions",
-                                       "test-model", "placeholder-token")
-        query = {"query": "A17 변형과 허용 값의 차이는 몇 mm인가?", "filters": {}}
-        _, preview = self.call("/api/design/preview", query)
-        with patch("mailsearch.external.http.client.HTTPSConnection") as https:
-            status, data = self.call("/api/design/send",
-                {"review": preview["review"], "excerpts": [item["id"] for item in preview["excerpts"]]})
-            https.assert_not_called()
-        self.assertEqual(status, 200)
-        self.assertEqual(data["status"], "answered")
-        self.assertIn("0.02 mm", data["claims"][0]["text"])
-        self.assertEqual(len(data["claims"][0]["citations"]), 2)
-        for citation in data["claims"][0]["citations"]:
-            self.assertEqual(self.call(f"/api/evidence/{citation['passage']}")[0], 200)
-
-    def test_design_preview_optional_rerank(self):
-        self.import_mail()
-        self.app.external = ExternalAI("https://api.example.invalid/v1/chat/completions",
-                                       "test-model", "placeholder-token")
-        query = {"query": "한빛 납품 승인", "filters": {}}
-        _, baseline = self.call("/api/design/preview", query)
-        self.assertTrue(baseline["results"])
-        top = [row["passage"] for row in baseline["results"][:10]]
-        with patch("mailsearch.external.http.client.HTTPSConnection") as https:
-            connection = https.return_value
-            reply = connection.getresponse.return_value
-            reply.status = 200
-            reply.read.return_value = json.dumps(
-                {"choices": [{"message": {"content": json.dumps({"order": list(reversed(top))})}}]}).encode()
-            status, preview = self.call("/api/design/preview", {**query, "rerank": True})
-            self.assertEqual(status, 200)
-            self.assertEqual([row["passage"] for row in preview["results"][:len(top)]], list(reversed(top)))
-            self.assertEqual(connection.request.call_count, 1)
-
-    def test_design_scope_limits_sources(self):
-        self.import_mail()
-        folder = self.design_corpus()
-        _, payload = self.call("/api/sources", {"path": str(folder)})
-        await_source(self.store, payload["source"], {"ready", "error", "empty"})
-        self.app.external = ExternalAI("https://api.example.invalid/v1/chat/completions",
-                                       "test-model", "placeholder-token")
-        _, preview = self.call("/api/design/preview",
-            {"query": "A17 브래킷 두께 변경 이력", "filters": {"source": payload["source"]}})
-        self.assertTrue(preview["results"])
-        self.assertTrue(all(row["source"] == payload["source"] for row in preview["results"]))
-
     def test_search_tab_scopes_mail_and_documents(self):
         """메일 탭은 문서를, 문서 탭은 메일을 검색하지 않는다."""
         self.import_mail()
-        folder = self.design_corpus()
+        folder = self.mixed_corpus()
         _, payload = self.call("/api/sources", {"path": str(folder)})
         await_source(self.store, payload["source"], {"ready", "error", "empty"})
         query = {"query": "A17", "filters": {"tab": "mail"}}
@@ -513,9 +406,14 @@ class Integration(unittest.TestCase):
         self.assertTrue(documents["results"])
         self.assertTrue(all(row["kind"] == "document" for row in documents["results"]))
         self.assertFalse(any("PCF" in row["subject"] for row in documents["results"]))
+        # PCF 전용 범위(호선)는 파일명·본문 텍스트 매칭으로 좁힌다(데이터화 전 임시 동작).
+        _, other_hull = self.call("/api/search", {"query": "", "filters": {"tab": "pcf", "hull": "H9999"}})
+        self.assertFalse(other_hull["results"])
+        _, this_hull = self.call("/api/search", {"query": "", "filters": {"tab": "pcf", "hull": "H2107"}})
+        self.assertTrue(any("PCF-H2107" in row["subject"] for row in this_hull["results"]))
         self.app.external = ExternalAI("https://api.example.invalid/v1/chat/completions",
                                        "test-model", "placeholder-token")
-        _, preview = self.call("/api/design/preview", {"query": "밸브 등급 상향 COMMENT 처리", "filters": {"tab": "pcf"}})
+        _, preview = self.call("/api/pcf/preview", {"query": "밸브 등급 상향 COMMENT 처리", "filters": {"tab": "pcf"}})
         self.assertTrue(preview["results"])
         self.assertTrue(all(row["kind"] == "pcf" for row in preview["results"]))
         with patch("mailsearch.external.http.client.HTTPSConnection") as https:
@@ -528,7 +426,7 @@ class Integration(unittest.TestCase):
                             "citations": [{"source": preview["excerpts"][0]["id"],
                                            "quote": "현 설계 유지"}]}],
             }, ensure_ascii=False)}}]}).encode()
-            status, data = self.call("/api/design/send",
+            status, data = self.call("/api/pcf/send",
                 {"review": preview["review"], "excerpts": [item["id"] for item in preview["excerpts"]]})
             self.assertEqual(status, 200)
             body = connection.request.call_args[0][2]
@@ -540,7 +438,7 @@ class Integration(unittest.TestCase):
     def test_sources_report_kind_counts(self):
         """사이드바 섹션 구분을 위한 소스별 종류 카운트."""
         self.import_mail()
-        folder = self.design_corpus()
+        folder = self.mixed_corpus()
         _, payload = self.call("/api/sources", {"path": str(folder)})
         await_source(self.store, payload["source"], {"ready", "error", "empty"})
         rows = self.call("/api/sources")[1]["sources"]
