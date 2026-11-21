@@ -173,6 +173,38 @@ class Integration(unittest.TestCase):
             self.assertEqual((status, response["error"]), (409, "external_review_expired"))
             https.assert_not_called()
 
+    def test_folder_registration_imports_contained_pst(self):
+        folder = Path(self.workspace.name) / "pst-folder"
+        folder.mkdir()
+        (folder / "보관.pst").write_bytes(b"!BDN\x00\x00\x00\x00SM\x00\x00")
+
+        def fake_export(pst, stage, event):
+            message = EmailMessage()
+            message["From"] = "a@example.invalid"
+            message["To"] = "b@example.invalid"
+            message["Subject"] = "폴더 PST 시험"
+            message["Message-ID"] = "<folder-pst@example.invalid>"
+            message.set_content("폴더 안 PST에서 꺼낸 메일입니다.")
+            message.add_attachment("공급가 320000원.".encode(), maintype="text", subtype="plain", filename="견적.txt")
+            output = stage / "eml"
+            output.mkdir(parents=True)
+            (output / "1").write_bytes(message.as_bytes())
+            (stage / "export-complete").touch()
+            return output
+
+        with patch.object(Indexer, "export", side_effect=fake_export):
+            status, payload = self.call("/api/sources", {"path": str(folder)})
+            self.assertEqual(status, 202)
+            row = await_source(self.store, payload["source"], {"ready", "error", "empty"})
+            self.assertEqual(row["state"], "ready")
+        status, found = self.call("/api/search", {"query": "폴더 안 PST에서", "filters": {}})
+        self.assertEqual(status, 200)
+        self.assertTrue(found["results"])
+        self.assertTrue(found["results"][0]["folder"].startswith("/보관.pst/"))
+        status, attachment = self.call("/api/search", {"query": "320000원", "filters": {}})
+        self.assertEqual(status, 200)
+        self.assertTrue(attachment["results"])
+
     def test_external_review_sends_only_selected_excerpt_once(self):
         self.import_mail()
         question = "한빛 A-17 납품일은 언제 확정됐어?"
