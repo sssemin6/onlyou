@@ -71,6 +71,25 @@ class App(ThreadingHTTPServer):
         self.last_seen = 0.0
 
 
+SNIPPET_SPLIT = re.compile(r"(?<=[.!?])\s+|\n+")
+
+
+def best_snippet(text, tokens, size=170):
+    """The sentence carrying the most query tokens, so results show why they matched."""
+    if not tokens or not text:
+        return None
+    lowered = [token.casefold() for token in tokens]
+    best, best_hits = None, 0
+    for sentence in SNIPPET_SPLIT.split(text):
+        hits = sum(1 for token in lowered if token in sentence.casefold())
+        if hits > best_hits:
+            best, best_hits = sentence, hits
+    if best is None:
+        return None
+    best = best.strip()
+    return best[:size] + ("…" if len(best) > size else "")
+
+
 def filters_from(get):
     filters = {}
     for name in ("sender", "recipient", "subject", "body"):
@@ -246,7 +265,9 @@ class Handler(BaseHTTPRequestHandler):
                     shown["similarity"] = round(row["similarity"], 3)
                 if shown.get("matched") is None:
                     haystack = normalized(f"{row['subject']} {row['text']}")
-                    shown["matched"] = [token for token in tokens if normalized(token) in haystack]
+                    matched = [token for token in tokens if normalized(token) in haystack]
+                    shown["matched"] = matched
+                    shown["snippet"] = best_snippet(row["text"], matched)
             self.send_json(200, {"results": list(distinct.values())[:20]})
             return
         if not query:
