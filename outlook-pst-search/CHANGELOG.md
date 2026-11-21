@@ -28,6 +28,7 @@
 
 ### 배포·UI
 - readpst 0.6.76 휴대용 번들(`vendor/readpst-win64`) 저장소 포함 — MSYS2 수동 설치 불필요.
+- Git for Windows에 포함된 pdftotext 자동 탐지 — PDF 색인을 위해 별도 설치가 필요 없는 경우가 많음.
 - `setup-windows.cmd` 첫 실행 자동 구성(파이썬 winget 설치, 번들 readpst 확인, Ollama 선택), `start.cmd` 원클릭 실행.
 - `Ctrl+Enter` AI 질문 단축키(Enter=일반 검색), "검색 시작하기" 카드 제거.
 - `start.vbs` 창 없는 실행, 브라우저 탭을 모두 닫으면 앱 자동 종료.
