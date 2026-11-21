@@ -349,6 +349,78 @@ class Integration(unittest.TestCase):
         evidence = self.call(f"/api/evidence/{found[0]['passage']}")[1]
         self.assertIn("±0.05", evidence["text"])
 
+    def design_corpus(self):
+        """The PRD 02 section-5 acceptance corpus: report, approval mail, BOM, draft."""
+        folder = Path(self.workspace.name) / "design"
+        folder.mkdir()
+        (folder / "A17 시험보고서.txt").write_text(
+            "A17 브래킷 진동 시험 결과. 12쪽: 변형 발생 최대 0.18 mm, 허용 값 0.20 mm.", encoding="utf-8")
+        approved = EmailMessage()
+        approved["From"] = "review@example.invalid"
+        approved["To"] = "design@example.invalid"
+        approved["Subject"] = "Re: A17 브래킷 두께 변경 승인"
+        approved["Date"] = "03 May 2026 10:00:00 +0900"
+        approved["Message-ID"] = "<approve-a17@example.invalid>"
+        approved.set_content("A17 브래킷 두께 변경, 시제품만 4T 적용을 승인합니다.")
+        (folder / "승인.eml").write_bytes(approved.as_bytes())
+        (folder / "양산BOM RevC.xlsx").write_bytes(self.document_zip({
+            "xl/workbook.xml": '<workbook xmlns:r="relationship"><sheets><sheet name="양산 BOM" r:id="sheet1"/></sheets></workbook>',
+            "xl/_rels/workbook.xml.rels": '<Relationships><Relationship Id="sheet1" Target="worksheets/sheet1.xml"/></Relationships>',
+            "xl/worksheets/sheet1.xml": '<worksheet><row><c r="F18" t="inlineStr"><is><t>3T</t></is></c></row></worksheet>',
+        }))
+        (folder / "개정초안.docx").write_bytes(self.document_zip({
+            "word/document.xml": "<document><p><r><t>A17 전 모델 4T 적용 제안 초안입니다.</t></r></p></document>"}))
+        return folder
+
+    def test_design_history_question_acceptance_scenario(self):
+        folder = self.design_corpus()
+        status, payload = self.call("/api/sources", {"path": str(folder)})
+        self.assertEqual(status, 202)
+        row = await_source(self.store, payload["source"], {"ready", "error", "empty"})
+        self.assertEqual((row["state"], row["done"]), ("ready", 4))
+        query = {"query": "A17 브래킷 두께가 왜 바뀌었고 양산에도 적용됐나?", "filters": {}}
+        self.assertEqual(self.call("/api/design/preview", query)[0], 403)
+        self.app.external = ExternalAI("https://api.example.invalid/v1/chat/completions",
+                                       "test-model", "placeholder-token")
+        status, preview = self.call("/api/design/preview", query)
+        self.assertEqual(status, 200)
+        texts = " ".join(item["text"] for item in preview["excerpts"])
+        self.assertIn("시제품만 4T", texts)
+        self.assertIn("3T", texts)
+        self.assertIn("제안 초안", texts)
+        self.assertIn("0.18", texts)
+        with patch("mailsearch.external.http.client.HTTPSConnection") as https:
+            connection = https.return_value
+            reply = connection.getresponse.return_value
+            reply.status = 200
+            def excerpt_with(fragment):
+                return next(item for item in preview["excerpts"] if fragment in item["text"])
+            prototype, bom, draft, report = (excerpt_with("시제품만 4T"), excerpt_with("3T"),
+                                             excerpt_with("초안"), excerpt_with("0.18"))
+            result = {"status": "answered", "claims": [
+                {"text": "시제품 4T 적용은 승인되었습니다.",
+                 "citations": [{"source": prototype["id"], "quote": "시제품만 4T 적용을 승인합니다."}]},
+                {"text": "양산 BOM Rev.C의 두께는 3T입니다.",
+                 "citations": [{"source": bom["id"], "quote": "F18 3T"}]},
+                {"text": "전 모델 4T는 개정 초안 제안이며, 양산 4T 적용 승인은 확인되지 않습니다.",
+                 "citations": [{"source": draft["id"], "quote": "전 모델 4T 적용 제안 초안입니다."}]},
+                {"text": "시험 보고서 12쪽의 최대 변형량은 0.18 mm입니다.",
+                 "citations": [{"source": report["id"], "quote": "12쪽: 변형 발생 최대 0.18 mm"}]},
+                {"text": "양산 4T 적용이 승인되었습니다.",
+                 "citations": [{"source": prototype["id"], "quote": "시제품만 4T 적용을 승인합니다."}]},
+            ]}
+            reply.read.return_value = json.dumps(
+                {"choices": [{"message": {"content": json.dumps(result, ensure_ascii=False)}}]}).encode()
+            status, data = self.call("/api/design/send",
+                {"review": preview["review"], "excerpts": [item["id"] for item in preview["excerpts"]]})
+        self.assertEqual(status, 200)
+        self.assertEqual(data["status"], "partial")  # the unproven 양산 approval claim is dropped
+        self.assertEqual(len(data["claims"]), 4)
+        self.assertFalse(any("양산 4T 적용이 승인" in claim["text"] for claim in data["claims"]))
+        for claim in data["claims"]:
+            citation = claim["citations"][0]
+            self.assertEqual(self.call(f"/api/evidence/{citation['passage']}")[0], 200)
+
     def test_external_review_sends_only_selected_excerpt_once(self):
         self.import_mail()
         question = "한빛 A-17 납품일은 언제 확정됐어?"
