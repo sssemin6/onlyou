@@ -537,6 +537,19 @@ class Integration(unittest.TestCase):
             self.assertIn("선주 교신문(PCF)".encode() if isinstance(body, bytes) else "선주 교신문(PCF)", body)
         self.assertEqual(data["status"], "answered")
 
+    def test_sources_report_kind_counts(self):
+        """사이드바 섹션 구분을 위한 소스별 종류 카운트."""
+        self.import_mail()
+        folder = self.design_corpus()
+        _, payload = self.call("/api/sources", {"path": str(folder)})
+        await_source(self.store, payload["source"], {"ready", "error", "empty"})
+        rows = self.call("/api/sources")[1]["sources"]
+        by_id = {row["id"]: row for row in rows}
+        self.assertEqual(by_id[payload["source"]]["counts"], {"mail": 1, "document": 3})
+        mail_only = next(row for row in rows if row["id"] != payload["source"])
+        self.assertEqual(list(mail_only["counts"]), ["mail"])
+        self.assertGreater(mail_only["counts"]["mail"], 0)
+
     def test_external_review_sends_only_selected_excerpt_once(self):
         self.import_mail()
         question = "한빛 A-17 납품일은 언제 확정됐어?"
