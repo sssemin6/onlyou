@@ -192,14 +192,20 @@ class Indexer:
         return len(header) == 12 and header[:4] == b"!BDN" and header[8:10] == b"SM"
 
     def import_folder_psts(self, folder, stage, event):
-        """Also import PST files kept inside a registered mail folder."""
+        """Also import PST files kept inside a registered mail folder.
+
+        Empty or unreadable PST files are skipped and counted so the rest of the
+        folder still imports; locking and mid-import changes still fail the source.
+        """
         extras = []
+        skipped = 0
         files = sorted(path for path in folder.rglob("*")
                        if path.suffix.lower() == ".pst" and path.is_file() and not path.is_symlink())
         for pst in files:
             self.check(event)
             label = pst.relative_to(folder).as_posix() + "/"
             slot = stage / ("pst-" + hashlib.sha1(label.encode("utf-8")).hexdigest()[:16])
+            slot.mkdir(parents=True, exist_ok=True, mode=0o700)
             try:
                 with stable_input(pst):
                     if not self.pst_header(pst):
@@ -210,8 +216,13 @@ class Indexer:
                         raise ImportIssue("changed")
             except PermissionError as exc:
                 raise ImportIssue("pst_in_use") from exc
+            except ImportIssue as exc:
+                if str(exc) in {"pst_no_mail", "pst_export", "pst_invalid"}:
+                    skipped += 1
+                    continue
+                raise
             extras.append((output, label))
-        return extras
+        return extras, skipped
 
     def export(self, path, stage, event):
         output = stage / "eml"
@@ -296,7 +307,10 @@ class Indexer:
         else:
             root = path
             if path.is_dir():
-                extras = self.import_folder_psts(path, stage, event)
+                extras, skipped_psts = self.import_folder_psts(path, stage, event)
+                if skipped_psts:
+                    with self.store.connection() as conn:
+                        conn.execute("UPDATE sources SET omitted=omitted+? WHERE id=?", (skipped_psts, source))
         self.check(event)
         self.state(source, "headers")
         self.index_headers(root, source, version, event, numbered=is_pst, extras=extras)
