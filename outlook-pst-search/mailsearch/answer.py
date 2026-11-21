@@ -10,6 +10,7 @@ import time
 from pathlib import Path
 
 from .extract import CREATE_FLAGS
+from .pcf import comment_number
 from .store import normalized, query_words, topic_key
 
 QUOTE_LIMIT = 300
@@ -21,6 +22,11 @@ NEGATED = re.compile(r"미승인|승인\s*(?:여부|요청|대기|보류|취소|
 CANCELLED = re.compile(r"취소|철회|번복|cancelled|canceled|revoked", re.I)
 # Approval claims about one scope need evidence naming that scope (PRD 02 section 5).
 SCOPE_WORDS = ("시제품", "양산")
+CLOSED_PCF = re.compile(r"종결|완료|closed", re.I)
+PCF_MEASUREMENT = re.compile(
+    r"(?<![\w.])([±−+-]?\s*\d[\d,]*(?:\.\d+)?)\s*(mm|cm|m|MPa|kPa|kW|kg|°C|T|%|W|V|A)(?![A-Za-z])", re.I
+)
+PENDING_PCF = re.compile(r"미종결|보류|검토\s*중|미완료|취소|철회|번복|not\s+closed|pending|reopened", re.I)
 UNCONFIRMED = re.compile(r"확인\s*되지|미확인|확인\s*불가|근거가?\s*없")
 DELIVERY_DATE = re.compile(r"(?<!\d)(?:(\d{4})년\s*)?(\d{1,2})월\s*(\d{1,2})일")
 DELIVERY = re.compile(r"납기|납품|출하|출고")
@@ -211,22 +217,21 @@ def merge_rows(lexical, semantic, limit=9):
 
 
 def pcf_retrieval(store, ai, question, filters, context):
-    """Design-history evidence: first pass, one follow-up when thin, neighbor context."""
+    """Retrieve relevant comments before expanding unambiguous neighboring context."""
+    filters = {**filters, "tab": "pcf"}
     evidence, mode = evidence_for(store, ai, question, filters, context, semantic=True)
-    # One follow-up search when the first pass looks thin (PRD 02 section 5).
-    if len(evidence) < 6:
-        follow = evidence_for(store, ai, f"{question} {context} 승인 확정 반영 Rev 양산 시제품 BOM 도면".strip(),
-                              filters, "", semantic=True)[0]
+    if 0 < len(evidence) < 6:
+        follow = evidence_for(store, ai, f"{question} 회신 종결", filters, context, semantic=True)[0]
         seen = {row["passage"] for row in evidence}
         evidence.extend(row for row in follow if row["passage"] not in seen)
-    # Context expansion: passages right around each hit in the same mail or document.
-    expanded, seen = [], set()
+    expanded = {row["passage"]: row for row in evidence[:9]}
     for row in evidence[:9]:
-        for item in [row, *store.neighbors(row["id"], row["passage"])]:
-            if item["passage"] not in seen:
-                seen.add(item["passage"])
-                expanded.append(item)
-    return expanded[:14], mode
+        number = comment_number(row["text"])
+        if number is not None:
+            for item in store.neighbors(row["id"], row["passage"]):
+                if comment_number(item["text"]) == number:
+                    expanded.setdefault(item["passage"], item)
+    return list(expanded.values())[:14], mode
 
 
 def evidence_for(store, ai, question, filters, context, semantic=True):
@@ -261,7 +266,7 @@ def evidence_for(store, ai, question, filters, context, semantic=True):
     return evidence, mode
 
 
-def validate(result, candidates, question="", *, text_for=source_text):
+def validate(result, candidates, question="", *, text_for=source_text, pcf=False):
     business_date = re.search(r"납기|납품|출하|출고|입고|일정|마감|공급가|단가|금액", question)
     sent_date = re.search(r"발송일|발송\s*(?:시각|날짜)|(?:메일|회신)(?:이|을)?\s*언제\s*(?:보냈|왔)", question)
     if not isinstance(result, dict) or result.get("status") not in ("answered", "partial", "insufficient", "ambiguous"):
@@ -303,55 +308,26 @@ def validate(result, candidates, question="", *, text_for=source_text):
         if CANCELLED.search(text) and not CANCELLED.search(text_proof):
             continue
         scopes = [word for word in SCOPE_WORDS if word in text]
-        if scopes and APPROVED.search(text) and not NEGATED.search(text) and not UNCONFIRMED.search(text):
-            if not all(any(word in ref["quote"] for ref in citations) for word in scopes):
+        if scopes and active_approval:
+            approved_lines = [line for quote in body_quotes for line in re.split(r"[\n!?]|(?<!\d)\.|\.(?!\d)", quote)
+                              if APPROVED.search(line) and not NEGATED.search(line) and not PENDING_PCF.search(line)]
+            if not any(all(word in line for word in scopes) and
+                       stated_numbers <= {n.rstrip(".,").replace(",", "") for n in NUMBERS.findall(line)} and
+                       not any(re.search(rf"{other}\s*(?:만|에만|에 한해)", line)
+                               for other in SCOPE_WORDS if other not in scopes) for line in approved_lines):
                 continue
+        if pcf:
+            def measurements(value):
+                return {(number.replace(" ", "").replace(",", "").replace("−", "-"), unit.casefold())
+                        for number, unit in PCF_MEASUREMENT.findall(value)}
+
+            if measurements(text) - measurements(text_proof):
+                continue
+            if CLOSED_PCF.search(text) and not PENDING_PCF.search(text) and not UNCONFIRMED.search(text):
+                if not any(CLOSED_PCF.search(quote) and not PENDING_PCF.search(quote) for quote in body_quotes):
+                    continue
         claims.append({"text": text, "citations": citations})
     return {"status": (status if len(proposed) == len(claims) else "partial") if claims else "insufficient", "claims": claims}
-
-
-NUMBER_WITH_UNIT = re.compile(r"(\d+(?:\.\d+)?)\s*(mm|cm|km|kg|MPa|kPa|kW|°C|[Tmg%원WVA])")
-
-
-def numeric_answer(question, evidence):
-    """Deterministic arithmetic over stored values with unit citations (PRD 02 section 5)."""
-    intent = ("diff" if re.search(r"차이|얼마나\s*차", question)
-              else "max" if re.search(r"최댓값|최대", question)
-              else "sum" if "합계" in question else None)
-    if not intent:
-        return None
-    by_unit = {}
-    for row in evidence:
-        if row.get("attachment") is None and row.get("location") == "파일명":
-            continue
-        for match in NUMBER_WITH_UNIT.finditer(row["text"]):
-            by_unit.setdefault(match.group(2), []).append((float(match.group(1)), row, match.group(0)))
-    wanted = next((unit for unit in by_unit if unit in question), None)
-    groups = [by_unit[wanted]] if wanted else [items for items in by_unit.values()]
-    qualifying = [items for items in groups if len(items) >= 2 and len({i[1]["passage"] for i in items[:2]}) == 2
-                  and all(i[0] > 0 for i in items)]
-    if not qualifying:
-        return None
-    if intent in {"diff", "sum"} and len(qualifying) != 1:
-        return None  # ambiguous: more than one unit could answer the question
-    items = max(qualifying, key=len)
-    unit = next(unit for unit, values in by_unit.items() if values is items)
-    if intent == "max":
-        value, row, quote = max(items, key=lambda item: item[0])
-        text = f"자료에서 가장 큰 값은 {value:g} {unit}입니다."
-        picks = [(row, quote)]
-    else:
-        if len(items) != 2:
-            return None
-        (first, first_row, first_quote), (second, second_row, second_quote) = items
-        amount = round(abs(first - second) if intent == "diff" else first + second, 6)
-        text = (f"{first:g} {unit}와 {second:g} {unit}의 차이는 {amount:g} {unit}입니다." if intent == "diff"
-                else f"{first:g} {unit}과 {second:g} {unit}의 합계는 {amount:g} {unit}입니다.")
-        picks = [(first_row, first_quote), (second_row, second_quote)]
-    return {"status": "answered", "claims": [{
-        "text": text,
-        "citations": [{**public_row(row), "quote": quote} for row, quote in picks],
-    }]}
 
 
 def delivery_date_answer(question, evidence, context=""):
