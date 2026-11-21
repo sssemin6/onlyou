@@ -1,4 +1,5 @@
 """Background imports with persistent progress and atomic version switches."""
+import datetime
 import hashlib
 import http.client
 import os
@@ -8,12 +9,19 @@ import subprocess
 import threading
 from pathlib import Path
 
-from .extract import CREATE_FLAGS, extract_attachment, parse_mail
+from .extract import CREATE_FLAGS, DOCUMENT_SUFFIXES, extract_attachment, extract_document, parse_mail
 from .filesystem import local_path, stable_input
-from .store import buckets, now, pack_vector, read_signature, sections, vector_array
+from .store import buckets, document_identity, now, pack_vector, read_signature, sections, vector_array
 
 
 NO_MAIL = {"pst_no_mail", "eml_no_mail"}
+
+
+def document_date(path):
+    try:
+        return datetime.datetime.fromtimestamp(path.stat().st_mtime, datetime.timezone.utc).isoformat(timespec="seconds")
+    except OSError:
+        return ""
 
 
 class Paused(Exception):
@@ -53,8 +61,9 @@ class Indexer:
             raise ImportIssue("source_path")
         if path.is_dir():
             kind = "eml_dir"
-        elif path.is_file() and path.suffix.lower() in {".pst", ".eml"}:
-            kind = path.suffix.lower().lstrip(".")
+        elif path.is_file() and path.suffix.lower() in {".pst", ".eml"} | DOCUMENT_SUFFIXES:
+            suffix = path.suffix.lower()
+            kind = "pst" if suffix == ".pst" else ("eml" if suffix == ".eml" else "doc")
         else:
             raise ImportIssue("source_format")
         with self.lock:
@@ -281,7 +290,8 @@ class Indexer:
             dirs[:] = sorted(name for name in dirs if not (Path(current) / name).is_symlink())
             for name in sorted(files):
                 path = Path(current) / name
-                is_mail = path.suffix.lower() == ".eml" or (numbered and name.isascii() and name.isdecimal())
+                suffix = path.suffix.lower()
+                is_mail = suffix == ".eml" or suffix in DOCUMENT_SUFFIXES or (numbered and name.isascii() and name.isdecimal())
                 if is_mail and not path.is_symlink() and path.is_file():
                     relative = path.relative_to(root)
                     yield path, relative.as_posix(), "/" + ("" if relative.parent == Path(".") else relative.parent.as_posix())
@@ -326,7 +336,7 @@ class Indexer:
         self.check(event)
         self.state(source, "headers")
         self.index_headers(root, source, version, event, numbered=is_pst, extras=extras,
-                           previous=previous, carried=carried)
+                           previous=previous, carried=carried, temp=temp)
         self.check(event)
         progress = self.store.source(source)
         empty_eml = progress["done"] == 0 and not progress["failed"] and not is_pst
@@ -390,7 +400,7 @@ class Indexer:
                 return output / item[len(prefix):]
         return root / item
 
-    def index_headers(self, root, source, version, event, *, numbered=False, extras=(), previous=None, carried=()):
+    def index_headers(self, root, source, version, event, *, numbered=False, extras=(), previous=None, carried=(), temp=None):
         with self.store.connection() as conn:
             batch = 0
             for prefix in carried:
@@ -400,11 +410,30 @@ class Indexer:
                     conn.execute("UPDATE sources SET done=done+? WHERE id=?", (adopted, source))
                     batch += adopted
                     conn.commit()
+            workspace = temp or self.spool
             for path, item, folder in self.scan_entries(root, numbered=numbered, extras=extras):
                 self.check(event)
                 if conn.execute("SELECT 1 FROM mails WHERE source=? AND version=? AND item=?", (source, version, item)).fetchone():
                     continue
                 if conn.execute("SELECT 1 FROM problems WHERE source=? AND version=? AND item=?", (source, version, item)).fetchone():
+                    continue
+                if path.suffix.lower() in DOCUMENT_SUFFIXES:
+                    try:
+                        status, locations = extract_document(path, workspace, self.pdf)
+                    except OSError:
+                        status, locations = "추출 실패 또는 암호화", []
+                    if not locations:
+                        conn.execute("INSERT INTO problems VALUES(?,?,?,'extract')", (source, version, item))
+                        conn.execute("UPDATE sources SET omitted=omitted+1 WHERE id=?", (source,))
+                    else:
+                        doc = {"name": path.name, "folder": folder, "sent": document_date(path),
+                               "status": status, "sections": locations}
+                        if previous is None or not self.store.try_adopt(conn, source, previous, version, item, document_identity(doc)):
+                            self.store.add_document(conn, source, version, item, doc)
+                        conn.execute("UPDATE sources SET done=done+1 WHERE id=?", (source,))
+                    batch += 1
+                    if batch % 32 == 0:
+                        conn.commit()
                     continue
                 try:
                     mail = parse_mail(path, folder)
