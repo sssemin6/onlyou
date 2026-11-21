@@ -337,18 +337,36 @@ class Integration(unittest.TestCase):
 
     def test_fast_and_attachment_search(self):
         source = self.import_mail()
-        status, data = self.call("/api/search", {"query": "A-17", "filters": {"source": source, "sender": "buy@example.invalid"}})
+        status, data = self.call("/api/search", {"query": "A-17", "filters": {"sender": "buy@example.invalid"}})
         self.assertEqual(status, 200)
-        self.assertEqual(len(data["results"]), 3)
+        subjects = {row["subject"] for row in data["results"]}
+        self.assertTrue({"한빛 A-17 출하 일정", "Re: 한빛 A-17 출하 일정"} <= subjects)
+        whole = self.call("/api/search", {"query": '"A-17"', "filters": {}})[1]["results"]
+        with_files = self.call("/api/search", {"query": '"A-17"', "filters": {"attachment": "yes"}})[1]["results"]
+        without_files = self.call("/api/search", {"query": '"A-17"', "filters": {"attachment": "no"}})[1]["results"]
+        self.assertEqual(len(with_files) + len(without_files), len(whole))
+        self.assertTrue(all(row["attachment"] for row in with_files))
+        self.assertFalse(any(row["attachment"] for row in without_files))
+        self.assertTrue(self.call("/api/search", {"query": "납품", "filters": {"body": "승인"}})[1]["results"])
         status, data = self.call("/api/search", {"query": "냉각판", "filters": {"recipient": "hanbit@"}})
         self.assertEqual(status, 200)
-        self.assertEqual(len(data["results"]), 1)
-        self.assertEqual(data["results"][0]["attachment"], "B-19_견적.txt")
-        _, evidence = self.call(f"/api/evidence/{data['results'][0]['passage']}")
+        quoted = next(row for row in data["results"] if row["attachment"] == "B-19_견적.txt")
+        _, evidence = self.call(f"/api/evidence/{quoted['passage']}")
         self.assertIn("320000원", evidence["text"])
         self.assertEqual(evidence["attachments"][1]["status"], "미지원 형식")
         self.assertEqual(self.call("/api/search", {"query": "납품", "filters": {"after": "2027-01-01"}})[1]["results"], [])
         self.assertEqual(self.call("/api/search", {"query": 123})[0], 400)
+
+    def test_quoted_exact_search_with_and_or(self):
+        self.import_mail()
+        exact = self.call("/api/search", {"query": '"A-17"', "filters": {}})[1]["results"]
+        self.assertEqual(len(exact), 3)
+        self.assertTrue(all("A-17" in row["subject"] + row["preview"] for row in exact))
+        both = self.call("/api/search", {"query": '"A-17" & "승인"', "filters": {}})[1]["results"]
+        self.assertEqual(len(both), 1)
+        self.assertIn("승인", both[0]["preview"])
+        either = self.call("/api/search", {"query": '"반도체" or "승인"', "filters": {}})[1]["results"]
+        self.assertEqual(len(either), 2)
 
     def test_grounded_question_followup_and_revocation(self):
         source = self.import_mail()
@@ -467,7 +485,7 @@ class Integration(unittest.TestCase):
             self.assertEqual(self.call("/api/source-action", {"source": source, "action": "refresh"})[0], 202)
             latest = await_source(self.store, source, {"empty", "ready", "error"})
         self.assertEqual((latest["state"], latest["active"]), ("empty", first["active"]))
-        self.assertEqual(len(self.call("/api/search", {"query": "A-17", "filters": {"source": source}})[1]["results"]), 1)
+        self.assertEqual(len(self.call("/api/search", {"query": "A-17", "filters": {}})[1]["results"]), 1)
 
     def test_wrong_file_and_legacy_empty_source_have_distinct_status(self):
         pst = self.mail / "fake.pst"
@@ -510,7 +528,7 @@ class Integration(unittest.TestCase):
         self.assertGreater(indexed["done"], 0)
         self.assertEqual(indexed["failed"], 0)
         self.assertEqual(hashlib.sha256(path.read_bytes()).digest(), original_digest)
-        self.assertTrue(self.call("/api/search", {"query": "", "filters": {"source": source}})[1]["results"])
+        self.assertTrue(self.call("/api/search", {"query": "", "filters": {}})[1]["results"])
 
 
 class ExternalTransport(unittest.TestCase):
