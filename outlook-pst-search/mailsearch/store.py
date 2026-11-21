@@ -176,6 +176,13 @@ def like_prefix(prefix):
     return prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
 
 
+def document_identity(doc):
+    """Fingerprint basis for a document: filename and extracted content, never timestamps."""
+    digest = hashlib.sha256("\n".join(f"{location}\n{text}" for location, text in doc["sections"]).encode()).hexdigest()
+    return {"message_id": "", "subject": doc["name"], "sender": "", "recipient": "",
+            "sent": "", "body": digest, "reply_ids": "", "attachments": [(doc["name"], None)]}
+
+
 def sections(text, size=1100):
     position = 0
     while position < len(text):
@@ -324,6 +331,24 @@ class Store:
             (passage_id, index_text(mail["subject"]), index_text(mail["sender"] + " " + mail["recipient"]),
              index_text(name), index_text(text)),
         )
+
+    def add_document(self, conn, source, version, item, doc):
+        """Index a standalone document: one archive row with located passages."""
+        mail = document_identity(doc)
+        cursor = conn.execute(
+            """INSERT INTO mails(source,version,item,fingerprint,folder,subject,sender,recipient,sent,message_id,topic,body)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (source, version, item, fingerprint(mail, item), doc["folder"], doc["name"], "", "",
+             doc["sent"], "", topic_key(doc["name"]), ""),
+        )
+        mail_id = cursor.lastrowid
+        attachment_id = conn.execute(
+            "INSERT INTO attachments(mail,name,status) VALUES(?,?,?)", (mail_id, doc["name"], doc["status"])
+        ).lastrowid
+        for location, text in doc["sections"]:
+            for start, segment in sections(text):
+                self.add_passage(conn, mail_id, mail, attachment_id, doc["name"], location, start, segment)
+        return mail_id
 
     def adopt_mail(self, conn, version, old_id):
         """Copy an imported mail with its index and embeddings into a new version."""
