@@ -253,6 +253,8 @@ class Integration(unittest.TestCase):
             source = payload["source"]
             row = await_source(self.store, source, {"ready", "error", "empty"})
             self.assertEqual((row["state"], row["done"], row["omitted"]), ("ready", 1, 1))
+            listed = self.call("/api/sources")[1]["sources"]
+            self.assertEqual(next(item for item in listed if item["id"] == source)["updates"], [])
             direct = EmailMessage()
             direct["From"] = "c@example.invalid"
             direct["To"] = "d@example.invalid"
@@ -262,12 +264,46 @@ class Integration(unittest.TestCase):
             (folder / "direct.eml").write_bytes(direct.as_bytes())
             self.call("/api/source-action", {"source": source, "action": "refresh"})
             updated = await_source(self.store, source, {"ready", "error", "empty"})
-            self.assertEqual((updated["state"], updated["done"], updated["omitted"]), ("ready", 2, 1))
-        # The unchanged PST was carried over from the previous version, not re-exported.
-        self.assertEqual(exports, ["보관.pst"])
-        self.assertEqual(set(self.store.pst_files(source)), {"보관.pst/"})
+            self.assertEqual((updated["state"], updated["done"], updated["omitted"]), ("ready", 2, 0))
+            # The unchanged PST was carried over from the previous version, not re-exported.
+            self.assertEqual(exports, ["보관.pst"])
+            # A changed PST is listed as an update target until the next refresh.
+            (folder / "보관.pst").write_bytes(b"!BDN\x00\x00\x00\x00SM\x00\x00appended")
+            listed = self.call("/api/sources")[1]["sources"]
+            self.assertEqual(next(item for item in listed if item["id"] == source)["updates"], ["보관.pst"])
+            self.call("/api/source-action", {"source": source, "action": "refresh"})
+            await_source(self.store, source, {"ready", "error", "empty"})
+            listed = self.call("/api/sources")[1]["sources"]
+            self.assertEqual(next(item for item in listed if item["id"] == source)["updates"], [])
+            self.assertEqual(exports, ["보관.pst", "보관.pst"])
+        self.assertEqual(set(self.store.pst_files(source)), {"보관.pst/", "깨진.pst/"})
         self.assertTrue(self.call("/api/search", {"query": "폴더 안 PST에서", "filters": {}})[1]["results"])
         self.assertTrue(self.call("/api/search", {"query": "직접 추가한", "filters": {}})[1]["results"])
+
+    def test_bundled_model_restore_joins_parts(self):
+        from mailsearch.bundled import prepare
+        source = Path(self.workspace.name) / "bundle"
+        (source / "blobs").mkdir(parents=True)
+        (source / "parts").mkdir(parents=True)
+        (source / "blobs" / ("sha256-" + "0" * 64)).write_bytes(b"{}")
+        payload = b"model-weights" * 1000
+        name = "sha256-" + hashlib.sha256(payload).hexdigest()
+        half = len(payload) // 2
+        (source / "parts" / f"{name}.part00").write_bytes(payload[:half])
+        (source / "parts" / f"{name}.part01").write_bytes(payload[half:])
+        (source / "manifest.json").write_text("{}")
+        root = Path(self.workspace.name) / "models"
+        self.assertEqual(prepare(root, source), root)
+        self.assertEqual(hashlib.sha256((root / "blobs" / name).read_bytes()).hexdigest(), name[7:])
+        self.assertTrue((root / "manifests" / "registry.ollama.ai" / "library" / "bge-m3" / "latest").is_file())
+        self.assertEqual(prepare(root, source), root)  # already restored, no work
+        (source / "parts" / f"{name}.part01").write_bytes(b"broken")
+        with self.assertRaises(RuntimeError):
+            prepare(Path(self.workspace.name) / "models2", source)
+
+    def test_ping_route_requires_session(self):
+        self.assertEqual(self.call("/api/ping", token=False)[0], 403)
+        self.assertEqual(self.call("/api/ping")[0], 200)
 
     def test_external_review_sends_only_selected_excerpt_once(self):
         self.import_mail()
