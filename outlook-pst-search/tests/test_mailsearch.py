@@ -269,6 +269,15 @@ class Integration(unittest.TestCase):
         self.assertTrue(self.call("/api/search", {"query": "폴더 안 PST에서", "filters": {}})[1]["results"])
         self.assertTrue(self.call("/api/search", {"query": "직접 추가한", "filters": {}})[1]["results"])
 
+    def test_remote_embedding_url_uses_that_host(self):
+        url = f"http://127.0.0.1:{self.model.server_port}"
+        ai = LocalAI("test", "embed", port=1, embedding_url=url)
+        self.assertEqual(len(ai.embed(["안녕하세요"])[0]), 3)
+        with self.assertRaises(ValueError):
+            LocalAI("test", "embed", embedding_url="ftp://nas/models")
+        with self.assertRaises(ValueError):
+            LocalAI("test", "embed", embedding_url="http://nas:11434/path")
+
     def test_external_review_sends_only_selected_excerpt_once(self):
         self.import_mail()
         question = "한빛 A-17 납품일은 언제 확정됐어?"
