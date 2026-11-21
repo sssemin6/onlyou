@@ -28,14 +28,14 @@ py -3 -m unittest discover -s tests          # 전체 테스트(변경 후 반�
 | `mailsearch/answer.py` | 루프백 Ollama 연결(생성·임베딩, 필요 시 `ensure_server`가 백그라운드 시작), 근거 검색 `evidence_for`, 답변 검증 `validate` |
 | `mailsearch/bundled.py` | 저장소에 분할 포함된 bge-m3를 첫 실행 때 결합·검증 |
 | `mailsearch/external.py` | 외부 AI 전송(OpenAI 호환 + Anthropic Messages 호환), 발췌문 리뷰 토큰 |
-| `mailsearch/extract.py` | EML 파싱, 첨부 텍스트 추출(PDF/DOCX/XLSX/TXT) |
+| `mailsearch/extract.py` | EML 파싱, 문서 텍스트 추출(PDF/DOCX/XLSX/TXT, 구형 DOC/XLS는 LibreOffice 읽기 전용 변환) |
 | `mailsearch/static/` | UI(`index.html`/`app.js`/`style.css`) |
 | `vendor/readpst-win64/` | MSYS2 libpst 0.6.76 휴대용 번들(Windows, DLL 의존성 포함) |
 | `setup-windows.ps1` | 첫 실행 환경 구성(파이썬 확인/설치, 번들 readpst, 선택 Ollama+bge-m3) |
 
 ## 데이터 모델·색인 흐름
 
-PST --readpst--> EML 스풀 --> `parse_mail` --> `mails`/`passages`/`terms`(FTS5) --> `vectors`(임베딩, 모델명이 키). `sources.active`가 현재 검색 대상 버전이다. 갱신은 새 `pending` 버전을 완성한 뒤 스왑하고 이전 버전 행을 삭제한다(중단 시 이전 색인 유지).
+PST --readpst--> EML 스풀 --> `parse_mail` --> `mails`/`passages`/`terms`(FTS5) --> `vectors`(임베딩, 모델명이 키). 문서 폴더·파일(PDF·DOCX·XLSX·TXT, PRD-02)은 `extract_document`가 위치(페이지·본문·시트!셀)를 보존해 같은 테이블에 색인한다. `sources.active`가 현재 검색 대상 버전이다. 갱신은 새 `pending` 버전을 완성한 뒤 스왑하고 이전 버전 행을 삭제한다(중단 시 이전 색인 유지).
 
 **증분 갱신**: `pst_files` 테이블의 PST별 서명(크기·mtime)이 같으면 재추출 없이 이전 버전 행을 접두사로 복사(`carry_prefix`). 바뀐 PST도 메일 `fingerprint`(message_id·제목·본문 등 해시)가 같으면 색인·첨부·임베딩 행을 통째로 복사(`adopt_mail`)하고 새 메일만 처리한다.
 
