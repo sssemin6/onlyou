@@ -12,6 +12,9 @@ from .filesystem import local_path, stable_input
 from .store import buckets, now, pack_vector, read_signature, sections, vector_array
 
 
+NO_MAIL = {"pst_no_mail", "eml_no_mail"}
+
+
 class Paused(Exception):
     pass
 
@@ -29,7 +32,15 @@ class Indexer:
         self.stopping = False
         with store.connection() as conn:
             conn.execute("UPDATE sources SET state='paused',issue='interrupted' WHERE state IN ('extracting','headers','attachments','embeddings')")
-            self.spool = store.root / "work"
+            # Older versions completed an import even when no message was indexed.
+            conn.execute("""
+                UPDATE sources SET active=NULL, updated=NULL,
+                    state=CASE WHEN failed>0 THEN 'error' ELSE 'empty' END,
+                    issue=CASE WHEN failed>0 THEN 'mail_parse_failed'
+                               WHEN kind='pst' THEN 'pst_no_mail' ELSE 'eml_no_mail' END
+                WHERE state='ready' AND done=0
+            """)
+        self.spool = store.root / "work"
         self.spool.mkdir(mode=0o700, exist_ok=True)
 
     def register(self, path):
@@ -75,7 +86,7 @@ class Indexer:
                         raise ImportIssue("source_action")
                     if action == "refresh" and row["state"] == "queued":
                         raise ImportIssue("source_busy")
-                    if action == "refresh" or row["issue"] == "changed":
+                    if action == "refresh" or row["issue"] in NO_MAIL | {"changed", "mail_parse_failed"}:
                         self.discard_pending(conn, row)
                         conn.execute(
                             """UPDATE sources SET pending=revision+1,revision=revision+1,signature=NULL,
@@ -147,9 +158,13 @@ class Indexer:
                         if task["state"] == "removing":
                             conn.execute("UPDATE sources SET state='remove_failed',issue=? WHERE id=?", (code, source))
                         else:
+                            if isinstance(exc, Paused):
+                                state = "paused"
+                            else:
+                                state = "empty" if code in NO_MAIL else "error"
                             conn.execute(
                                 "UPDATE sources SET state=?,issue=? WHERE id=? AND state NOT IN ('removing','ready')",
-                                ("paused" if isinstance(exc, Paused) else "error", code, source),
+                                (state, code, source),
                             )
                 except sqlite3.Error:
                     # The last committed index remains available even if the disk is full.
@@ -178,9 +193,10 @@ class Indexer:
             raise ImportIssue("readpst_missing")
         shutil.rmtree(output, ignore_errors=True)
         output.mkdir(mode=0o700, exist_ok=True)
+        # The child starts in the export directory so readpst need not decode its full path.
         with subprocess.Popen(
-            [binary, "-q", "-j", "0", "-e", "-t", "e", "-o", str(output), str(path)],
-            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            [str(Path(binary).resolve()), "-q", "-j", "0", "-e", "-t", "e", "-o", ".", str(path)],
+            cwd=output, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             creationflags=CREATE_FLAGS,
         ) as process:
             try:
@@ -196,12 +212,17 @@ class Indexer:
                         process.kill()
                         process.wait()
             if process.returncode:
+                if os.name == "nt" and (process.returncode & 0xFFFFFFFF) in {0xC0000135, 0xC000007B, 0xC0000139}:
+                    raise ImportIssue("readpst_dependencies")
                 raise ImportIssue("pst_export")
+        self.check(event)
+        if next(self.entries(output, numbered=True), None) is None:
+            raise ImportIssue("pst_no_mail")
         (stage / "export-complete").touch()
         return output
 
     @staticmethod
-    def entries(root):
+    def entries(root, *, numbered=False):
         if root.is_file():
             yield root, root.name, "/"
             return
@@ -209,7 +230,8 @@ class Indexer:
             dirs[:] = sorted(name for name in dirs if not (Path(current) / name).is_symlink())
             for name in sorted(files):
                 path = Path(current) / name
-                if path.suffix.lower() == ".eml" and not path.is_symlink() and path.is_file():
+                is_mail = path.suffix.lower() == ".eml" or (numbered and name.isascii() and name.isdecimal())
+                if is_mail and not path.is_symlink() and path.is_file():
                     relative = path.relative_to(root)
                     yield path, relative.as_posix(), "/" + ("" if relative.parent == Path(".") else relative.parent.as_posix())
 
@@ -228,11 +250,16 @@ class Indexer:
         with self.store.connection() as conn:
             conn.execute("UPDATE sources SET signature=?,state='extracting' WHERE id=? AND state='queued'", (signature, source))
         self.check(event)
-        if row["kind"] == "pst":
+        is_pst = row["kind"] == "pst"
+        if is_pst:
             try:
                 with stable_input(path):
                     if read_signature(path) != signature:
                         raise ImportIssue("changed")
+                    with path.open("rb") as stream:
+                        header = stream.read(12)
+                    if len(header) != 12 or header[:4] != b"!BDN" or header[8:10] != b"SM":
+                        raise ImportIssue("pst_invalid")
                     root = self.export(path, stage, event)
                     if read_signature(path) != signature:
                         raise ImportIssue("changed")
@@ -242,8 +269,12 @@ class Indexer:
             root = path
         self.check(event)
         self.state(source, "headers")
-        self.index_headers(root, source, version, event)
+        self.index_headers(root, source, version, event, numbered=is_pst)
         self.check(event)
+        progress = self.store.source(source)
+        empty_eml = progress["done"] == 0 and not progress["failed"] and not is_pst
+        if not progress["done"] and not empty_eml:
+            raise ImportIssue("mail_parse_failed" if progress["failed"] else "pst_no_mail")
         self.state(source, "attachments")
         self.index_attachments(root, temp, source, version, event)
         issue = None
@@ -257,17 +288,17 @@ class Indexer:
             self.check(event)
             with self.store.connection() as conn:
                 conn.execute(
-                    "UPDATE sources SET active=?,pending=NULL,state='ready',updated=?,issue=? WHERE id=?",
-                    (version, now(), issue, source),
+                    "UPDATE sources SET active=?,pending=NULL,state=?,updated=?,issue=? WHERE id=?",
+                    (version, "empty" if empty_eml else "ready", now(), "eml_no_mail" if empty_eml else issue, source),
                 )
                 conn.execute("DELETE FROM mails WHERE source=? AND version<>?", (source, version))
                 conn.execute("DELETE FROM problems WHERE source=? AND version<>?", (source, version))
         shutil.rmtree(stage, ignore_errors=True)
 
-    def index_headers(self, root, source, version, event):
+    def index_headers(self, root, source, version, event, *, numbered=False):
         with self.store.connection() as conn:
             batch = 0
-            for path, item, folder in self.entries(root):
+            for path, item, folder in self.entries(root, numbered=numbered):
                 self.check(event)
                 if conn.execute("SELECT 1 FROM mails WHERE source=? AND version=? AND item=?", (source, version, item)).fetchone():
                     continue

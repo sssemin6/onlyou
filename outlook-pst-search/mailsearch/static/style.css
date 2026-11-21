@@ -142,7 +142,7 @@ svg { width: 21px; height: 21px; flex: none; stroke: currentColor; stroke-width:
 }
 .source-state::before { content: ""; margin: 0 6px 1px 0; }
 .source-card[data-state="ready"] .source-state::before, .model-panel[data-configured="true"] .model-dot { background: #9cb795; }
-.source-card[data-state="error"] .source-state::before, .source-card[data-state="remove_failed"] .source-state::before { background: #df8f7b; }
+.source-card[data-state="empty"] .source-state::before, .source-card[data-state="error"] .source-state::before, .source-card[data-state="remove_failed"] .source-state::before { background: #df8f7b; }
 .source-actions { display: flex; flex-wrap: wrap; gap: 5px 9px; margin-top: 8px; }
 .source-actions button { font-size: .75rem; }
 .text-button {

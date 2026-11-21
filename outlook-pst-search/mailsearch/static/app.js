@@ -12,13 +12,18 @@ const filterIds = ["source", "sender", "recipient", "folder", "after", "before"]
 const dateFormat = new Intl.DateTimeFormat("ko-KR", { dateStyle: "medium", timeStyle: "short" });
 const stateNames = {
   queued: "대기", extracting: "PST 읽는 중", headers: "메일 색인 중", attachments: "첨부 색인 중",
-  embeddings: "의미 검색 준비 중", ready: "검색 가능", paused: "일시정지", error: "오류",
+  embeddings: "의미 검색 준비 중", ready: "검색 가능", paused: "일시정지", error: "오류", empty: "가져온 메일 없음",
   removing: "삭제 중", remove_failed: "삭제 재시도 필요",
 };
 const issueNames = {
   readpst_missing: "PST 추출 도구(readpst)를 설치하거나 실행 경로를 지정하세요.",
   pst_in_use: "Outlook에서 사용 중이거나 접근할 수 없는 PST입니다. Outlook을 닫거나 사본을 등록하세요.",
-  pst_export: "PST를 읽지 못했습니다. Outlook을 닫고 파일과 여유 공간을 확인하세요.",
+  pst_export: "PST 추출에 실패했습니다. Outlook에서 해당 파일이 열리는지, 로컬 디스크에 여유 공간이 있는지 확인하세요.",
+  pst_invalid: "Outlook PST 헤더를 읽을 수 없습니다. Outlook에서 만든 .pst 파일인지 확인하세요.",
+  pst_no_mail: "추출된 메일이 없습니다. Outlook에서 이 PST를 열어 받은 편지함이나 하위 폴더에 메일이 있는지 확인하세요.",
+  eml_no_mail: "폴더에서 .eml 메일을 찾지 못했습니다. PST를 가져오려면 파일 전체 경로를 등록하세요.",
+  mail_parse_failed: "가져온 메일을 읽을 수 없습니다. 아래 실패 건수를 확인하고 다시 색인해 보세요.",
+  readpst_dependencies: "readpst가 시작되지 않았습니다. MSYS2에서 함께 설치된 DLL이 있는지 확인하세요.",
   disk_or_source: "파일 접근 권한과 저장 공간을 확인하세요.",
   changed: "파일이 변경되었습니다. 갱신해 주세요.",
   interrupted: "중단된 색인입니다.",
@@ -119,14 +124,19 @@ async function showSources() {
     if (source.failed || source.omitted || source.partial) {
       entry.append(node("p", "메일 실패 " + source.failed + " · 첨부 누락 " + source.omitted + " · 일부 " + source.partial));
     }
-    if (source.updated) entry.append(node("p", "색인 기준 " + formatDate(source.updated)));
+    if (source.updated) {
+      const existing = source.active !== null && source.pending !== null;
+      entry.append(node("p", (existing ? "이전 색인 사용 중 · " : "색인 기준 ") + formatDate(source.updated)));
+    }
     if (source.issue) entry.append(node("p", issueNames[source.issue] || source.issue, "issue"));
     if (!source.available && source.state !== "removing") entry.append(node("p", "원본 경로 접근 불가", "issue"));
     const actions = node("div", "", "source-actions");
     const choices = ["queued", "extracting", "headers", "attachments", "embeddings"].includes(source.state)
       ? [["pause", "일시정지"]]
       : source.state === "ready" ? [["refresh", "갱신"]]
-      : source.state === "removing" || source.state === "remove_failed" ? [] : [["resume", "재개"], ["refresh", "다시 색인"]];
+      : source.state === "removing" || source.state === "remove_failed" ? []
+      : source.pending === null || ["pst_no_mail", "eml_no_mail", "mail_parse_failed"].includes(source.issue)
+        ? [["refresh", "다시 색인"]] : [["resume", "재개"], ["refresh", "다시 색인"]];
     if (source.state !== "removing") choices.push(["remove", source.state === "remove_failed" ? "삭제 재시도" : "등록 해제"]);
     for (const [action, label] of choices) {
       const button = node("button", label, "text-button");
