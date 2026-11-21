@@ -41,7 +41,22 @@ ollama serve
 .\start-windows.cmd --model qwen3:4b --embedding-model bge-m3 --readpst "C:\msys64\mingw64\bin\readpst.exe"
 ```
 
-설정 이전에 등록한 보관함은 **갱신**으로 의미 검색 색인을 생성합니다. 재색인 중 기존 버전으로 검색할 수 있습니다. 앱은 루프백 Ollama 포트에만 연결하고 로컬 목록에서 확인한 모델만 사용합니다. Ollama의 클라우드 기능과 외부 통신은 폐쇄망 방화벽 정책으로도 차단해 주세요.
+설정 이전에 등록한 보관함은 **갱신**으로 의미 검색 색인을 생성합니다. 재색인 중 기존 버전으로 검색할 수 있습니다. 앱은 루프백 Ollama 포트(또는 아래 중앙 임베딩 서버)에만 연결하고 해당 서버 목록에 있는 모델만 사용합니다. Ollama의 클라우드 기능과 외부 통신은 폐쇄망 방화벽 정책으로도 차단해 주세요.
+
+### 중앙 임베딩 서버(NAS) 함께 쓰기
+
+여러 PC가 같은 임베딩 모델을 쓰게 하려면 NAS 등 한 곳에서 Ollama를 실행하고 각 PC는 그 주소만 가리킵니다. 각 PC에 모델을 내려받지 않아도 의미 검색이 동작합니다.
+
+NAS에서 Docker로 Ollama를 실행하고 모델을 받습니다.
+
+```text
+docker run -d --name ollama -p 11434:11434 -v ollama:/root/.ollama ollama/ollama
+docker exec -it ollama ollama pull qwen3-embedding:4b
+```
+
+추천 모델은 `qwen3-embedding:4b`(2.5GB, 컨텍스트 40K)입니다. 한국어 포함 다국어 검색 품질이 bge-m3보다 좋고 컨텍스트도 깁니다. NAS 메모리 여유가 4GB 미만이면 `qwen3-embedding:0.6b`(639MB)를 씁니다.
+
+`start.cmd`의 `EMBEDDING_URL`을 NAS 주소로, `EMBEDDING_MODEL`을 받아 둔 모델명으로 맞춰 두면 모든 사용자가 별도 설정 없이 의미 검색을 씁니다. 색인할 메일 본문과 질문 문장이 임베딩을 위해 NAS로 전송됩니다. 생성 모델(로컬 답변) 설정과는 독립적이라 외부 API 답변만 쓰는 환경에서는 각 PC에 Ollama가 필요 없습니다.
 
 ### 외부 AI API 연결
 
