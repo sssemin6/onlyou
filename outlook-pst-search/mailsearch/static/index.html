@@ -114,19 +114,50 @@
         <span class="folder-icon" aria-hidden="true">
           <svg viewBox="0 0 24 24" fill="none"><path d="M3.5 7a2 2 0 0 1 2-2h4l2 2h7a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2h-13a2 2 0 0 1-2-2z"/><path d="M4 10h16"/></svg>
         </span>
-        <h2 id="archive-heading">메일 보관함</h2>
+        <h2 id="archive-heading">자료 보관함</h2>
       </div>
-      <button type="button" id="add-toggle" class="button add-button" aria-controls="add-form" aria-expanded="false">
-        <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
-        보관함 추가
-      </button>
-      <form id="add-form" class="add-form" hidden>
-        <label for="path">PST, 문서 파일 또는 EML 폴더 경로</label>
-        <input id="path" placeholder="C:\메일보관\2025.pst, 문서 폴더 또는 PDF·DOCX·XLSX 파일" required spellcheck="false">
-        <button type="submit" class="button small primary">등록</button>
-        <p id="add-notice" class="form-message" role="status"></p>
-      </form>
-      <div id="sources" class="sources" aria-label="등록한 보관함"></div>
+      <section class="source-group" data-kind="mail" aria-label="메일 자료">
+        <h3 class="group-title">메일</h3>
+        <button type="button" class="button add-button group-add" aria-controls="add-form-mail" aria-expanded="false">
+          <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
+          메일 추가
+        </button>
+        <form id="add-form-mail" class="add-form" hidden>
+          <label for="path-mail">PST 또는 EML 폴더 경로</label>
+          <input id="path-mail" placeholder="C:\메일보관\2025.pst 또는 EML 폴더" required spellcheck="false">
+          <button type="submit" class="button small primary">등록</button>
+          <p class="form-message add-notice" role="status"></p>
+        </form>
+        <div class="sources" data-kind="mail" aria-label="등록한 메일 자료"></div>
+      </section>
+      <section class="source-group" data-kind="document" aria-label="문서 자료">
+        <h3 class="group-title">문서</h3>
+        <button type="button" class="button add-button group-add" aria-controls="add-form-doc" aria-expanded="false">
+          <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
+          문서 추가
+        </button>
+        <form id="add-form-doc" class="add-form" hidden>
+          <label for="path-doc">문서 파일 또는 폴더 경로</label>
+          <input id="path-doc" placeholder="문서 폴더 또는 PDF·DOCX·XLSX·TXT 파일" required spellcheck="false">
+          <button type="submit" class="button small primary">등록</button>
+          <p class="form-message add-notice" role="status"></p>
+        </form>
+        <div class="sources" data-kind="document" aria-label="등록한 문서 자료"></div>
+      </section>
+      <section class="source-group" data-kind="pcf" aria-label="PCF 자료">
+        <h3 class="group-title">PCF <span class="group-hint">선주 교신문</span></h3>
+        <button type="button" class="button add-button group-add" aria-controls="add-form-pcf" aria-expanded="false">
+          <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
+          PCF 문서 추가
+        </button>
+        <form id="add-form-pcf" class="add-form" hidden>
+          <label for="path-pcf">PCF 문서 파일 또는 폴더 경로</label>
+          <input id="path-pcf" placeholder="PCF 문서 폴더 또는 파일 (파일명에 PCF가 들어간 문서)" required spellcheck="false">
+          <button type="submit" class="button small primary">등록</button>
+          <p class="form-message add-notice" role="status"></p>
+        </form>
+        <div class="sources" data-kind="pcf" aria-label="등록한 PCF 자료"></div>
+      </section>
       <div class="model-panels">
         <div class="model-panel">
           <span class="model-dot" aria-hidden="true"></span>
