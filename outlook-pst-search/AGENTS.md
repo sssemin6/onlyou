@@ -16,6 +16,8 @@ py -3 -m unittest discover -s tests          # 전체 테스트(변경 후 반�
 
 서버 인자: `--port`(기본 8765), `--readpst`, `--pdftotext`, `--model`(로컬 생성), `--embedding-model`, `--ollama-port`(기본 11435). 외부 AI는 `MAILSEARCH_EXTERNAL_URL/MODEL/API_KEY` 환경 변수 또는 GUI API 설정. 임베딩 모델 bge-m3는 저장소에 분할 포함되어 첫 실행 때 `%LOCALAPPDATA%`에 복원되며, Ollama는 임베딩이 필요한 순간에만 시작해 앱 종료 때 함께 종료된다.
 
+**종료 동작**: 페이지가 2.5초마다 `/api/ping`을 보내고 `main()`의 `watch_page` 스레드가 12초 이상 무응답이면 서버를 종료한다(탭을 모두 닫으면 앱이 죽는다. 새로고침은 끊기지 않게 임계값이 넉넉하다). `--no-browser`로 실행하면 이 감시가 켜지지 않는다.
+
 ## 모듈 지도
 
 | 경로 | 책임 |
