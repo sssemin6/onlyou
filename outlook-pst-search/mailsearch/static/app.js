@@ -54,6 +54,24 @@ let sourceSnapshot = "";
 let sourceRequest = 0;
 let settingsRequest = 0;
 
+// 메일/문서 탭: 검색 대상을 한쪽으로 한정한다(서버 filters.tab).
+let activeTab = "mail";
+function selectTab(value) {
+  activeTab = value;
+  element("tab-mail").classList.toggle("active", value === "mail");
+  element("tab-doc").classList.toggle("active", value === "document");
+  element("tab-mail").setAttribute("aria-selected", String(value === "mail"));
+  element("tab-doc").setAttribute("aria-selected", String(value === "document"));
+  try { localStorage.setItem("mailsearch-tab", value); } catch { /* private mode */ }
+}
+for (const [id, value] of [["tab-mail", "mail"], ["tab-doc", "document"]]) {
+  element(id).addEventListener("click", () => {
+    selectTab(value);
+    element("query").focus();
+  });
+}
+try { if (localStorage.getItem("mailsearch-tab") === "document") selectTab("document"); } catch { /* private mode */ }
+
 function node(tag, text, className) {
   const result = document.createElement(tag);
   if (text) result.textContent = text;
@@ -272,7 +290,7 @@ function showResults(rows, title) {
   result.replaceChildren();
   element("result-section").hidden = false;
   element("result-heading").textContent = title + " (" + rows.length + ")";
-  if (!rows.length) result.append(node("p", "이 범위에서 일치하는 메일을 찾지 못했습니다.", "result-empty"));
+  if (!rows.length) result.append(node("p", activeTab === "document" ? "이 범위에서 일치하는 문서를 찾지 못했습니다." : "이 범위에서 일치하는 메일을 찾지 못했습니다.", "result-empty"));
   for (const row of rows) {
     const button = node("button", "", "result");
     button.type = "button";
@@ -346,6 +364,7 @@ form.addEventListener("submit", async (event) => {
     return;
   }
   const filters = Object.fromEntries(filterIds.map((id) => [id, element(id).value]));
+  filters.tab = activeTab;
   if (element("design-mode").checked && element("design-scope").value) filters.source = element("design-scope").value;
   const payload = { query, filters, context: ask ? previousQuestion : "" };
   element("answer").hidden = true;
@@ -376,7 +395,6 @@ form.addEventListener("submit", async (event) => {
       if (active.signal.aborted) return;
       showAnswer(answer);
       if (answer.status !== "external_unavailable") showResults(answer.results, "전송한 발췌문의 원본 메일");
-      if (design && answer.claims?.length) attachDecisionSave(answer, query);
       rememberQuestion(answer, query);
       notice("");
       return;
@@ -393,48 +411,6 @@ form.addEventListener("submit", async (event) => {
 element("design-mode").addEventListener("change", () => {
   element("design-scope").hidden = !element("design-mode").checked;
 });
-
-function attachDecisionSave(answer, query) {
-  const save = node("button", "결정 저장", "button small decision-save");
-  save.type = "button";
-  save.addEventListener("click", async () => {
-    save.disabled = true;
-    try {
-      await call("/api/decisions", {
-        question: query,
-        claims: answer.claims,
-        passages: [...new Set(answer.results.map((row) => row.passage))],
-      });
-      save.remove();
-      notice("설계 결정을 저장했습니다.");
-      await showDecisions();
-    } catch (error) {
-      notice(error.message);
-      save.disabled = false;
-    }
-  });
-  element("answer").append(save);
-}
-
-async function showDecisions() {
-  let data;
-  try { data = await call("/api/decisions"); } catch { return; }
-  const box = element("decisions");
-  box.replaceChildren(node("h3", "저장된 설계 결정", "decisions-title"));
-  if (!data.decisions.length) box.append(node("p", "설계 이력 질문의 답변에서 결정 저장을 누르면 여기에 쌓입니다.", "source-empty"));
-  for (const item of data.decisions) {
-    const entry = node("div", "", "decision-item");
-    entry.dataset.review = item.review;
-    const label = node("p", (item.review === "recheck" ? "재검토 대상 · " : "") + item.question);
-    const remove = node("button", "삭제", "text-button");
-    remove.type = "button";
-    remove.addEventListener("click", async () => {
-      try { await call("/api/decisions", { action: "remove", id: item.id }); await showDecisions(); } catch (error) { notice(error.message); }
-    });
-    entry.append(label, remove);
-    box.append(entry);
-  }
-}
 
 element("clear-context").addEventListener("click", () => {
   setQuestionContext("");
@@ -581,7 +557,6 @@ addForm.addEventListener("submit", async (event) => {
 
 async function pollSources() {
   try { await showSources(); } catch (error) { if (!sourceSnapshot) notice(error.message); }
-  showDecisions().catch(() => {});
   setTimeout(pollSources, 3000);
 }
 pollSources();
