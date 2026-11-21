@@ -3,28 +3,27 @@
 const element = (id) => document.getElementById(id);
 const token = document.querySelector('meta[name="mail-session"]').content;
 const form = element("search-form");
-// 사이드바는 메일/문서/PCF 섹션으로 나뉘고, 각 섹션이 자체 추가 폼을 가진다.
-const addControls = [...document.querySelectorAll(".source-group")].map((group) => ({
-  kind: group.dataset.kind,
-  form: group.querySelector(".add-form"),
-  toggle: group.querySelector(".group-add"),
-  input: group.querySelector(".add-form input"),
-  notice: group.querySelector(".add-notice"),
-  list: group.querySelector(".sources"),
-}));
+const sourcesList = element("sources");
+const addForm = element("add-form");
+const addOpen = element("add-open");
+const sourcePath = element("source-path");
+const sourceSelect = element("source");
+const reviewBox = element("review");
+const reviewSend = element("review-send");
 const settingsDialog = element("settings-dialog");
 const settingsForm = element("settings-form");
 // 탭마다 쓸 수 있는 검색 범위가 다르다 — 문서엔 발신자가 없고 PCF는 전용 범위를 쓴다.
 const TAB_FILTERS = {
+  all: ["subject", "body", "after", "before"],
   mail: ["subject", "body", "sender", "recipient", "attachment", "after", "before"],
   document: ["subject", "body", "after", "before"],
   pcf: ["class", "flag", "owner", "hull", "drawing"],
 };
-const ALL_FILTERS = [...new Set([...TAB_FILTERS.mail, ...TAB_FILTERS.document, ...TAB_FILTERS.pcf])];
+const ALL_FILTERS = ["source", ...new Set(Object.values(TAB_FILTERS).flat())];
 const dateFormat = new Intl.DateTimeFormat("ko-KR", { dateStyle: "medium", timeStyle: "short" });
 const stateNames = {
-  queued: "대기", extracting: "PST 읽는 중", headers: "메일 색인 중", attachments: "첨부 색인 중",
-  embeddings: "의미 검색 준비 중", ready: "검색 가능", paused: "일시정지", error: "오류", empty: "가져온 메일 없음",
+  queued: "대기", extracting: "PST 읽는 중", headers: "자료 색인 중", attachments: "첨부 색인 중",
+  embeddings: "의미 검색 준비 중", ready: "검색 가능", paused: "일시정지", error: "오류", empty: "가져온 자료 없음",
   removing: "삭제 중", remove_failed: "삭제 재시도 필요",
 };
 const issueNames = {
@@ -33,15 +32,16 @@ const issueNames = {
   pst_export: "PST 추출에 실패했습니다. Outlook에서 해당 파일이 열리는지, 로컬 디스크에 여유 공간이 있는지 확인하세요.",
   pst_invalid: "Outlook PST 헤더를 읽을 수 없습니다. Outlook에서 만든 .pst 파일인지 확인하세요.",
   pst_no_mail: "추출된 메일이 없습니다. Outlook에서 이 PST를 열어 받은 편지함이나 하위 폴더에 메일이 있는지 확인하세요.",
-  eml_no_mail: "폴더에서 메일을 찾지 못했습니다. 폴더에 .eml 또는 .pst 파일이 있는지 확인하세요.",
+  eml_no_mail: "읽을 수 있는 PST·EML 또는 지원 문서가 있는지 확인하세요.",
+  document_extract_failed: "문서 내용을 가져오지 못했습니다. 아래 누락 사유를 확인하고 다시 색인하세요.",
   mail_parse_failed: "가져온 메일을 읽을 수 없습니다. 아래 실패 건수를 확인하고 다시 색인해 보세요.",
   readpst_dependencies: "readpst가 시작되지 않았습니다. MSYS2에서 함께 설치된 DLL이 있는지 확인하세요.",
   disk_or_source: "파일 접근 권한과 저장 공간을 확인하세요.",
   changed: "파일이 변경되었습니다. 갱신해 주세요.",
   interrupted: "중단된 색인입니다.",
   embedding_unavailable: "의미 검색 모델을 열지 못했습니다. 일반 검색은 사용할 수 있습니다.",
-  external_disabled: "상단의 API 설정에서 외부 AI를 연결해 주세요.",
-  external_url: "HTTPS 주소를 확인하세요. 주소는 /chat/completions로 끝나야 합니다.",
+  external_disabled: "상단의 API 설정에서 답변에 사용할 AI를 연결해 주세요.",
+  external_url: "HTTPS 주소를 확인하세요. 주소는 /chat/completions 또는 /messages로 끝나야 합니다.",
   external_model: "제공자에서 안내한 모델명을 입력하세요.",
   external_key: "API 키에 공백이 있는지 확인하세요.",
   external_key_required: "이 주소에서 사용할 API 키를 입력하세요.",
@@ -51,7 +51,7 @@ const issueNames = {
   external_test_failed: "연결 테스트에 실패했습니다. 네트워크와 제공자의 응답을 확인하세요.",
   external_busy: "외부 API가 다른 질문을 처리하고 있습니다. 잠시 후 다시 시도하세요.",
   external_review_expired: "전송 검토가 만료되었습니다. 질문을 다시 실행해 주세요.",
-  external_source_changed: "검토한 메일의 보관함이 변경되었습니다. 질문을 다시 실행해 주세요.",
+  external_source_changed: "검토한 자료가 변경되었거나 원본에 접근할 수 없습니다. 질문을 다시 실행해 주세요.",
   source_path: "이 PC에서 읽을 수 있는 경로를 입력하세요.",
   source_format: "PST, EML·문서 파일(PDF·DOCX·XLSX·TXT) 또는 그런 파일이 든 폴더를 등록할 수 있습니다.",
   source_busy: "현재 작업이 끝난 뒤 다시 시도하세요.",
@@ -63,35 +63,55 @@ const issueNames = {
 };
 let previousQuestion = "";
 let request;
+let pendingReview;
 let sourceSnapshot = "";
 let sourceRequest = 0;
 let settingsRequest = 0;
 
-// 메일/문서/PCF 탭: 검색 대상을 한쪽으로 한정한다(서버 filters.tab).
-const TABS = [["tab-mail", "mail"], ["tab-doc", "document"], ["tab-pcf", "pcf"]];
+const TABS = [["tab-all", "all"], ["tab-mail", "mail"], ["tab-doc", "document"], ["tab-pcf", "pcf"]];
+const SEARCH_HINT = {
+  all: "예: A17 변경 승인 메일과 양산 BOM",
+  mail: "예: A-17 최종 납품일",
+  document: "예: A17 양산 BOM Rev.C 또는 허용 공차",
+  pcf: "선주 COMMENT나 호선·도면번호로 검색",
+};
 let activeTab = "mail";
 function selectTab(value) {
+  if (value !== activeTab) {
+    clearSearch();
+    setQuestionContext("");
+  }
   activeTab = value;
   for (const [id, tab] of TABS) {
     element(id).classList.toggle("active", value === tab);
     element(id).setAttribute("aria-selected", String(value === tab));
+    element(id).tabIndex = value === tab ? 0 : -1;
   }
   document.querySelectorAll(".filter-grid label[data-show]").forEach((field) => {
     field.hidden = !field.dataset.show.split(" ").includes(value);
   });
+  element("query").placeholder = SEARCH_HINT[value];
+  element("pcf-scope-help").hidden = value !== "pcf";
   showFilterCount();
   try { localStorage.setItem("mailsearch-tab", value); } catch { /* private mode */ }
 }
 for (const [id, value] of TABS) {
-  element(id).addEventListener("click", () => {
-    selectTab(value);
-    element("query").focus();
+  const tab = element(id);
+  tab.addEventListener("click", () => selectTab(value));
+  tab.addEventListener("keydown", (event) => {
+    const index = TABS.findIndex(([key]) => key === id);
+    const offset = { ArrowLeft: -1, ArrowRight: 1 }[event.key];
+    if (!offset && !["Home", "End"].includes(event.key)) return;
+    event.preventDefault();
+    const next = event.key === "Home" ? 0 : event.key === "End" ? TABS.length - 1
+      : (index + offset + TABS.length) % TABS.length;
+    selectTab(TABS[next][1]);
+    element(TABS[next][0]).focus();
   });
 }
-try {
-  const saved = localStorage.getItem("mailsearch-tab");
-  if (saved === "document" || saved === "pcf") selectTab(saved);
-} catch { /* private mode */ }
+let savedTab;
+try { savedTab = localStorage.getItem("mailsearch-tab"); } catch { /* private mode */ }
+selectTab(Object.hasOwn(SEARCH_HINT, savedTab) ? savedTab : "all");
 
 function node(tag, text, className) {
   const result = document.createElement(tag);
@@ -130,21 +150,11 @@ function formatDate(value) {
 }
 
 function showFilterCount() {
-  const count = TAB_FILTERS[activeTab].filter((id) => element(id).value.trim()).length;
+  const count = Number(Boolean(sourceSelect.value)) + TAB_FILTERS[activeTab].filter((id) => element(id).value.trim()).length;
   const badge = element("filter-count");
   badge.textContent = count;
   badge.hidden = !count;
   element("clear-filters").hidden = !count;
-}
-
-// 소스는 가장 많이 담은 종류의 섹션에 나타난다(문서 폴더 안의 EML처럼 섞인 경우 최빈 종류).
-function sourceGroup(source) {
-  const counts = source.counts || {};
-  let best = "mail", bestCount = -1;
-  for (const kind of ["mail", "document", "pcf"]) {
-    if ((counts[kind] || 0) > bestCount) { best = kind; bestCount = counts[kind] || 0; }
-  }
-  return bestCount > 0 ? best : "mail";
 }
 
 function kindCountLine(source) {
@@ -162,19 +172,15 @@ async function showSources() {
   const next = JSON.stringify(data);
   if (next === sourceSnapshot) return;
   sourceSnapshot = next;
-  let focusedControl = null, focusedAction = "";
-  for (const control of addControls) {
-    if (control.list.contains(document.activeElement)) {
-      focusedControl = control;
-      focusedAction = document.activeElement.dataset.action;
-    }
-    control.list.replaceChildren();
-  }
+  const focusedAction = sourcesList.contains(document.activeElement) ? document.activeElement.dataset.action : "";
+  sourcesList.replaceChildren();
   if (!data.sources.length) {
-    addControls[0].list.append(node("p", "등록한 자료가 없습니다. 위 버튼으로 추가하세요.", "source-empty"));
+    sourcesList.append(node("p", "등록된 자료가 없습니다.", "source-empty"));
   }
+  const selectedSource = sourceSelect.value;
+  sourceSelect.replaceChildren(new Option("전체 보관함", ""));
   for (const source of data.sources) {
-    const list = (addControls.find((control) => control.kind === sourceGroup(source)) || addControls[0]).list;
+    sourceSelect.append(new Option(source.path, source.id));
     const name = source.path.split(/[\\/]/).pop();
     const entry = node("div", "", "source-card");
     entry.dataset.state = source.state;
@@ -182,7 +188,10 @@ async function showSources() {
     heading.title = source.path;
     entry.append(heading, node("p", (stateNames[source.state] || source.state) + " · " + kindCountLine(source), "source-state"));
     if (source.failed || source.omitted || source.partial) {
-      entry.append(node("p", "메일 실패 " + source.failed + " · 첨부 누락 " + source.omitted + " · 일부 " + source.partial));
+      entry.append(node("p", "실패 " + source.failed + " · 누락 " + source.omitted + " · 일부 색인 " + source.partial));
+      for (const problem of source.problems || []) {
+        entry.append(node("p", problem.item + " · " + (issueNames[problem.code] || problem.code), "issue"));
+      }
     }
     if (source.updated) {
       const existing = source.active !== null && source.pending !== null;
@@ -196,9 +205,9 @@ async function showSources() {
     const actions = node("div", "", "source-actions");
     const choices = ["queued", "extracting", "headers", "attachments", "embeddings"].includes(source.state)
       ? [["pause", "일시정지"]]
-      : source.state === "ready" ? [["refresh", "갱신"]]
+      : source.state === "ready" ? [["refresh", source.partial || source.omitted ? "다시 색인" : "갱신"]]
       : source.state === "removing" || source.state === "remove_failed" ? []
-      : source.pending === null || ["pst_no_mail", "eml_no_mail", "mail_parse_failed"].includes(source.issue)
+      : source.pending === null || ["pst_no_mail", "eml_no_mail", "mail_parse_failed", "document_extract_failed"].includes(source.issue)
         ? [["refresh", "다시 색인"]] : [["resume", "재개"], ["refresh", "다시 색인"]];
     if (source.state !== "removing") choices.push(["remove", source.state === "remove_failed" ? "삭제 재시도" : "등록 해제"]);
     for (const [action, label] of choices) {
@@ -211,10 +220,7 @@ async function showSources() {
         try {
           await call("/api/source-action", { source: source.id, action });
           if (action === "remove") {
-            request?.abort();
-            element("answer").hidden = true;
-            element("result-section").hidden = true;
-            form.closest("main").classList.remove("has-query");
+            clearSearch();
             if (element("viewer").open) element("viewer").close();
             notice("보관함을 등록 해제했습니다.");
           }
@@ -228,24 +234,27 @@ async function showSources() {
       actions.append(button);
     }
     entry.append(actions);
-    list.append(entry);
+    sourcesList.append(entry);
+  }
+  sourceSelect.value = selectedSource;
+  if (sourceSelect.selectedIndex < 0) {
+    sourceSelect.value = "";
+    clearSearch();
   }
   showFilterCount();
-  if (focusedAction && focusedControl) {
-    const replacement = [...focusedControl.list.querySelectorAll("button")]
+  if (focusedAction) {
+    const replacement = [...sourcesList.querySelectorAll("button")]
       .find((button) => button.dataset.action === focusedAction);
-    (replacement || focusedControl.toggle).focus({ preventScroll: true });
+    (replacement || addOpen).focus({ preventScroll: true });
   }
   const modelStatus = element("model-status");
-  modelStatus.parentElement.dataset.configured = Boolean(data.model);
-  modelStatus.textContent = data.model
-    ? "로컬 AI 설정됨 · " + data.model + (data.embedding ? " · 의미 검색" : "")
-    : "로컬 AI 연결 전";
-  const externalPanel = element("external-panel");
-  externalPanel.dataset.configured = Boolean(data.external);
-  element("external-status").textContent = data.external
-    ? "외부 API 연결됨 · " + data.external.model
-    : "외부 API 연결 전";
+  modelStatus.parentElement.dataset.configured = Boolean(data.embedding);
+  modelStatus.textContent = data.embedding ? "로컬 의미 검색 · " + data.embedding : "로컬 키워드 검색";
+  element("external-panel").dataset.configured = Boolean(data.external);
+  const externalStatus = element("external-status");
+  externalStatus.textContent = data.external
+    ? "답변 API · " + new URL(data.external.destination).host + " · " + data.external.model : "답변 API 연결 전";
+  externalStatus.title = data.external?.destination || "";
 }
 
 function highlight(text, quote) {
@@ -273,20 +282,27 @@ async function openEvidence(id, quote) {
     element("viewer-title").textContent = item.subject || "제목 없는 메일";
     dialog.scrollTop = 0;
     const metadata = node("dl", "", "viewer-meta");
-    const fields = [
+    const mail = item.kind === "mail";
+    const fields = mail ? [
       ["발신자", item.sender || "정보 없음"],
       ["수신자", item.recipient || "정보 없음"],
-      ["날짜", formatDate(item.sent)],
+      ["발송일", formatDate(item.sent)],
       ["출처", item.archive + " · " + item.folder],
+    ] : [
+      ["파일", item.subject],
+      ["파일 수정일", formatDate(item.sent)],
+      ["보관함", item.archive + " · " + item.folder],
+      ["위치", item.location],
     ];
-    if (item.attachment) fields.push(["첨부", item.attachment + " · " + item.location]);
+    if (mail && item.attachment) fields.push(["첨부", item.attachment + " · " + item.location]);
+    if (!mail && item.attachments[0]) fields.push(["추출 상태", item.attachments[0].status]);
     for (const [label, value] of fields) metadata.append(node("dt", label), node("dd", value));
     body.replaceChildren(metadata);
     if (quote) body.append(node("blockquote", quote));
     const text = item.attachment ? item.text : item.body || item.text;
     const original = highlight(text, quote || item.text);
     body.append(original);
-    if (item.attachments.length) {
+    if (mail && item.attachments.length) {
       const attachments = node("ul");
       body.append(node("h3", "첨부"), attachments);
       for (const attachment of item.attachments) {
@@ -308,7 +324,7 @@ async function openEvidence(id, quote) {
 function recentTitle() {
   if (activeTab === "pcf") return "최근 PCF 문서";
   if (activeTab === "document") return "최근 문서";
-  return "최근 메일";
+  return activeTab === "mail" ? "최근 메일" : "최근 자료";
 }
 
 function marked(text, words) {
@@ -336,7 +352,7 @@ function showResults(rows, title) {
   result.replaceChildren();
   element("result-section").hidden = false;
   element("result-heading").textContent = title + " (" + rows.length + ")";
-  if (!rows.length) result.append(node("p", activeTab === "mail" ? "이 범위에서 일치하는 메일을 찾지 못했습니다." : activeTab === "pcf" ? "이 범위에서 일치하는 PCF 문서를 찾지 못했습니다." : "이 범위에서 일치하는 문서를 찾지 못했습니다.", "result-empty"));
+  if (!rows.length) result.append(node("p", "이 범위에서 일치하는 자료를 찾지 못했습니다.", "result-empty"));
   for (const row of rows) {
     const button = node("button", "", "result");
     button.type = "button";
@@ -344,7 +360,7 @@ function showResults(rows, title) {
     if (row.matched?.length) reasons.push("단어 " + row.matched.slice(0, 3).join(" · "));
     if (row.similarity != null) reasons.push("유사도 " + Math.round(row.similarity * 100) + "%");
     button.append(node("strong", row.subject || "제목 없는 메일"),
-      node("span", [row.sender, formatDate(row.sent), row.archive, row.folder, row.attachment, row.attachment ? row.location : ""].filter(Boolean).join(" · "), "result-meta"));
+      node("span", [row.sender, formatDate(row.sent), row.archive, row.folder, row.kind === "mail" ? row.attachment : null, row.attachment || row.kind !== "mail" ? row.location : ""].filter(Boolean).join(" · "), "result-meta"));
     if (reasons.length) button.append(node("span", reasons.join(" · "), "result-why"));
     const preview = node("span", "", "result-preview");
     if (row.snippet && row.matched?.length) preview.append(...marked(row.snippet, row.matched));
@@ -358,7 +374,7 @@ function showResults(rows, title) {
 function showAnswer(data) {
   const box = element("answer");
   const statuses = {
-    answered: "메일 근거로 찾은 답변", partial: "일부 근거만 확인했습니다",
+    answered: "선택한 근거로 찾은 답변", partial: "일부 근거만 확인했습니다",
     ambiguous: "여러 건이 해당합니다. 품번이나 기간을 질문에 추가해 주세요.",
     insufficient: "검색된 자료에서 답을 확인하지 못했습니다.",
     model_busy: "로컬 AI가 다른 질문을 처리 중입니다. 잠시 후 다시 시도하세요.",
@@ -390,78 +406,127 @@ function rememberQuestion(data, query) {
   setQuestionContext((followUp && previousQuestion ? previousQuestion + " / " + query : query).slice(-450));
 }
 
-// AI 질문은 두 단계로 동작한다: 첫 Ctrl+Enter는 단어+의미 검색, 같은 질문으로 다시 누르면 AI가 정리한다.
-let stagedQuery = null;
-element("query").addEventListener("input", () => { stagedQuery = null; });
+function clearReview() {
+  pendingReview = null;
+  reviewBox.hidden = true;
+  element("review-excerpts").replaceChildren();
+}
 
+function clearSearch() {
+  request?.abort();
+  clearReview();
+  element("answer").hidden = true;
+  element("result-section").hidden = true;
+  notice("");
+}
+
+function showReview(data, pcf) {
+  pendingReview = { ...data, pcf };
+  element("review-destination").textContent = data.model + " · " + data.destination;
+  element("review-question").textContent = data.question;
+  const excerpts = element("review-excerpts");
+  excerpts.replaceChildren();
+  for (const excerpt of data.excerpts) {
+    const card = node("div", "", "review-excerpt");
+    const label = node("label", "", "review-choice");
+    const checkbox = node("input");
+    checkbox.type = "checkbox";
+    checkbox.value = excerpt.id;
+    checkbox.checked = true;
+    checkbox.addEventListener("change", () => {
+      reviewSend.disabled = !excerpts.querySelector("input:checked");
+    });
+    const title = excerpt.source;
+    label.append(checkbox, node("span", title.subject + " · " + title.location));
+    const original = node("button", "원문 보기", "text-button");
+    original.type = "button";
+    original.addEventListener("click", () => openEvidence(title.passage));
+    card.append(label, original, node("p", excerpt.text));
+    excerpts.append(card);
+  }
+  reviewSend.disabled = false;
+  reviewBox.hidden = false;
+  reviewBox.scrollIntoView({ block: "nearest" });
+}
+
+element("query").addEventListener("input", clearSearch);
 form.addEventListener("submit", async (event) => {
   event.preventDefault();
-  request?.abort();
+  clearSearch();
   const active = request = new AbortController();
   const query = element("query").value.trim();
   const ask = event.submitter?.value === "ask";
-  const escalate = ask && stagedQuery === query;
-  if (ask) stagedQuery = null;
-  // AI answers always use the external API; the local model only embeds.
-  const external = escalate;
+  const pcf = activeTab === "pcf";
   if (ask && !query) {
     element("query").focus();
     notice("질문을 입력하세요.");
     return;
   }
-  const filters = Object.fromEntries(TAB_FILTERS[activeTab].map((id) => [id, element(id).value]));
+  const filters = Object.fromEntries(["source", ...TAB_FILTERS[activeTab]].map((id) => [id, element(id).value]));
   filters.tab = activeTab;
   const payload = { query, filters, context: ask ? previousQuestion : "" };
-  element("answer").hidden = true;
-  element("result-section").hidden = true;
-  form.closest("main").classList.add("has-query");
-  notice(escalate ? "메일에서 근거를 찾고 있습니다." : "검색 중입니다.");
+  notice(ask ? "답변에 쓸 근거를 찾고 있습니다." : "검색 중입니다.");
   try {
-    if (ask && !escalate) {
-      stagedQuery = query;
+    if (ask) {
+      const data = await call(pcf ? "/api/pcf/preview" : "/api/external/preview", payload, active.signal);
+      if (active.signal.aborted) return;
+      if (data.review) {
+        notice("");
+        showReview(data, pcf);
+      } else {
+        showResults(data.results, "근거 후보");
+        notice("답변에 보낼 발췌문을 찾지 못했습니다.");
+      }
+    } else {
       const data = await call("/api/search", payload, active.signal);
       if (active.signal.aborted) return;
       showResults(data.results, query ? "검색 결과" : recentTitle());
-      notice("단어+의미 검색 결과입니다. 한 번 더 Ctrl+Enter를 누르면 AI가 정리합니다.");
-      return;
-    }
-    if (external) {
-      // PCF 탭은 선주 COMMENT 유사 검색 + 과거 처리 이력 기반 답변 흐름을 쓴다.
-      const pcf = activeTab === "pcf";
-      const review = await call(pcf ? "/api/pcf/preview" : "/api/external/preview", payload, active.signal);
-      if (active.signal.aborted) return;
-      if (!review.review) {
-        showResults(review.results, "근거 후보");
-        notice("외부 API로 보낼 수 있는 발췌문을 찾지 못했습니다.");
-        return;
-      }
-      notice(pcf ? "유사한 과거 선주 COMMENT를 모아 검토합니다." : "외부 API 응답을 기다리고 있습니다.");
-      const answer = await call(pcf ? "/api/pcf/send" : "/api/external/send",
-        { review: review.review, excerpts: review.excerpts.map((item) => item.id) }, active.signal);
-      if (active.signal.aborted) return;
-      showAnswer(answer);
-      if (answer.status !== "external_unavailable") showResults(answer.results, "전송한 발췌문의 원본 메일");
-      rememberQuestion(answer, query);
       notice("");
-      return;
     }
-    const data = await call("/api/search", payload, active.signal);
-    if (active.signal.aborted) return;
-    showResults(data.results, query ? "검색 결과" : recentTitle());
-    notice("");
   } catch (error) {
     if (!active.signal.aborted) notice(error.message);
   }
 });
 
+reviewSend.addEventListener("click", async () => {
+  const review = pendingReview;
+  const selected = [...element("review-excerpts").querySelectorAll("input:checked")].map((input) => Number(input.value));
+  if (!review || !selected.length) return;
+  request?.abort();
+  const active = request = new AbortController();
+  clearReview();
+  notice("답변 API 응답을 기다리는 중입니다.");
+  try {
+    const data = await call(review.pcf ? "/api/pcf/send" : "/api/external/send",
+      { review: review.review, excerpts: selected }, active.signal);
+    if (active.signal.aborted) return;
+    showAnswer(data);
+    if (data.status !== "external_unavailable") showResults(data.results, "사용한 근거");
+    rememberQuestion(data, review.question);
+    notice("");
+  } catch (error) {
+    if (!active.signal.aborted) notice(error.message);
+  }
+});
+element("review-cancel").addEventListener("click", () => {
+  clearReview();
+  element("submit-ask").focus();
+});
+
 element("clear-context").addEventListener("click", () => {
   setQuestionContext("");
+  clearSearch();
   element("query").focus();
 });
-for (const id of ALL_FILTERS) element(id).addEventListener("input", showFilterCount);
-element("clear-filters").addEventListener("click", () => {
-  for (const id of ALL_FILTERS) element(id).value = "";
+function scopeChanged() {
+  clearSearch();
+  setQuestionContext("");
   showFilterCount();
+}
+for (const id of ALL_FILTERS) element(id).addEventListener("input", scopeChanged);
+element("clear-filters").addEventListener("click", () => {
+  for (const id of ["source", ...TAB_FILTERS[activeTab]]) element(id).value = "";
+  scopeChanged();
   element("query").focus();
 });
 function settingsMessage(message) {
@@ -524,6 +589,7 @@ async function changeSettings(action) {
     key: element("settings-key").value.trim(),
   };
   setSettingsBusy(true);
+  if (action !== "test") clearSearch();
   settingsMessage(action === "test" ? "테스트 문구로 연결을 확인하는 중입니다." : "");
   try {
     const data = await call("/api/external/settings", payload);
@@ -571,33 +637,31 @@ element("query").addEventListener("keydown", (event) => {
   form.requestSubmit(element("submit-ask"));
 });
 
-function showAddForm(control, open) {
-  control.form.hidden = !open;
-  control.toggle.setAttribute("aria-expanded", open);
-  if (open) control.input.focus();
+function showAddForm(open) {
+  addForm.hidden = !open;
+  addOpen.setAttribute("aria-expanded", open);
+  (open ? sourcePath : addOpen).focus();
 }
-for (const control of addControls) {
-  control.toggle.addEventListener("click", () => showAddForm(control, control.form.hidden));
-  control.form.addEventListener("submit", async (event) => {
-    event.preventDefault();
-    const button = control.form.querySelector("button[type=submit]");
-    control.notice.textContent = "";
-    button.disabled = true;
-    try {
-      await call("/api/sources", { path: control.input.value.trim().replace(/^"(.*)"$/, "$1") });
-      control.input.value = "";
-      showAddForm(control, false);
-      control.toggle.focus();
-      notice("보관함을 등록했습니다.");
-      await showSources();
-    } catch (error) {
-      if (control.form.hidden) notice(error.message);
-      else control.notice.textContent = error.message;
-    } finally {
-      button.disabled = false;
-    }
-  });
-}
+addOpen.addEventListener("click", () => showAddForm(addForm.hidden));
+addForm.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const button = addForm.querySelector("button[type=submit]");
+  const addNotice = element("add-notice");
+  addNotice.textContent = "";
+  button.disabled = true;
+  try {
+    await call("/api/sources", { path: sourcePath.value.trim().replace(/^"(.*)"$/, "$1") });
+    sourcePath.value = "";
+    showAddForm(false);
+    notice("자료를 등록했습니다.");
+    await showSources();
+  } catch (error) {
+    if (addForm.hidden) notice(error.message);
+    else addNotice.textContent = error.message;
+  } finally {
+    button.disabled = false;
+  }
+});
 
 async function pollSources() {
   try { await showSources(); } catch (error) { if (!sourceSnapshot) notice(error.message); }
