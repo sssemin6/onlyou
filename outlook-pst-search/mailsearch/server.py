@@ -15,7 +15,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from .answer import LocalAI, delivery_date_answer, evidence_for, public_row, validate
+from .answer import LocalAI, delivery_date_answer, embedding_target, evidence_for, public_row, validate
 from .external import DEFAULT_MODEL, DEFAULT_URL, MAX_EXCERPTS, ExternalAI, ExternalRequestError, Reviews
 from .filesystem import local_path
 from .indexer import ImportIssue, Indexer
@@ -376,10 +376,17 @@ def main(argv=None):
     parser.add_argument("--model", default="")
     parser.add_argument("--embedding-model", default="")
     parser.add_argument("--ollama-port", type=int, default=11435)
+    parser.add_argument("--embedding-url", default="",
+                        help="shared Ollama embedding server, e.g. http://192.168.0.10:11434")
     parser.add_argument("--no-browser", action="store_true")
     args = parser.parse_args(argv)
     if not 0 < args.ollama_port < 65536 or not 0 <= args.port < 65536 or args.port == args.ollama_port:
         parser.error("Invalid port configuration")
+    if args.embedding_url:
+        try:
+            embedding_target(args.embedding_url)
+        except ValueError:
+            parser.error("--embedding-url must look like http://nas-ip:11434")
     try:
         external = ExternalAI.from_environment()
     except ValueError:
@@ -390,7 +397,7 @@ def main(argv=None):
     try:
         root = local_path(args.data)
         root.mkdir(mode=0o700, parents=True, exist_ok=True)
-        ai = LocalAI(args.model, args.embedding_model, args.ollama_port)
+        ai = LocalAI(args.model, args.embedding_model, args.ollama_port, embedding_url=args.embedding_url)
         with SessionLock(root):
             store = Store(root)
             indexer = Indexer(store, args.readpst, args.pdftotext, ai)
