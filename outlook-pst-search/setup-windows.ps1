@@ -38,9 +38,9 @@ if (Test-Path "$PSScriptRoot\vendor\readpst-win64\readpst.exe") {
 }
 
 Write-Host "== 3/3 의미 검색 모델(선택)"
-$answer = Read-Host "의미 검색용 Ollama + bge-m3를 설치할까요? 필수는 아닙니다 (Enter=설치, n=건너뛰기)"
+$answer = Read-Host "의미 검색을 이 PC에 설치할까요? 중앙(NAS) 임베딩 서버를 쓰면 n (Enter=이 PC 설치, n=건너뛰기)"
 if ($answer -eq "n") {
-    Write-Host "건너뛰었습니다. 일반(키워드) 검색과 외부 API 답변은 그대로 사용할 수 있습니다."
+    Write-Host "건너뛰었습니다. 일반(키워드) 검색과 외부 API 답변은 그대로 사용할 수 있고, start.cmd의 중앙 임베딩 서버 주소가 쓰입니다."
 } else {
     $ollamaExe = "$env:LOCALAPPDATA\Programs\Ollama\ollama.exe"
     if (-not (Test-Path $ollamaExe)) {
