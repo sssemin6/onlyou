@@ -54,23 +54,37 @@ let sourceSnapshot = "";
 let sourceRequest = 0;
 let settingsRequest = 0;
 
-// 메일/문서 탭: 검색 대상을 한쪽으로 한정한다(서버 filters.tab).
+// 메일/문서/PCF 탭: 검색 대상을 한쪽으로 한정한다(서버 filters.tab).
+const TABS = [["tab-mail", "mail"], ["tab-doc", "document"], ["tab-pcf", "pcf"]];
+const MAIL_ONLY_FILTERS = ["sender", "recipient", "attachment"];  // 문서·PCF에는 없는 메일 정보
 let activeTab = "mail";
+function updateDesignControls() {
+  // PCF 탭은 자체 답변 흐름을 쓰므로 설계 이력 토글을 숨긴다.
+  const pcf = activeTab === "pcf";
+  element("design-toggle").hidden = pcf;
+  element("design-scope").hidden = pcf || !element("design-mode").checked;
+}
 function selectTab(value) {
   activeTab = value;
-  element("tab-mail").classList.toggle("active", value === "mail");
-  element("tab-doc").classList.toggle("active", value === "document");
-  element("tab-mail").setAttribute("aria-selected", String(value === "mail"));
-  element("tab-doc").setAttribute("aria-selected", String(value === "document"));
+  for (const [id, tab] of TABS) {
+    element(id).classList.toggle("active", value === tab);
+    element(id).setAttribute("aria-selected", String(value === tab));
+  }
+  document.querySelectorAll("[data-mail-only]").forEach((field) => { field.hidden = value !== "mail"; });
+  updateDesignControls();
+  showFilterCount();
   try { localStorage.setItem("mailsearch-tab", value); } catch { /* private mode */ }
 }
-for (const [id, value] of [["tab-mail", "mail"], ["tab-doc", "document"]]) {
+for (const [id, value] of TABS) {
   element(id).addEventListener("click", () => {
     selectTab(value);
     element("query").focus();
   });
 }
-try { if (localStorage.getItem("mailsearch-tab") === "document") selectTab("document"); } catch { /* private mode */ }
+try {
+  const saved = localStorage.getItem("mailsearch-tab");
+  if (saved === "document" || saved === "pcf") selectTab(saved);
+} catch { /* private mode */ }
 
 function node(tag, text, className) {
   const result = document.createElement(tag);
@@ -109,7 +123,8 @@ function formatDate(value) {
 }
 
 function showFilterCount() {
-  const count = filterIds.filter((id) => element(id).value.trim()).length;
+  const visible = filterIds.filter((id) => activeTab === "mail" || !MAIL_ONLY_FILTERS.includes(id));
+  const count = visible.filter((id) => element(id).value.trim()).length;
   const badge = element("filter-count");
   badge.textContent = count;
   badge.hidden = !count;
@@ -265,6 +280,12 @@ async function openEvidence(id, quote) {
   }
 }
 
+function recentTitle() {
+  if (activeTab === "pcf") return "최근 PCF 문서";
+  if (activeTab === "document") return "최근 문서";
+  return "최근 메일";
+}
+
 function marked(text, words) {
   // Split text into plain and <mark> nodes around every matched word.
   const parts = [];
@@ -290,7 +311,7 @@ function showResults(rows, title) {
   result.replaceChildren();
   element("result-section").hidden = false;
   element("result-heading").textContent = title + " (" + rows.length + ")";
-  if (!rows.length) result.append(node("p", activeTab === "document" ? "이 범위에서 일치하는 문서를 찾지 못했습니다." : "이 범위에서 일치하는 메일을 찾지 못했습니다.", "result-empty"));
+  if (!rows.length) result.append(node("p", activeTab === "mail" ? "이 범위에서 일치하는 메일을 찾지 못했습니다." : activeTab === "pcf" ? "이 범위에서 일치하는 PCF 문서를 찾지 못했습니다." : "이 범위에서 일치하는 문서를 찾지 못했습니다.", "result-empty"));
   for (const row of rows) {
     const button = node("button", "", "result");
     button.type = "button";
@@ -363,9 +384,12 @@ form.addEventListener("submit", async (event) => {
     notice("질문을 입력하세요.");
     return;
   }
-  const filters = Object.fromEntries(filterIds.map((id) => [id, element(id).value]));
+  const usableFilters = filterIds.filter((id) => activeTab === "mail" || !MAIL_ONLY_FILTERS.includes(id));
+  const filters = Object.fromEntries(usableFilters.map((id) => [id, element(id).value]));
   filters.tab = activeTab;
-  if (element("design-mode").checked && element("design-scope").value) filters.source = element("design-scope").value;
+  if (activeTab !== "pcf" && element("design-mode").checked && element("design-scope").value) {
+    filters.source = element("design-scope").value;
+  }
   const payload = { query, filters, context: ask ? previousQuestion : "" };
   element("answer").hidden = true;
   element("result-section").hidden = true;
@@ -376,20 +400,22 @@ form.addEventListener("submit", async (event) => {
       stagedQuery = query;
       const data = await call("/api/search", payload, active.signal);
       if (active.signal.aborted) return;
-      showResults(data.results, query ? "검색 결과" : "최근 메일");
+      showResults(data.results, query ? "검색 결과" : recentTitle());
       notice("단어+의미 검색 결과입니다. 한 번 더 Ctrl+Enter를 누르면 AI가 정리합니다.");
       return;
     }
     if (external) {
-      const design = element("design-mode").checked;
+      // PCF 탭은 선주 COMMENT 유사 검색 + 과거 처리 이력 기반 답변 흐름을 그대로 쓴다.
+      const design = activeTab === "pcf" || element("design-mode").checked;
       const review = await call(design ? "/api/design/preview" : "/api/external/preview", payload, active.signal);
       if (active.signal.aborted) return;
       if (!review.review) {
         showResults(review.results, "근거 후보");
-        notice("외부 API로 보낼 수 있는 메일 발췌문을 찾지 못했습니다.");
+        notice("외부 API로 보낼 수 있는 발췌문을 찾지 못했습니다.");
         return;
       }
-      notice(design ? "설계 이력 근거를 모아 검토합니다." : "외부 API 응답을 기다리고 있습니다.");
+      notice(activeTab === "pcf" ? "유사한 과거 선주 COMMENT를 모아 검토합니다."
+        : design ? "설계 이력 근거를 모아 검토합니다." : "외부 API 응답을 기다리고 있습니다.");
       const answer = await call(design ? "/api/design/send" : "/api/external/send",
         { review: review.review, excerpts: review.excerpts.map((item) => item.id) }, active.signal);
       if (active.signal.aborted) return;
@@ -401,16 +427,14 @@ form.addEventListener("submit", async (event) => {
     }
     const data = await call("/api/search", payload, active.signal);
     if (active.signal.aborted) return;
-    showResults(data.results, query ? "검색 결과" : "최근 메일");
+    showResults(data.results, query ? "검색 결과" : recentTitle());
     notice("");
   } catch (error) {
     if (!active.signal.aborted) notice(error.message);
   }
 });
 
-element("design-mode").addEventListener("change", () => {
-  element("design-scope").hidden = !element("design-mode").checked;
-});
+element("design-mode").addEventListener("change", updateDesignControls);
 
 element("clear-context").addEventListener("click", () => {
   setQuestionContext("");
@@ -420,7 +444,7 @@ for (const id of filterIds) element(id).addEventListener("input", showFilterCoun
 element("clear-filters").addEventListener("click", () => {
   for (const id of filterIds) element(id).value = "";
   showFilterCount();
-  element("source").focus();
+  element("query").focus();
 });
 function settingsMessage(message) {
   element("settings-status").textContent = message;
