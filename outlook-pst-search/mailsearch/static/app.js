@@ -14,7 +14,13 @@ const addControls = [...document.querySelectorAll(".source-group")].map((group) 
 }));
 const settingsDialog = element("settings-dialog");
 const settingsForm = element("settings-form");
-const filterIds = ["subject", "body", "sender", "recipient", "attachment", "after", "before"];
+// 탭마다 쓸 수 있는 검색 범위가 다르다 — 문서엔 발신자가 없고 PCF는 전용 범위를 쓴다.
+const TAB_FILTERS = {
+  mail: ["subject", "body", "sender", "recipient", "attachment", "after", "before"],
+  document: ["subject", "body", "after", "before"],
+  pcf: ["class", "flag", "owner", "hull", "drawing"],
+};
+const ALL_FILTERS = [...new Set([...TAB_FILTERS.mail, ...TAB_FILTERS.document, ...TAB_FILTERS.pcf])];
 const dateFormat = new Intl.DateTimeFormat("ko-KR", { dateStyle: "medium", timeStyle: "short" });
 const stateNames = {
   queued: "대기", extracting: "PST 읽는 중", headers: "메일 색인 중", attachments: "첨부 색인 중",
@@ -63,22 +69,16 @@ let settingsRequest = 0;
 
 // 메일/문서/PCF 탭: 검색 대상을 한쪽으로 한정한다(서버 filters.tab).
 const TABS = [["tab-mail", "mail"], ["tab-doc", "document"], ["tab-pcf", "pcf"]];
-const MAIL_ONLY_FILTERS = ["sender", "recipient", "attachment"];  // 문서·PCF에는 없는 메일 정보
 let activeTab = "mail";
-function updateDesignControls() {
-  // PCF 탭은 자체 답변 흐름을 쓰므로 설계 이력 토글을 숨긴다.
-  const pcf = activeTab === "pcf";
-  element("design-toggle").hidden = pcf;
-  element("design-scope").hidden = pcf || !element("design-mode").checked;
-}
 function selectTab(value) {
   activeTab = value;
   for (const [id, tab] of TABS) {
     element(id).classList.toggle("active", value === tab);
     element(id).setAttribute("aria-selected", String(value === tab));
   }
-  document.querySelectorAll("[data-mail-only]").forEach((field) => { field.hidden = value !== "mail"; });
-  updateDesignControls();
+  document.querySelectorAll(".filter-grid label[data-show]").forEach((field) => {
+    field.hidden = !field.dataset.show.split(" ").includes(value);
+  });
   showFilterCount();
   try { localStorage.setItem("mailsearch-tab", value); } catch { /* private mode */ }
 }
@@ -130,8 +130,7 @@ function formatDate(value) {
 }
 
 function showFilterCount() {
-  const visible = filterIds.filter((id) => activeTab === "mail" || !MAIL_ONLY_FILTERS.includes(id));
-  const count = visible.filter((id) => element(id).value.trim()).length;
+  const count = TAB_FILTERS[activeTab].filter((id) => element(id).value.trim()).length;
   const badge = element("filter-count");
   badge.textContent = count;
   badge.hidden = !count;
@@ -247,14 +246,6 @@ async function showSources() {
   element("external-status").textContent = data.external
     ? "외부 API 연결됨 · " + data.external.model
     : "외부 API 연결 전";
-  const scope = element("design-scope");
-  const currentScope = scope.value;
-  scope.replaceChildren(new Option("전체 보관함", ""));
-  for (const source of data.sources) {
-    const name = source.path.split(/[\\/]/).pop();
-    if (source.available && !["removing", "remove_failed"].includes(source.state)) scope.append(new Option(name, source.id));
-  }
-  if ([...scope.options].some((option) => option.value === currentScope)) scope.value = currentScope;
 }
 
 function highlight(text, quote) {
@@ -418,12 +409,8 @@ form.addEventListener("submit", async (event) => {
     notice("질문을 입력하세요.");
     return;
   }
-  const usableFilters = filterIds.filter((id) => activeTab === "mail" || !MAIL_ONLY_FILTERS.includes(id));
-  const filters = Object.fromEntries(usableFilters.map((id) => [id, element(id).value]));
+  const filters = Object.fromEntries(TAB_FILTERS[activeTab].map((id) => [id, element(id).value]));
   filters.tab = activeTab;
-  if (activeTab !== "pcf" && element("design-mode").checked && element("design-scope").value) {
-    filters.source = element("design-scope").value;
-  }
   const payload = { query, filters, context: ask ? previousQuestion : "" };
   element("answer").hidden = true;
   element("result-section").hidden = true;
@@ -439,18 +426,17 @@ form.addEventListener("submit", async (event) => {
       return;
     }
     if (external) {
-      // PCF 탭은 선주 COMMENT 유사 검색 + 과거 처리 이력 기반 답변 흐름을 그대로 쓴다.
-      const design = activeTab === "pcf" || element("design-mode").checked;
-      const review = await call(design ? "/api/design/preview" : "/api/external/preview", payload, active.signal);
+      // PCF 탭은 선주 COMMENT 유사 검색 + 과거 처리 이력 기반 답변 흐름을 쓴다.
+      const pcf = activeTab === "pcf";
+      const review = await call(pcf ? "/api/pcf/preview" : "/api/external/preview", payload, active.signal);
       if (active.signal.aborted) return;
       if (!review.review) {
         showResults(review.results, "근거 후보");
         notice("외부 API로 보낼 수 있는 발췌문을 찾지 못했습니다.");
         return;
       }
-      notice(activeTab === "pcf" ? "유사한 과거 선주 COMMENT를 모아 검토합니다."
-        : design ? "설계 이력 근거를 모아 검토합니다." : "외부 API 응답을 기다리고 있습니다.");
-      const answer = await call(design ? "/api/design/send" : "/api/external/send",
+      notice(pcf ? "유사한 과거 선주 COMMENT를 모아 검토합니다." : "외부 API 응답을 기다리고 있습니다.");
+      const answer = await call(pcf ? "/api/pcf/send" : "/api/external/send",
         { review: review.review, excerpts: review.excerpts.map((item) => item.id) }, active.signal);
       if (active.signal.aborted) return;
       showAnswer(answer);
@@ -468,15 +454,13 @@ form.addEventListener("submit", async (event) => {
   }
 });
 
-element("design-mode").addEventListener("change", updateDesignControls);
-
 element("clear-context").addEventListener("click", () => {
   setQuestionContext("");
   element("query").focus();
 });
-for (const id of filterIds) element(id).addEventListener("input", showFilterCount);
+for (const id of ALL_FILTERS) element(id).addEventListener("input", showFilterCount);
 element("clear-filters").addEventListener("click", () => {
-  for (const id of filterIds) element(id).value = "";
+  for (const id of ALL_FILTERS) element(id).value = "";
   showFilterCount();
   element("query").focus();
 });
