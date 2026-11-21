@@ -17,7 +17,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from .answer import (PCF_INSTRUCTIONS, LocalAI, pcf_retrieval, delivery_date_answer,
-                     evidence_for, merge_rows, numeric_answer, public_row, validate)
+                     evidence_for, merge_rows, public_row, validate)
 from .bundled import prepare as prepare_bundled
 from .external import DEFAULT_MODEL, DEFAULT_URL, MAX_EXCERPTS, ExternalAI, ExternalRequestError, Reviews
 from .filesystem import local_path
@@ -190,7 +190,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_bytes(200, content_type, body)
         elif route.path == "/api/sources":
             sources = self.server.store.sources()
-            ids = set(self.server.store.allowed_sources())
+            ids = set(self.server.store.allowed_sources(sources=sources))
             external = self.server.external
             self.send_json(200, {
                 "sources": [{**row, "available": row["id"] in ids,
@@ -290,18 +290,20 @@ class Handler(BaseHTTPRequestHandler):
         if route in {"/api/external/preview", "/api/pcf/preview"} and not external:
             self.send_json(403, {"error": "external_disabled"})
             return
-        if route == "/api/pcf/preview":
+        pcf = route == "/api/pcf/preview"
+        if pcf:
+            filters["tab"] = "pcf"
             evidence, mode = pcf_retrieval(store, ai, query, filters, context)
         else:
             evidence, mode = evidence_for(store, ai, query, filters, context,
                                           semantic=(route in {"/api/answer", "/api/external/preview"}))
         if route in {"/api/external/preview", "/api/pcf/preview"}:
-            # PCF comment questions carry a larger evidence budget.
-            budget = {"limit": 2400} if route == "/api/pcf/preview" else {}
-            token, review = self.server.reviews.create(query, evidence, external.review_generation, **budget)
+            token, review = self.server.reviews.create(query, evidence, external.review_generation, pcf=pcf)
+            by_passage = {row["passage"]: public_row(row) for row in evidence}
             self.send_json(200, {
                 **external.public, "review": token, "question": query,
-                "excerpts": [{"id": item.number, "text": item.text} for item in review.excerpts] if review else [],
+                "excerpts": [{"id": item.number, "text": item.text, "source": by_passage[item.passage]}
+                             for item in review.excerpts] if review else [],
                 "results": [public_row(row) for row in evidence],
             })
             return
@@ -351,23 +353,18 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(403, {"error": "external_disabled"})
                 return
             review = server.reviews.take(token)
-            if review is None or review.generation is not external.review_generation:
+            if review is None or review.generation is not external.review_generation or review.pcf != pcf:
                 self.send_json(409, {"error": "external_review_expired"})
                 return
             excerpts = [item for item in review.excerpts if item.number in selected]
             if len(excerpts) != len(selected):
                 raise ValueError("external_excerpts")
             ids = [item.passage for item in excerpts]
-            rows = server.store.passages(ids)
+            scope = {"tab": "pcf"} if pcf else {}
+            rows = server.store.passages(ids, scope)
             if len(rows) != len(ids):
                 self.send_json(409, {"error": "external_source_changed"})
                 return
-            if pcf:
-                computed = numeric_answer(review.question, rows)
-                if computed is not None:
-                    self.send_json(200, {**computed, "results": [public_row(row) for row in rows],
-                                         "provider": "external"})
-                    return
             try:
                 if pcf:
                     result = external.answer(review.question, excerpts,
@@ -380,9 +377,9 @@ class Handler(BaseHTTPRequestHandler):
                     "reason": type(exc).__name__,
                 })
                 return
-            visible = {row["passage"]: row for row in server.store.passages(ids)}
+            visible = {row["passage"]: row for row in server.store.passages(ids, scope)}
             verified = [{**visible[item.passage], "text": item.text} for item in excerpts if item.passage in visible]
-            checked = validate(result, verified, review.question, text_for=lambda row: row["text"])
+            checked = validate(result, verified, review.question, text_for=lambda row: row["text"], pcf=pcf)
             self.send_json(200, {
                 **checked, "results": [public_row(row) for row in verified], "provider": "external",
             })
