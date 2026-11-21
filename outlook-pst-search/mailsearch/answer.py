@@ -310,6 +310,50 @@ def validate(result, candidates, question="", *, text_for=source_text):
     return {"status": (status if len(proposed) == len(claims) else "partial") if claims else "insufficient", "claims": claims}
 
 
+NUMBER_WITH_UNIT = re.compile(r"(\d+(?:\.\d+)?)\s*(mm|cm|km|kg|MPa|kPa|kW|°C|[Tmg%원WVA])")
+
+
+def numeric_answer(question, evidence):
+    """Deterministic arithmetic over stored values with unit citations (PRD 02 section 5)."""
+    intent = ("diff" if re.search(r"차이|얼마나\s*차", question)
+              else "max" if re.search(r"최댓값|최대", question)
+              else "sum" if "합계" in question else None)
+    if not intent:
+        return None
+    by_unit = {}
+    for row in evidence:
+        if row.get("attachment") is None and row.get("location") == "파일명":
+            continue
+        for match in NUMBER_WITH_UNIT.finditer(row["text"]):
+            by_unit.setdefault(match.group(2), []).append((float(match.group(1)), row, match.group(0)))
+    wanted = next((unit for unit in by_unit if unit in question), None)
+    groups = [by_unit[wanted]] if wanted else [items for items in by_unit.values()]
+    qualifying = [items for items in groups if len(items) >= 2 and len({i[1]["passage"] for i in items[:2]}) == 2
+                  and all(i[0] > 0 for i in items)]
+    if not qualifying:
+        return None
+    if intent in {"diff", "sum"} and len(qualifying) != 1:
+        return None  # ambiguous: more than one unit could answer the question
+    items = max(qualifying, key=len)
+    unit = next(unit for unit, values in by_unit.items() if values is items)
+    if intent == "max":
+        value, row, quote = max(items, key=lambda item: item[0])
+        text = f"자료에서 가장 큰 값은 {value:g} {unit}입니다."
+        picks = [(row, quote)]
+    else:
+        if len(items) != 2:
+            return None
+        (first, first_row, first_quote), (second, second_row, second_quote) = items
+        amount = round(abs(first - second) if intent == "diff" else first + second, 6)
+        text = (f"{first:g} {unit}와 {second:g} {unit}의 차이는 {amount:g} {unit}입니다." if intent == "diff"
+                else f"{first:g} {unit}과 {second:g} {unit}의 합계는 {amount:g} {unit}입니다.")
+        picks = [(first_row, first_quote), (second_row, second_quote)]
+    return {"status": "answered", "claims": [{
+        "text": text,
+        "citations": [{**public_row(row), "quote": quote} for row, quote in picks],
+    }]}
+
+
 def delivery_date_answer(question, evidence, context=""):
     """Extract a narrowly defined answer when one explicit agreement is visible."""
     if not DECISION_QUESTION.search(question) or not re.search(r"언제|몇\s*월|며칠|날짜", question):
