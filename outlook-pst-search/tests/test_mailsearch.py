@@ -427,6 +427,28 @@ class ExternalTransport(unittest.TestCase):
             con.request.assert_called_once()
             con.close.assert_called_once()
 
+    def test_anthropic_messages_endpoint(self):
+        ai = ExternalAI("https://api.z.ai/api/anthropic/v1/messages", "glm-5.3", "placeholder-token")
+        with patch("mailsearch.external.http.client.HTTPSConnection") as https:
+            con = https.return_value
+            reply = con.getresponse.return_value
+            reply.status = 200
+            result = {"status": "insufficient", "claims": []}
+            reply.read.return_value = json.dumps(
+                {"content": [{"type": "text", "text": json.dumps(result)}]}
+            ).encode()
+            self.assertEqual(ai.answer("테스트", [Excerpt(1, 91, "테스트 근거")])["status"], "insufficient")
+            method, path, body, headers = con.request.call_args.args
+            self.assertEqual((method, path), ("POST", "/api/anthropic/v1/messages"))
+            self.assertEqual(headers["x-api-key"], "placeholder-token")
+            self.assertEqual(headers["anthropic-version"], "2023-06-01")
+            sent = json.loads(body)
+            self.assertEqual(sent["model"], "glm-5.3")
+            self.assertEqual(sent["max_tokens"], 1500)
+            self.assertIn("system", sent)
+            self.assertEqual(sent["messages"][0]["role"], "user")
+            self.assertNotIn("response_format", sent)
+
     def test_review_expiry_and_size_limits(self):
         reviews = Reviews()
         rows = [{"passage": n, "text": "A" * 800 + "불필요한 뒷부분", "location": f"{n}페이지"}
