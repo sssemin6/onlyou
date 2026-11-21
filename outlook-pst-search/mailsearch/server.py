@@ -10,12 +10,14 @@ import secrets
 import sqlite3
 import sys
 import threading
+import time
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlsplit
 
 from .answer import LocalAI, delivery_date_answer, evidence_for, merge_rows, public_row, validate
+from .bundled import prepare as prepare_bundled
 from .external import DEFAULT_MODEL, DEFAULT_URL, MAX_EXCERPTS, ExternalAI, ExternalRequestError, Reviews
 from .filesystem import local_path
 from .indexer import ImportIssue, Indexer
@@ -66,6 +68,7 @@ class App(ThreadingHTTPServer):
         self.token = secrets.token_urlsafe(32)
         self.generation = threading.BoundedSemaphore(1)
         self.origin = f"http://127.0.0.1:{self.server_port}"
+        self.last_seen = 0.0
 
 
 def filters_from(get):
@@ -158,10 +161,14 @@ class Handler(BaseHTTPRequestHandler):
             ids = set(self.server.store.allowed_sources())
             external = self.server.external
             self.send_json(200, {
-                "sources": [{**row, "available": row["id"] in ids} for row in sources],
+                "sources": [{**row, "available": row["id"] in ids,
+                             "updates": self.server.indexer.pending_updates(row)} for row in sources],
                 "model": self.server.ai.model, "embedding": self.server.ai.embedding_model,
                 "external": external.public if external else None,
             })
+        elif route.path == "/api/ping":
+            self.server.last_seen = time.time()
+            self.send_json(200, {"ok": True})
         elif route.path == "/api/external/settings":
             external = self.server.external
             self.send_json(200, {
@@ -400,7 +407,11 @@ def main(argv=None):
     try:
         root = local_path(args.data)
         root.mkdir(mode=0o700, parents=True, exist_ok=True)
-        ai = LocalAI(args.model, args.embedding_model, args.ollama_port)
+        models_dir = None
+        if args.embedding_model and args.embedding_model.split(":")[0] == "bge-m3":
+            # The repository ships the model split into parts; join it once on first run.
+            models_dir = prepare_bundled(root / "ollama-models")
+        ai = LocalAI(args.model, args.embedding_model, args.ollama_port, models_dir=models_dir)
         with SessionLock(root):
             store = Store(root)
             indexer = Indexer(store, args.readpst, args.pdftotext, ai)
@@ -409,12 +420,22 @@ def main(argv=None):
                 print(app.origin, flush=True)
                 if not args.no_browser:
                     webbrowser.open(app.origin)
+                    # Closing every app page stops the server (and its Ollama).
+                    def watch_page():
+                        while True:
+                            time.sleep(3)
+                            seen = app.last_seen
+                            if seen and time.time() - seen > 12:
+                                app.shutdown()
+                                return
+                    threading.Thread(target=watch_page, daemon=True).start()
                 try:
                     app.serve_forever()
                 except KeyboardInterrupt:
                     pass
                 finally:
                     indexer.stop()
+                    ai.shutdown()
     except (OSError, sqlite3.Error, ValueError, RuntimeError) as exc:
         print(f"Startup failed ({type(exc).__name__}). Check the data folder, port, and SQLite 3.42+ with FTS5.", file=sys.stderr)
         return 1
