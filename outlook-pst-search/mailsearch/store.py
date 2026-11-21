@@ -77,6 +77,26 @@ VISIBLE_VERSION = """m.version=coalesce(s.active,s.pending)
     AND (s.active IS NOT NULL OR coalesce(s.issue,'')<>'changed')"""
 HANGUL = re.compile(r"[가-힣]+")
 WORD = re.compile(r"[^\W_]+(?:[-_][^\W_]+)*", re.UNICODE)
+QUOTED = re.compile(r'"([^"\n]{1,120})"')
+
+
+def quoted_plan(query):
+    """Return a boolean plan of "quoted" exact terms, or None when none are quoted.
+
+    Terms separated by nothing or & must all appear; terms separated by or need one.
+    """
+    found = list(QUOTED.finditer(query))
+    if not found:
+        return None
+    plan = []
+    for index, match in enumerate(found):
+        term = match.group(1).strip()
+        if not term:
+            continue
+        separator = query[found[index - 1].end():match.start()] if index else ""
+        joiner = "or" if re.search(r"(?:^|[^a-z])or(?:$|[^a-z])", separator, re.I) or "|" in separator else "&"
+        plan.append((joiner, term))
+    return plan or None
 SUFFIXES = ("으로부터", "에게서는", "에서", "으로", "에게", "부터", "까지", "처럼", "으로는", "이고", "만큼", "이랑", "이며", "의", "은", "는", "이", "가", "을", "를", "도", "만", "와", "과", "로", "건")
 STOP = set("지난번에 지난번 결국 혹시 그리고 그거 어디 무슨 언제 누가 어떤 무엇 알려줘 알려주세요 확인해줘 됐지 정해졌지 정해졌어 됐어 요약해줘 부탁해 그 뒤에 뒤 기준 내역 건 관련 결과 대해서 최종 나한테 그때 찾고싶어 어떻게 내용 보낸 메일 받은 보여줘".split())
 SYNONYMS = {
@@ -254,13 +274,16 @@ class Store:
         return ids
 
     def scope(self, filters, extra=()):
-        ids = self.allowed_sources(filters.get("source"))
+        ids = self.allowed_sources()
         clauses = [VISIBLE_VERSION, "m.source IN (SELECT value FROM json_each(?))"]
         params = [json.dumps(ids)]
-        for name, col in {"sender": "m.sender", "recipient": "m.recipient", "folder": "m.folder"}.items():
+        for name, col in {"sender": "m.sender", "recipient": "m.recipient", "subject": "m.subject", "body": "m.body"}.items():
             if filters.get(name):
                 clauses.append(f"instr(lower({col}),lower(?))>0")
                 params.append(filters[name])
+        if filters.get("attachment") in ("yes", "no"):
+            negate = "" if filters["attachment"] == "yes" else "NOT "
+            clauses.append(f"{negate}EXISTS(SELECT 1 FROM attachments a WHERE a.mail=m.id)")
         if filters.get("after"):
             clauses.append("m.sent>=?")
             params.append(filters["after"])
@@ -401,6 +424,29 @@ class Store:
         return [row for row, _ in sorted(ordered, key=lambda entry: (
             exact_identifier and exact in WORD.findall(normalized(entry[0]["subject"] + " " + entry[0]["text"])), entry[1]
         ), reverse=True)[:limit]]
+
+    def exact_search(self, plan, filters):
+        """Search "quoted" terms as exact substrings; & within a group, or between groups."""
+        groups, current = [], []
+        for joiner, term in plan:
+            if joiner == "or" and current:
+                groups.append(current)
+                current = [term]
+            else:
+                current.append(term)
+        groups.append(current)
+        selected = {}
+        for group in groups:
+            matches = None
+            for term in group:
+                verified = {}
+                for row in self.lexical(term, filters, fuzzy=False, limit=400):
+                    if normalized(term) in normalized(f"{row['subject']} {row['text']}"):
+                        verified.setdefault(row["fingerprint"], row)
+                matches = verified if matches is None else {key: row for key, row in matches.items() if key in verified}
+            for row in (matches or {}).values():
+                selected.setdefault(row["fingerprint"], row)
+        return list(selected.values())
 
     def semantic(self, values, model, filters, limit=40):
         vector = vector_array(pack_vector(values))
