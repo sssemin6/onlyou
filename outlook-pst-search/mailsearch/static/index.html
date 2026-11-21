@@ -54,6 +54,11 @@
         </div>
       </section>
 
+      <div class="tabs" role="tablist" aria-label="검색 대상">
+        <button type="button" id="tab-mail" class="tab active" role="tab" aria-selected="true">메일</button>
+        <button type="button" id="tab-doc" class="tab" role="tab" aria-selected="false">문서</button>
+      </div>
+
       <form id="search-form" class="search-form" role="search" aria-label="보관 메일 검색">
         <label for="query" class="search-label">검색어 또는 질문</label>
         <div class="search-line">
@@ -131,7 +136,6 @@
           <p id="external-status">외부 API 연결 전</p>
         </div>
       </div>
-      <div id="decisions" class="decisions" aria-label="저장된 설계 결정"></div>
     </aside>
   </div>
 
