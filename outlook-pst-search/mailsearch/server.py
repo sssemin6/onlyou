@@ -102,6 +102,9 @@ def filters_from(get):
     attachment = get("attachment", "")
     if attachment in ("yes", "no"):
         filters["attachment"] = attachment
+    tab = get("tab", "")
+    if tab in ("mail", "document"):
+        filters["tab"] = tab
     source = get("source", "")
     if source:
         filters["source"] = int(source)
@@ -192,8 +195,6 @@ class Handler(BaseHTTPRequestHandler):
         elif route.path == "/api/ping":
             self.server.last_seen = time.time()
             self.send_json(200, {"ok": True})
-        elif route.path == "/api/decisions":
-            self.send_json(200, {"decisions": self.server.store.decisions()})
         elif route.path == "/api/external/settings":
             external = self.server.external
             self.send_json(200, {
@@ -233,8 +234,6 @@ class Handler(BaseHTTPRequestHandler):
                 self.query(route, payload)
             elif route in {"/api/external/send", "/api/design/send"}:
                 self.send_external(payload, design=route == "/api/design/send")
-            elif route == "/api/decisions":
-                self.change_decisions(payload)
             elif route == "/api/external/settings":
                 self.change_external_settings(payload)
             else:
@@ -393,24 +392,6 @@ class Handler(BaseHTTPRequestHandler):
         finally:
             server.outbound.release()
 
-
-    def change_decisions(self, payload):
-        if payload.get("action") == "remove":
-            with self.server.store.connection() as conn:
-                conn.execute("DELETE FROM decisions WHERE id=?", (int(payload["id"]),))
-            self.send_json(200, {"ok": True})
-            return
-        question, claims, passages = payload.get("question", ""), payload.get("claims"), payload.get("passages")
-        if (not isinstance(question, str) or not question.strip() or not isinstance(claims, list) or not claims
-                or not isinstance(passages, list) or not 1 <= len(passages) <= 20
-                or any(type(number) is not int for number in passages)
-                or len(json.dumps(claims, ensure_ascii=False)) > 20000):
-            raise ValueError("decision")
-        rows = self.server.store.passages(passages)
-        if len(rows) != len(passages):
-            raise ValueError("decision")
-        identifier = self.server.store.save_decision(question.strip()[:450], claims, rows)
-        self.send_json(200, {"id": identifier})
 
     def change_external_settings(self, payload):
         action = payload.get("action")
