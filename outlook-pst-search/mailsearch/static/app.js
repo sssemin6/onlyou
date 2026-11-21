@@ -170,8 +170,6 @@ async function showSources() {
     const replacement = [...list.querySelectorAll("button")].find((button) => button.dataset.action === focusedAction);
     (replacement || addToggle).focus({ preventScroll: true });
   }
-  element("provider-control").hidden = !data.external;
-  if (!data.external) element("provider").value = "local";
   const modelStatus = element("model-status");
   modelStatus.parentElement.dataset.configured = Boolean(data.model);
   modelStatus.textContent = data.model
@@ -241,6 +239,26 @@ async function openEvidence(id, quote) {
   }
 }
 
+function marked(text, words) {
+  // Split text into plain and <mark> nodes around every matched word.
+  const parts = [];
+  const lower = text.toLowerCase();
+  let index = 0;
+  while (index < text.length) {
+    let at = -1;
+    let hit = "";
+    for (const word of words) {
+      const found = lower.indexOf(word.toLowerCase(), index);
+      if (found >= 0 && (at < 0 || found < at)) { at = found; hit = word; }
+    }
+    if (at < 0) break;
+    parts.push(text.slice(index, at), node("mark", text.slice(at, at + hit.length)));
+    index = at + hit.length;
+  }
+  parts.push(text.slice(index));
+  return parts;
+}
+
 function showResults(rows, title) {
   const result = element("results");
   result.replaceChildren();
@@ -256,7 +274,10 @@ function showResults(rows, title) {
     button.append(node("strong", row.subject || "제목 없는 메일"),
       node("span", [row.sender, formatDate(row.sent), row.archive, row.folder, row.attachment, row.attachment ? row.location : ""].filter(Boolean).join(" · "), "result-meta"));
     if (reasons.length) button.append(node("span", reasons.join(" · "), "result-why"));
-    button.append(node("span", row.preview, "result-preview"));
+    const preview = node("span", "", "result-preview");
+    if (row.snippet && row.matched?.length) preview.append(...marked(row.snippet, row.matched));
+    else preview.textContent = row.preview;
+    button.append(preview);
     button.addEventListener("click", () => openEvidence(row.passage));
     result.append(button);
   }
@@ -309,7 +330,8 @@ form.addEventListener("submit", async (event) => {
   const ask = event.submitter?.value === "ask";
   const escalate = ask && stagedQuery === query;
   if (ask) stagedQuery = null;
-  const external = escalate && element("provider").value === "external";
+  // AI answers always use the external API; the local model only embeds.
+  const external = escalate;
   if (ask && !query) {
     element("query").focus();
     notice("질문을 입력하세요.");
@@ -348,21 +370,9 @@ form.addEventListener("submit", async (event) => {
       notice("");
       return;
     }
-    if (ask) {
-      const preliminary = await call("/api/candidates", payload, active.signal);
-      if (active.signal.aborted) return;
-      showResults(preliminary.results, "근거 후보");
-      notice("로컬 AI가 답변을 작성하고 있습니다.");
-      const data = await call("/api/answer", payload, active.signal);
-      if (active.signal.aborted) return;
-      showAnswer(data);
-      showResults(data.results, "관련 메일");
-      rememberQuestion(data, query);
-    } else {
-      const data = await call("/api/search", payload, active.signal);
-      if (active.signal.aborted) return;
-      showResults(data.results, query ? "검색 결과" : "최근 메일");
-    }
+    const data = await call("/api/search", payload, active.signal);
+    if (active.signal.aborted) return;
+    showResults(data.results, query ? "검색 결과" : "최근 메일");
     notice("");
   } catch (error) {
     if (!active.signal.aborted) notice(error.message);
@@ -443,8 +453,7 @@ async function changeSettings(action) {
   try {
     const data = await call("/api/external/settings", payload);
     if (action !== "test") {
-      element("provider-control").hidden = !data.configured;
-      if (!data.configured) element("provider").value = "local";
+      showSources().catch(() => {});
     }
     if (version !== settingsRequest || !settingsDialog.open) return;
     if (action === "test") {
