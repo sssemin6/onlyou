@@ -69,6 +69,7 @@
           </button>
         </div>
         <label class="design-toggle"><input id="design-mode" type="checkbox">설계 이력 질문</label>
+        <label class="design-scope" hidden>답변 범위<select id="design-scope"><option value="">전체 보관함</option></select></label>
         <details class="filters" id="filter-panel">
           <summary>
             <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M4 7h16M4 12h16M4 17h16"/><circle cx="9" cy="7" r="2"/><circle cx="16" cy="12" r="2"/><circle cx="10" cy="17" r="2"/></svg>
@@ -130,6 +131,7 @@
           <p id="external-status">외부 API 연결 전</p>
         </div>
       </div>
+      <div id="decisions" class="decisions" aria-label="저장된 설계 결정"></div>
     </aside>
   </div>
 
