@@ -5,10 +5,9 @@ const token = document.querySelector('meta[name="mail-session"]').content;
 const form = element("search-form");
 const addForm = element("add-form");
 const addToggle = element("add-toggle");
-const reviewDialog = element("review-dialog");
 const settingsDialog = element("settings-dialog");
 const settingsForm = element("settings-form");
-const filterIds = ["source", "sender", "recipient", "folder", "after", "before"];
+const filterIds = ["subject", "body", "sender", "recipient", "attachment", "after", "before"];
 const dateFormat = new Intl.DateTimeFormat("ko-KR", { dateStyle: "medium", timeStyle: "short" });
 const stateNames = {
   queued: "대기", extracting: "PST 읽는 중", headers: "메일 색인 중", attachments: "첨부 색인 중",
@@ -53,7 +52,6 @@ let previousQuestion = "";
 let request;
 let sourceSnapshot = "";
 let sourceRequest = 0;
-let pendingReview;
 let settingsRequest = 0;
 
 function node(tag, text, className) {
@@ -108,10 +106,7 @@ async function showSources() {
   if (next === sourceSnapshot) return;
   sourceSnapshot = next;
   const list = element("sources");
-  const scope = element("source");
-  const current = scope.value;
   const focusedAction = list.contains(document.activeElement) ? document.activeElement.dataset.action : "";
-  scope.replaceChildren(new Option("전체", ""));
   list.replaceChildren();
   if (!data.sources.length) list.append(node("p", "등록한 파일이 없습니다.", "source-empty"));
   for (const source of data.sources) {
@@ -166,9 +161,7 @@ async function showSources() {
     }
     entry.append(actions);
     list.append(entry);
-    if (source.available && !["removing", "remove_failed"].includes(source.state)) scope.append(new Option(name, source.id));
   }
-  if ([...scope.options].some((option) => option.value === current)) scope.value = current;
   showFilterCount();
   if (focusedAction) {
     const replacement = [...list.querySelectorAll("button")].find((button) => button.dataset.action === focusedAction);
@@ -274,7 +267,6 @@ function showAnswer(data) {
     external_unavailable: "외부 API 응답을 받지 못했습니다. 연결 주소, 키, 모델, 네트워크를 확인하세요.",
   };
   const heading = node("h2", "AI 답변");
-  if (data.provider === "external") heading.append(node("span", "외부 API", "provider-badge"));
   box.replaceChildren(heading, node("p", statuses[data.status] || "", "answer-status"));
   let count = 0;
   for (const claim of data.claims) {
@@ -296,30 +288,6 @@ function rememberQuestion(data, query) {
   if (!["answered", "partial"].includes(data.status)) return;
   const followUp = /^(그|그리고|뒤에|누가|언제|어떻게|왜)/.test(query);
   setQuestionContext((followUp && previousQuestion ? previousQuestion + " / " + query : query).slice(-450));
-}
-
-function showReview(data, active) {
-  const list = element("review-excerpts");
-  element("review-question").textContent = data.question;
-  element("review-destination").textContent = data.destination;
-  element("review-model").textContent = data.model;
-  list.replaceChildren();
-  for (const item of data.excerpts) {
-    const label = node("label", "", "excerpt-toggle");
-    const checkbox = node("input");
-    checkbox.type = "checkbox";
-    checkbox.name = "excerpt";
-    checkbox.value = item.id;
-    checkbox.checked = true;
-    label.append(checkbox, node("span", "발췌문 " + item.id));
-    const card = node("div", "", "review-excerpt");
-    card.append(label, node("pre", item.text));
-    list.append(card);
-  }
-  element("review-send").disabled = false;
-  pendingReview = { data, active };
-  reviewDialog.showModal();
-  element("review-cancel").focus();
 }
 
 form.addEventListener("submit", async (event) => {
@@ -344,13 +312,19 @@ form.addEventListener("submit", async (event) => {
     if (external) {
       const review = await call("/api/external/preview", payload, active.signal);
       if (active.signal.aborted) return;
-      showResults(review.results, "근거 후보");
       if (!review.review) {
+        showResults(review.results, "근거 후보");
         notice("외부 API로 보낼 수 있는 메일 발췌문을 찾지 못했습니다.");
         return;
       }
+      notice("외부 API 응답을 기다리고 있습니다.");
+      const answer = await call("/api/external/send",
+        { review: review.review, excerpts: review.excerpts.map((item) => item.id) }, active.signal);
+      if (active.signal.aborted) return;
+      showAnswer(answer);
+      if (answer.status !== "external_unavailable") showResults(answer.results, "전송한 발췌문의 원본 메일");
+      rememberQuestion(answer, query);
       notice("");
-      showReview(review, active);
       return;
     }
     if (ask) {
@@ -368,43 +342,6 @@ form.addEventListener("submit", async (event) => {
       if (active.signal.aborted) return;
       showResults(data.results, query ? "검색 결과" : "최근 메일");
     }
-    notice("");
-  } catch (error) {
-    if (!active.signal.aborted) notice(error.message);
-  }
-});
-
-for (const id of ["review-close", "review-cancel"]) {
-  element(id).addEventListener("click", () => reviewDialog.close());
-}
-reviewDialog.addEventListener("close", () => {
-  if (reviewDialog.open) return;
-  element("review-question").textContent = "";
-  element("review-excerpts").replaceChildren();
-  if (pendingReview) {
-    pendingReview = undefined;
-    notice("외부 API 전송을 취소했습니다.");
-  }
-});
-const checkedExcerpts = () => [...element("review-excerpts").querySelectorAll("input:checked")];
-element("review-excerpts").addEventListener("change", () => {
-  element("review-send").disabled = !checkedExcerpts().length;
-});
-element("review-form").addEventListener("submit", async (event) => {
-  event.preventDefault();
-  if (!pendingReview) return;
-  const excerpts = checkedExcerpts().map((item) => Number(item.value));
-  if (!excerpts.length) return;
-  const { data, active } = pendingReview;
-  pendingReview = undefined;
-  reviewDialog.close();
-  notice("외부 API 응답을 기다리고 있습니다.");
-  try {
-    const answer = await call("/api/external/send", { review: data.review, excerpts }, active.signal);
-    if (active.signal.aborted) return;
-    showAnswer(answer);
-    if (answer.status !== "external_unavailable") showResults(answer.results, "전송한 발췌문의 원본 메일");
-    rememberQuestion(answer, data.question);
     notice("");
   } catch (error) {
     if (!active.signal.aborted) notice(error.message);
@@ -518,7 +455,7 @@ element("settings-remove").addEventListener("click", () => changeSettings("disco
 
 document.addEventListener("keydown", (event) => {
   if (event.key !== "/" || event.ctrlKey || event.metaKey || event.altKey || event.isComposing ||
-      (element("viewer").open || reviewDialog.open || settingsDialog.open) || event.target.closest?.("input, select, textarea, [contenteditable='true']")) return;
+      (element("viewer").open || settingsDialog.open) || event.target.closest?.("input, select, textarea, [contenteditable='true']")) return;
   event.preventDefault();
   element("query").focus();
 });
