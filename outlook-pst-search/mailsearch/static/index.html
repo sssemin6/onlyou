@@ -74,8 +74,6 @@
             AI에게 질문
           </button>
         </div>
-        <label class="design-toggle"><input id="design-mode" type="checkbox">설계 이력 질문</label>
-        <label class="design-scope" hidden>답변 범위<select id="design-scope"><option value="">전체 보관함</option></select></label>
         <details class="filters" id="filter-panel">
           <summary>
             <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M4 7h16M4 12h16M4 17h16"/><circle cx="9" cy="7" r="2"/><circle cx="16" cy="12" r="2"/><circle cx="10" cy="17" r="2"/></svg>
@@ -84,13 +82,18 @@
           </summary>
           <div class="filter-body">
             <div class="filter-grid">
-              <label>주제<input id="subject" maxlength="200"></label>
-              <label>본문<input id="body" maxlength="200"></label>
-              <label data-mail-only>발신자<input id="sender" maxlength="200"></label>
-              <label data-mail-only>수신자<input id="recipient" maxlength="200"></label>
-              <label data-mail-only>첨부<select id="attachment"><option value="">전체</option><option value="yes">있음</option><option value="no">없음</option></select></label>
-              <label>시작일<input id="after" type="date"></label>
-              <label>종료일<input id="before" type="date"></label>
+              <label data-show="mail document">주제<input id="subject" maxlength="200"></label>
+              <label data-show="mail document">본문<input id="body" maxlength="200"></label>
+              <label data-show="mail">발신자<input id="sender" maxlength="200"></label>
+              <label data-show="mail">수신자<input id="recipient" maxlength="200"></label>
+              <label data-show="mail">첨부<select id="attachment"><option value="">전체</option><option value="yes">있음</option><option value="no">없음</option></select></label>
+              <label data-show="mail document">시작일<input id="after" type="date"></label>
+              <label data-show="mail document">종료일<input id="before" type="date"></label>
+              <label data-show="pcf">선급<input id="class" maxlength="200" placeholder="예: KR, LR"></label>
+              <label data-show="pcf">FLAG<input id="flag" maxlength="200"></label>
+              <label data-show="pcf">선주<input id="owner" maxlength="200"></label>
+              <label data-show="pcf">호선<input id="hull" maxlength="200" placeholder="예: H2107"></label>
+              <label data-show="pcf">도면명<input id="drawing" maxlength="200"></label>
             </div>
             <button id="clear-filters" type="button" class="text-button" hidden>검색 범위 초기화</button>
           </div>
