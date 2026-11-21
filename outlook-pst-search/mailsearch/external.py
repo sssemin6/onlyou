@@ -27,6 +27,11 @@ JSON_INSTRUCTIONS = """
 답을 확인할 수 없으면 status를 insufficient 또는 ambiguous로 하고 claims를 빈 목록으로 설정한다.
 """
 
+RERANK_INSTRUCTIONS = """
+너는 검색 재정렬기다. question과 candidates가 주어지면 질문을 확인하는 데 가장 관련 있는 순서대로
+id를 정렬해 {"order": [id, ...]} 형태의 JSON 객체 하나로만 답한다. 모든 id를 정확히 한 번씩 포함한다.
+"""
+
 
 class ExternalRequestError(RuntimeError):
     def __init__(self, status):
@@ -93,6 +98,18 @@ class ExternalAI:
                                token_limit=token_limit or (2800 if self.host == "api.openai.com" else 1500),
                                timeout=timeout)
         return map_citations(result, {item.number: item.passage for item in excerpts})
+
+    def rerank(self, question, candidates, timeout=30):
+        """Ask the provider to reorder retrieval candidates; returns ids or None."""
+        content = json.dumps({"question": question,
+                              "candidates": [{"id": identifier, "text": text} for identifier, text in candidates]},
+                             ensure_ascii=False)
+        result = self.complete(RERANK_INSTRUCTIONS, content, token_limit=1200, timeout=timeout)
+        order = result.get("order") if isinstance(result, dict) else None
+        known = {identifier for identifier, _ in candidates}
+        if isinstance(order, list) and order and all(item in known for item in order):
+            return order
+        return None
 
     def test(self):
         reply = self.complete('Reply with the JSON object {"ok": true}.', "Connection test", token_limit=600, timeout=15)
