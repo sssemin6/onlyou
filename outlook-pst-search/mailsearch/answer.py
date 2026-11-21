@@ -2,9 +2,14 @@
 import datetime
 import http.client
 import json
+import os
 import re
+import shutil
+import subprocess
+import time
 from pathlib import Path
 
+from .extract import CREATE_FLAGS
 from .store import normalized, query_words, topic_key
 
 QUOTE_LIMIT = 300
@@ -52,7 +57,7 @@ claims에는 사실 한 문장과 그 주장을 직접 입증하는 citations를
 
 
 class LocalAI:
-    def __init__(self, model, embedding_model="", port=11435, timeout=55):
+    def __init__(self, model, embedding_model="", port=11435, timeout=55, models_dir=None):
         for name in (model, embedding_model):
             if name and (not MODEL_NAME.fullmatch(name) or "cloud" in name.casefold() or name.startswith("http")):
                 raise ValueError("Use an installed local model name.")
@@ -60,6 +65,8 @@ class LocalAI:
         self.embedding_model = embedding_model
         self.port = port
         self.timeout = timeout
+        self.models_dir = models_dir
+        self.server = None
 
     def call(self, path, data=None, timeout=None):
         # HTTPConnection uses a fixed IP. It does not follow redirects or environment proxies.
@@ -77,6 +84,43 @@ class LocalAI:
         finally:
             connection.close()
 
+    def ensure_server(self):
+        """Start a hidden Ollama server on demand; only ours to stop."""
+        try:
+            self.call("/api/tags", timeout=2)
+            return
+        except OSError:
+            pass
+        binary = ollama_binary()
+        if not binary:
+            raise OSError("ollama_not_found")
+        if self.server is None or self.server.poll() is not None:
+            environment = dict(os.environ, OLLAMA_HOST=f"127.0.0.1:{self.port}")
+            if self.models_dir:
+                environment["OLLAMA_MODELS"] = str(self.models_dir)
+            self.server = subprocess.Popen(
+                [binary, "serve"], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL, env=environment, creationflags=CREATE_FLAGS,
+            )
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            try:
+                self.call("/api/tags", timeout=2)
+                return
+            except OSError:
+                if self.server.poll() is not None:
+                    raise OSError("ollama_not_started")
+                time.sleep(.4)
+        raise OSError("ollama_not_started")
+
+    def shutdown(self):
+        if self.server is not None and self.server.poll() is None:
+            self.server.terminate()
+            try:
+                self.server.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self.server.kill()
+
     def ensure_model(self, name):
         # Server reports a model already installed on disk. Models are never pulled by this app.
         canonical = name if ":" in name.rsplit("/", 1)[-1] else name + ":latest"
@@ -89,11 +133,13 @@ class LocalAI:
         raise RuntimeError("local_model_missing")
 
     def embed(self, texts, timeout=8):
+        self.ensure_server()
         model = self.ensure_model(self.embedding_model)
         values = self.call("/api/embed", {"model": model, "input": texts, "truncate": True}, timeout)
         return values["embeddings"]
 
     def answer(self, question, evidence, context):
+        self.ensure_server()
         model = self.ensure_model(self.model)
         ids = {index: row["passage"] for index, row in enumerate(evidence, 1)}
         data = {"question": question, "context": context, "evidence": [
@@ -106,6 +152,17 @@ class LocalAI:
             "options": {"temperature": 0, "num_predict": 950, "num_ctx": 8192},
         })
         return map_citations(json.loads(response["response"]), ids)
+
+
+def ollama_binary():
+    candidates = [os.environ.get("MAILSEARCH_OLLAMA"), shutil.which("ollama")]
+    localappdata = os.environ.get("LOCALAPPDATA")
+    if localappdata:
+        candidates.append(Path(localappdata) / "Programs" / "Ollama" / "ollama.exe")
+    for candidate in candidates:
+        if candidate and Path(candidate).is_file():
+            return str(candidate)
+    return None
 
 
 def map_citations(result, ids):
