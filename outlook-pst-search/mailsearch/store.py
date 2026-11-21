@@ -60,6 +60,15 @@ CREATE TABLE IF NOT EXISTS pst_files (
     label TEXT NOT NULL, signature TEXT NOT NULL,
     PRIMARY KEY(source, label)
 );
+CREATE TABLE IF NOT EXISTS decisions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, question TEXT NOT NULL,
+    answer TEXT NOT NULL, created TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS decision_evidence (
+    decision INTEGER NOT NULL REFERENCES decisions(id) ON DELETE CASCADE,
+    passage INTEGER NOT NULL, fingerprint TEXT NOT NULL,
+    PRIMARY KEY(decision, passage)
+);
 CREATE TABLE IF NOT EXISTS vectors (
     passage INTEGER NOT NULL REFERENCES passages(id) ON DELETE CASCADE,
     model TEXT NOT NULL, value BLOB NOT NULL,
@@ -280,8 +289,46 @@ class Store:
             ids.append(row["id"])
         return ids
 
+    def save_decision(self, question, answer, evidence):
+        with self.connection() as conn:
+            identifier = conn.execute(
+                "INSERT INTO decisions(question,answer,created) VALUES(?,?,?)",
+                (question, json.dumps(answer, ensure_ascii=False), now()),
+            ).lastrowid
+            conn.executemany("INSERT INTO decision_evidence VALUES(?,?,?)",
+                             ((identifier, row["passage"], row["fingerprint"]) for row in evidence))
+            return identifier
+
+    def decisions(self):
+        with self.connection() as conn:
+            grouped = {}
+            for row in conn.execute(
+                "SELECT d.id id,d.question question,d.answer answer,d.created created,e.fingerprint fingerprint "
+                "FROM decisions d LEFT JOIN decision_evidence e ON e.decision=d.id ORDER BY d.id DESC"
+            ):
+                item = grouped.setdefault(row["id"], {
+                    "id": row["id"], "question": row["question"], "answer": json.loads(row["answer"]),
+                    "created": row["created"], "checks": set(),
+                })
+                if row["fingerprint"] is not None:
+                    item["checks"].add(row["fingerprint"])
+            for item in grouped.values():
+                checks = item.pop("checks")
+                if not checks:
+                    item["review"] = "ok"
+                    continue
+                placeholders = json.dumps(list(checks))
+                alive = {evidence[0] for evidence in conn.execute(
+                    f"""SELECT DISTINCT m.fingerprint FROM mails m JOIN passages p ON p.mail=m.id
+                        JOIN sources s ON s.id=m.source WHERE m.fingerprint IN (SELECT value FROM json_each(?))
+                        AND {VISIBLE_VERSION}""", (placeholders,)
+                )}
+                # A saved decision needs re-review when its evidence version is gone.
+                item["review"] = "ok" if checks <= alive else "recheck"
+            return list(grouped.values())
+
     def scope(self, filters, extra=()):
-        ids = self.allowed_sources()
+        ids = self.allowed_sources(filters.get("source"))
         clauses = [VISIBLE_VERSION, "m.source IN (SELECT value FROM json_each(?))"]
         params = [json.dumps(ids)]
         for name, col in {"sender": "m.sender", "recipient": "m.recipient", "subject": "m.subject", "body": "m.body"}.items():
