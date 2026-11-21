@@ -125,7 +125,7 @@ async function showSources() {
     }
     if (source.issue) entry.append(node("p", issueNames[source.issue] || source.issue, "issue"));
     if (source.updates?.length && ["ready", "empty", "error"].includes(source.state)) {
-      entry.append(node("p", "갱신 대상 PST · " + source.updates.join(", "), "issue"));
+      entry.append(node("p", "갱신 대상 PST " + source.updates.length + "개", "issue"));
     }
     if (!source.available && source.state !== "removing") entry.append(node("p", "원본 경로 접근 불가", "issue"));
     const actions = node("div", "", "source-actions");
