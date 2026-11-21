@@ -16,7 +16,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from .answer import LocalAI, delivery_date_answer, evidence_for, merge_rows, public_row, validate
+from .answer import (DESIGN_INSTRUCTIONS, LocalAI, design_retrieval, delivery_date_answer,
+                     evidence_for, merge_rows, public_row, validate)
 from .bundled import prepare as prepare_bundled
 from .external import DEFAULT_MODEL, DEFAULT_URL, MAX_EXCERPTS, ExternalAI, ExternalRequestError, Reviews
 from .filesystem import local_path
@@ -223,10 +224,10 @@ class Handler(BaseHTTPRequestHandler):
             elif route == "/api/source-action":
                 self.server.indexer.command(int(payload["source"]), payload["action"])
                 self.send_json(202, {})
-            elif route in {"/api/search", "/api/candidates", "/api/answer", "/api/external/preview"}:
+            elif route in {"/api/search", "/api/candidates", "/api/answer", "/api/external/preview", "/api/design/preview"}:
                 self.query(route, payload)
-            elif route == "/api/external/send":
-                self.send_external(payload)
+            elif route in {"/api/external/send", "/api/design/send"}:
+                self.send_external(payload, design=route == "/api/design/send")
             elif route == "/api/external/settings":
                 self.change_external_settings(payload)
             else:
@@ -274,13 +275,18 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(400, {"error": "question_required"})
             return
         external = self.server.external
-        if route == "/api/external/preview" and not external:
+        if route in {"/api/external/preview", "/api/design/preview"} and not external:
             self.send_json(403, {"error": "external_disabled"})
             return
-        evidence, mode = evidence_for(store, ai, query, filters, context,
-                                      semantic=(route in {"/api/answer", "/api/external/preview"}))
-        if route == "/api/external/preview":
-            token, review = self.server.reviews.create(query, evidence, external.review_generation)
+        if route == "/api/design/preview":
+            evidence, mode = design_retrieval(store, ai, query, filters, context)
+        else:
+            evidence, mode = evidence_for(store, ai, query, filters, context,
+                                          semantic=(route in {"/api/answer", "/api/external/preview"}))
+        if route in {"/api/external/preview", "/api/design/preview"}:
+            # Design-history questions carry a larger evidence budget (PRD 02 section 5).
+            budget = {"limit": 2400} if route == "/api/design/preview" else {}
+            token, review = self.server.reviews.create(query, evidence, external.review_generation, **budget)
             self.send_json(200, {
                 **external.public, "review": token, "question": query,
                 "excerpts": [{"id": item.number, "text": item.text} for item in review.excerpts] if review else [],
@@ -314,7 +320,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.server.generation.release()
         self.send_json(200, {**result, "results": rows, "retrieval": mode})
 
-    def send_external(self, payload):
+    def send_external(self, payload, design=False):
         server = self.server
         if not server.external:
             self.send_json(403, {"error": "external_disabled"})
@@ -345,10 +351,15 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(409, {"error": "external_source_changed"})
                 return
             try:
-                result = external.answer(review.question, excerpts)
-            except (OSError, ValueError, RuntimeError, KeyError, IndexError, TypeError, http.client.HTTPException):
+                if design:
+                    result = external.answer(review.question, excerpts,
+                                             instructions=DESIGN_INSTRUCTIONS, token_limit=2800, timeout=90)
+                else:
+                    result = external.answer(review.question, excerpts)
+            except (OSError, ValueError, RuntimeError, KeyError, IndexError, TypeError, http.client.HTTPException) as exc:
                 self.send_json(200, {
                     "status": "external_unavailable", "claims": [], "results": [], "provider": "external",
+                    "reason": type(exc).__name__,
                 })
                 return
             visible = {row["passage"]: row for row in server.store.passages(ids)}
