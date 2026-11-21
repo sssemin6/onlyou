@@ -124,6 +124,9 @@ async function showSources() {
       entry.append(node("p", (existing ? "이전 색인 사용 중 · " : "색인 기준 ") + formatDate(source.updated)));
     }
     if (source.issue) entry.append(node("p", issueNames[source.issue] || source.issue, "issue"));
+    if (source.updates?.length && ["ready", "empty", "error"].includes(source.state)) {
+      entry.append(node("p", "갱신 대상 PST · " + source.updates.join(", "), "issue"));
+    }
     if (!source.available && source.state !== "removing") entry.append(node("p", "원본 경로 접근 불가", "issue"));
     const actions = node("div", "", "source-actions");
     const choices = ["queued", "extracting", "headers", "attachments", "embeddings"].includes(source.state)
@@ -497,3 +500,6 @@ async function pollSources() {
   setTimeout(pollSources, 3000);
 }
 pollSources();
+
+// Tell the server this page is still open; when every page closes, the app exits.
+setInterval(() => { call("/api/ping").catch(() => {}); }, 2500);
