@@ -9,7 +9,7 @@ import time
 from dataclasses import dataclass
 from urllib.parse import urlsplit
 
-from .answer import ANSWER_INSTRUCTIONS, MODEL_NAME, map_citations
+from .answer import ANSWER_INSTRUCTIONS, DESIGN_INSTRUCTIONS, MODEL_NAME, map_citations
 
 DEFAULT_URL = "https://api.openai.com/v1/chat/completions"
 DEFAULT_MODEL = "gpt-4.1-mini"
@@ -85,12 +85,13 @@ class ExternalAI:
         destination = self.host if self.port == 443 else f"{self.host}:{self.port}"
         return {"destination": f"https://{destination}{self.path}", "model": self.model}
 
-    def answer(self, question, excerpts):
+    def answer(self, question, excerpts, instructions=ANSWER_INSTRUCTIONS, token_limit=None, timeout=35):
         messages = {"question": question, "evidence": [
             {"source": item.number, "text": item.text} for item in excerpts
         ]}
-        result = self.complete(ANSWER_INSTRUCTIONS + JSON_INSTRUCTIONS, json.dumps(messages, ensure_ascii=False),
-                               token_limit=2800 if self.host == "api.openai.com" else 1500, timeout=35)
+        result = self.complete(instructions + JSON_INSTRUCTIONS, json.dumps(messages, ensure_ascii=False),
+                               token_limit=token_limit or (2800 if self.host == "api.openai.com" else 1500),
+                               timeout=timeout)
         return map_citations(result, {item.number: item.passage for item in excerpts})
 
     def test(self):
@@ -173,13 +174,13 @@ class Reviews:
         self._pending = {}
         self._lock = threading.Lock()
 
-    def create(self, question, rows, generation=None):
+    def create(self, question, rows, generation=None, limit=MAX_EXCERPT_LENGTH):
         texts = {}
         for row in rows:
             # Keep path, mail metadata, filename and account identifiers out of the request envelope.
             if row["location"] in {"파일명", "제목"}:
                 continue
-            text = row["text"].strip()[:MAX_EXCERPT_LENGTH]
+            text = row["text"].strip()[:limit]
             if text and text != "본문 없음":
                 texts.setdefault(text, row["passage"])
             if len(texts) == MAX_EXCERPTS:
