@@ -3,8 +3,15 @@
 const element = (id) => document.getElementById(id);
 const token = document.querySelector('meta[name="mail-session"]').content;
 const form = element("search-form");
-const addForm = element("add-form");
-const addToggle = element("add-toggle");
+// 사이드바는 메일/문서/PCF 섹션으로 나뉘고, 각 섹션이 자체 추가 폼을 가진다.
+const addControls = [...document.querySelectorAll(".source-group")].map((group) => ({
+  kind: group.dataset.kind,
+  form: group.querySelector(".add-form"),
+  toggle: group.querySelector(".group-add"),
+  input: group.querySelector(".add-form input"),
+  notice: group.querySelector(".add-notice"),
+  list: group.querySelector(".sources"),
+}));
 const settingsDialog = element("settings-dialog");
 const settingsForm = element("settings-form");
 const filterIds = ["subject", "body", "sender", "recipient", "attachment", "after", "before"];
@@ -131,6 +138,24 @@ function showFilterCount() {
   element("clear-filters").hidden = !count;
 }
 
+// 소스는 가장 많이 담은 종류의 섹션에 나타난다(문서 폴더 안의 EML처럼 섞인 경우 최빈 종류).
+function sourceGroup(source) {
+  const counts = source.counts || {};
+  let best = "mail", bestCount = -1;
+  for (const kind of ["mail", "document", "pcf"]) {
+    if ((counts[kind] || 0) > bestCount) { best = kind; bestCount = counts[kind] || 0; }
+  }
+  return bestCount > 0 ? best : "mail";
+}
+
+function kindCountLine(source) {
+  const counts = source.counts || {};
+  const parts = [["mail", "메일"], ["document", "문서"], ["pcf", "PCF"]]
+    .filter(([kind]) => counts[kind])
+    .map(([kind, label]) => label + " " + counts[kind].toLocaleString("ko-KR") + "건");
+  return parts.length ? parts.join(" · ") : "항목 " + source.done.toLocaleString("ko-KR") + "건";
+}
+
 async function showSources() {
   const version = ++sourceRequest;
   const data = await call("/api/sources");
@@ -138,17 +163,25 @@ async function showSources() {
   const next = JSON.stringify(data);
   if (next === sourceSnapshot) return;
   sourceSnapshot = next;
-  const list = element("sources");
-  const focusedAction = list.contains(document.activeElement) ? document.activeElement.dataset.action : "";
-  list.replaceChildren();
-  if (!data.sources.length) list.append(node("p", "등록한 파일이 없습니다.", "source-empty"));
+  let focusedControl = null, focusedAction = "";
+  for (const control of addControls) {
+    if (control.list.contains(document.activeElement)) {
+      focusedControl = control;
+      focusedAction = document.activeElement.dataset.action;
+    }
+    control.list.replaceChildren();
+  }
+  if (!data.sources.length) {
+    addControls[0].list.append(node("p", "등록한 자료가 없습니다. 위 버튼으로 추가하세요.", "source-empty"));
+  }
   for (const source of data.sources) {
+    const list = (addControls.find((control) => control.kind === sourceGroup(source)) || addControls[0]).list;
     const name = source.path.split(/[\\/]/).pop();
     const entry = node("div", "", "source-card");
     entry.dataset.state = source.state;
     const heading = node("h3", name, "source-name");
     heading.title = source.path;
-    entry.append(heading, node("p", (stateNames[source.state] || source.state) + " · 메일 " + source.done.toLocaleString("ko-KR") + "건", "source-state"));
+    entry.append(heading, node("p", (stateNames[source.state] || source.state) + " · " + kindCountLine(source), "source-state"));
     if (source.failed || source.omitted || source.partial) {
       entry.append(node("p", "메일 실패 " + source.failed + " · 첨부 누락 " + source.omitted + " · 일부 " + source.partial));
     }
@@ -199,9 +232,10 @@ async function showSources() {
     list.append(entry);
   }
   showFilterCount();
-  if (focusedAction) {
-    const replacement = [...list.querySelectorAll("button")].find((button) => button.dataset.action === focusedAction);
-    (replacement || addToggle).focus({ preventScroll: true });
+  if (focusedAction && focusedControl) {
+    const replacement = [...focusedControl.list.querySelectorAll("button")]
+      .find((button) => button.dataset.action === focusedAction);
+    (replacement || focusedControl.toggle).focus({ preventScroll: true });
   }
   const modelStatus = element("model-status");
   modelStatus.parentElement.dataset.configured = Boolean(data.model);
@@ -553,31 +587,33 @@ element("query").addEventListener("keydown", (event) => {
   form.requestSubmit(element("submit-ask"));
 });
 
-function showAddForm(open) {
-  addForm.hidden = !open;
-  addToggle.setAttribute("aria-expanded", open);
-  if (open) element("path").focus();
+function showAddForm(control, open) {
+  control.form.hidden = !open;
+  control.toggle.setAttribute("aria-expanded", open);
+  if (open) control.input.focus();
 }
-addToggle.addEventListener("click", () => showAddForm(addForm.hidden));
-addForm.addEventListener("submit", async (event) => {
-  event.preventDefault();
-  const button = addForm.querySelector("button[type=submit]");
-  element("add-notice").textContent = "";
-  button.disabled = true;
-  try {
-    await call("/api/sources", { path: element("path").value.trim().replace(/^"(.*)"$/, "$1") });
-    element("path").value = "";
-    showAddForm(false);
-    addToggle.focus();
-    notice("보관함을 등록했습니다.");
-    await showSources();
-  } catch (error) {
-    if (addForm.hidden) notice(error.message);
-    else element("add-notice").textContent = error.message;
-  } finally {
-    button.disabled = false;
-  }
-});
+for (const control of addControls) {
+  control.toggle.addEventListener("click", () => showAddForm(control, control.form.hidden));
+  control.form.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const button = control.form.querySelector("button[type=submit]");
+    control.notice.textContent = "";
+    button.disabled = true;
+    try {
+      await call("/api/sources", { path: control.input.value.trim().replace(/^"(.*)"$/, "$1") });
+      control.input.value = "";
+      showAddForm(control, false);
+      control.toggle.focus();
+      notice("보관함을 등록했습니다.");
+      await showSources();
+    } catch (error) {
+      if (control.form.hidden) notice(error.message);
+      else control.notice.textContent = error.message;
+    } finally {
+      button.disabled = false;
+    }
+  });
+}
 
 async function pollSources() {
   try { await showSources(); } catch (error) { if (!sourceSnapshot) notice(error.message); }
