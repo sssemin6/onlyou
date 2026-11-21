@@ -66,7 +66,8 @@ try {
 }
 ```
 
-- 기본 주소는 `https://api.openai.com/v1/chat/completions`입니다. 다른 제공자를 쓰려면 `MAILSEARCH_EXTERNAL_URL`에 `/chat/completions`로 끝나는 전체 HTTPS 주소를 지정하고, 해당 제공자의 모델명과 키를 사용합니다. Bearer 인증과 JSON 객체 응답을 지원해야 합니다. 로컬 AI도 함께 쓰려면 기존 `--model`과 `--embedding-model` 옵션을 추가합니다.
+- 기본 주소는 `https://api.openai.com/v1/chat/completions`입니다. 다른 제공자를 쓰려면 `MAILSEARCH_EXTERNAL_URL`에 `/chat/completions`(OpenAI 호환) 또는 `/messages`(Anthropic Messages 호환)로 끝나는 전체 HTTPS 주소를 지정하고, 해당 제공자의 모델명과 키를 사용합니다. 두 형식 모두 Bearer 인증과 JSON 객체 응답을 지원해야 합니다. 로컬 AI도 함께 쓰려면 기존 `--model`과 `--embedding-model` 옵션을 추가합니다.
+- Anthropic Messages 호환 예시는 Claude Code가 사용하는 z.ai 엔드포인트입니다. `MAILSEARCH_EXTERNAL_URL`에 `https://api.z.ai/api/anthropic/v1/messages`를 지정하고 모델은 `glm-5.3`처럼 해당 계정의 모델명과 키를 사용합니다.
 - GUI에서 **외부 API → AI에게 질문**을 선택하면 전송 주소, 모델, 이번 질문, 메일·첨부에서 뽑은 텍스트를 검토할 수 있습니다. 발췌문은 최대 5개, 각 800자입니다. 필요 없는 항목의 선택을 해제하고 **외부 API로 보내기**를 누르면 표시된 질문과 선택한 발췌문이 제공자에게 전송됩니다.
 - 검색, PST 색인, 이전 질문 맥락과 계정·메일의 별도 메타데이터는 로컬에서 처리합니다. 발췌문 안에 이미 포함된 이름, 주소, 본문 정보는 그대로 표시되므로 전송 전에 확인하세요. 앱은 GUI에서 입력받은 키를 설정 조회나 검색 응답으로 다시 보내지 않습니다.
 - 외부 설정을 비워 두면 로컬 모드로 실행됩니다. 외부 API를 쓰면 제공자의 요금과 데이터 처리 정책이 적용됩니다.
