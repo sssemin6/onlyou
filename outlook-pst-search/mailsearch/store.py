@@ -13,6 +13,9 @@ import unicodedata
 from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
+from functools import lru_cache
+
+from .pcf import COMMENT_HEADER, PCF_FIELDS, pcf_field_value
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS sources (
@@ -179,8 +182,28 @@ def like_prefix(prefix):
 def document_identity(doc):
     """Fingerprint basis for a document: filename and extracted content, never timestamps."""
     digest = hashlib.sha256("\n".join(f"{location}\n{text}" for location, text in doc["sections"]).encode()).hexdigest()
-    return {"message_id": "", "subject": doc["name"], "sender": "", "recipient": "",
+    marker = "pcf-sections-v1" if document_kind(doc["name"]) == "pcf" else ""
+    return {"message_id": marker, "subject": doc["name"], "sender": "", "recipient": "",
             "sent": "", "body": digest, "reply_ids": "", "attachments": [(doc["name"], None)]}
+
+
+def document_kind(filename):
+    return "pcf" if "pcf" in Path(filename).stem.lower() else "document"
+
+
+def document_readable(source_path, item):
+    try:
+        root = Path(source_path)
+        resolved_root = root.resolve(strict=True)
+        if root != resolved_root:
+            return False
+        path = (root / item).resolve(strict=True) if root.is_dir() else root
+        if not path.is_file() or (root != path and not path.is_relative_to(root)):
+            return False
+        with path.open("rb"):
+            return True
+    except (OSError, RuntimeError, ValueError):
+        return False
 
 
 def sections(text, size=1100):
@@ -247,8 +270,9 @@ class Store:
                 suffixes = ("pdf", "docx", "xlsx", "txt", "doc", "xls")
                 conn.execute("UPDATE mails SET kind='document' WHERE " +
                              " OR ".join("item LIKE '%.' || ?" for _ in suffixes), suffixes)
-            # Owner-correspondence (PCF) documents get their own tab; re-checked every start.
-            conn.execute("UPDATE mails SET kind='pcf' WHERE kind='document' AND lower(item) LIKE '%pcf%'")
+            conn.create_function("document_kind", 1, document_kind)
+            conn.execute("UPDATE mails SET kind=document_kind(subject) WHERE kind IN ('document','pcf') "
+                         "AND kind<>document_kind(subject)")
             conn.execute("INSERT INTO terms(terms,rank) VALUES('secure-delete',1)")
 
     @contextlib.contextmanager
@@ -257,6 +281,8 @@ class Store:
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys=ON")
         conn.execute("PRAGMA secure_delete=ON")
+        conn.create_function("document_readable", 2, lru_cache(maxsize=2048)(document_readable))
+        conn.create_function("pcf_field_matches", 4, pcf_field_value)
         try:
             with conn:
                 yield conn
@@ -275,12 +301,20 @@ class Store:
                 f"SELECT m.source source,m.kind kind,COUNT(*) n FROM mails m {JOIN} GROUP BY m.source,m.kind"
             ):
                 counts[row["source"]][row["kind"]] = row["n"]
-            return [{**dict(row), "counts": counts.get(row["id"], {})}
-                    for row in conn.execute("SELECT * FROM sources ORDER BY id")]
+            sources = []
+            for row in conn.execute("SELECT * FROM sources ORDER BY id"):
+                problems = conn.execute("""SELECT item,code FROM problems WHERE source=? AND version=?
+                    ORDER BY item LIMIT 5""", (row["id"], row["pending"] or row["active"])).fetchall()
+                sources.append({**dict(row), "counts": counts.get(row["id"], {}),
+                                "problems": [dict(problem) for problem in problems]})
+            return sources
 
-    def allowed_sources(self, source=None):
+    def allowed_sources(self, source=None, *, sources=None):
+        if sources is None:
+            with self.connection() as conn:
+                sources = conn.execute("SELECT id,path,kind FROM sources WHERE ? IS NULL OR id=?", (source, source)).fetchall()
         ids = []
-        for row in self.sources():
+        for row in sources:
             if source is not None and row["id"] != source:
                 continue
             path = Path(row["path"])
@@ -298,24 +332,30 @@ class Store:
 
     def scope(self, filters, extra=()):
         ids = self.allowed_sources(filters.get("source"))
-        clauses = [VISIBLE_VERSION, "m.source IN (SELECT value FROM json_each(?))"]
+        clauses = [VISIBLE_VERSION, "m.source IN (SELECT value FROM json_each(?))",
+                   "CASE WHEN m.kind<>'mail' THEN document_readable(s.path,m.item) ELSE 1 END"]
         params = [json.dumps(ids)]
-        for name, col in {"sender": "m.sender", "recipient": "m.recipient", "subject": "m.subject", "body": "m.body"}.items():
+        for name, col in {"sender": "m.sender", "recipient": "m.recipient", "subject": "m.subject"}.items():
             if filters.get(name):
                 clauses.append(f"instr(lower({col}),lower(?))>0")
                 params.append(filters[name])
+        if filters.get("body"):
+            clauses.append("""((m.kind='mail' AND instr(lower(m.body),lower(?))>0) OR
+                (m.kind<>'mail' AND EXISTS(SELECT 1 FROM passages bp WHERE bp.mail=m.id AND instr(lower(bp.text),lower(?))>0)))""")
+            params.extend([filters["body"]] * 2)
         if filters.get("attachment") in ("yes", "no"):
             negate = "" if filters["attachment"] == "yes" else "NOT "
             clauses.append(f"{negate}EXISTS(SELECT 1 FROM attachments a WHERE a.mail=m.id)")
         if filters.get("tab") in ("mail", "document", "pcf"):
             clauses.append("m.kind=?")
             params.append(filters["tab"])
-        for name in ("class", "flag", "owner", "hull", "drawing"):
-            # PCF scope fields match file names or passage text until the data is structured.
+        for name in PCF_FIELDS:
             if filters.get(name):
-                clauses.append("(instr(lower(m.item),lower(?))>0 OR EXISTS("
-                               "SELECT 1 FROM passages p WHERE p.mail=m.id AND instr(lower(p.text),lower(?))>0))")
-                params.extend((filters[name], filters[name]))
+                clauses.append("""(m.kind='pcf' AND (EXISTS(
+                    SELECT 1 FROM passages fp WHERE fp.mail=m.id AND pcf_field_matches(?,'',fp.text,?))
+                    OR (pcf_field_matches(?,m.subject,'',?) AND NOT EXISTS(
+                    SELECT 1 FROM passages fp WHERE fp.mail=m.id AND pcf_field_matches(?,'',fp.text,NULL)))))""")
+                params.extend((name, filters[name], name, filters[name], name))
         if filters.get("after"):
             clauses.append("m.sent>=?")
             params.append(filters["after"])
@@ -365,15 +405,20 @@ class Store:
                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (source, version, item, fingerprint(mail, item), doc["folder"], doc["name"], "", "",
              doc["sent"], "", topic_key(doc["name"]), "",
-             "pcf" if "pcf" in Path(item).stem.lower() else "document"),
+             document_kind(doc["name"])),
         )
         mail_id = cursor.lastrowid
         attachment_id = conn.execute(
             "INSERT INTO attachments(mail,name,status) VALUES(?,?,?)", (mail_id, doc["name"], doc["status"])
         ).lastrowid
+        is_pcf = document_kind(doc["name"]) == "pcf"
         for location, text in doc["sections"]:
-            for start, segment in sections(text):
-                self.add_passage(conn, mail_id, mail, attachment_id, doc["name"], location, start, segment)
+            offsets = [0]
+            if is_pcf:
+                offsets.extend(match.start(1) for match in COMMENT_HEADER.finditer(text) if match.start(1))
+            for begin, end in zip(offsets, [*offsets[1:], len(text)]):
+                for start, segment in sections(text[begin:end]):
+                    self.add_passage(conn, mail_id, mail, attachment_id, doc["name"], location, begin + start, segment)
         return mail_id
 
     def adopt_mail(self, conn, version, old_id):
