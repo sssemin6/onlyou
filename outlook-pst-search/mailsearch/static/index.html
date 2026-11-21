@@ -3,58 +3,143 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
   <meta name="mail-session" content="__LOCAL_SESSION__">
   <title>보관 메일 검색</title>
   <link rel="stylesheet" href="/style.css">
   <script src="/app.js" defer></script>
 </head>
 <body>
-  <header class="bar"><div class="brand"><span aria-hidden="true" class="brand-icon">
-    <svg viewBox="0 0 24 24" fill="none"><rect x="3.5" y="5.5" width="17" height="13" rx="3"/><path d="m4 7 8 6 8-6"/></svg>
-  </span>보관 메일 검색</div><span class="local"><i></i> 이 PC에서 실행 중</span></header>
+  <header class="masthead">
+    <div class="masthead-inner">
+      <div class="brand">
+        <span class="brand-icon" aria-hidden="true">
+          <svg viewBox="0 0 24 24" fill="none"><rect x="3.5" y="5.5" width="17" height="13" rx="2"/><path d="m4 7 8 6 8-6"/></svg>
+        </span>
+        보관 메일 검색
+      </div>
+      <span class="local">
+        <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><rect x="5" y="10" width="14" height="10" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3m-4 4v2"/></svg>
+        로컬 실행
+      </span>
+    </div>
+  </header>
+
   <div class="layout">
-    <aside class="sidebar">
-      <div class="side-title">메일 보관함 <button type="button" id="add-toggle" class="square" aria-label="보관함 추가" title="보관함 추가">＋</button></div>
-      <form id="add-form" hidden>
-        <label for="path">PST 파일 또는 EML 폴더 경로</label>
-        <input id="path" placeholder="C:\메일보관\2025.pst" required>
-        <button type="submit" class="button small primary">등록</button>
-      </form>
-      <div id="sources" aria-live="polite"></div>
-      <p class="model-status" id="model-status"></p>
-    </aside>
     <main>
-      <div class="intro"><h1>어떤 메일을 찾으세요?</h1><p>품번, 발신자, 기억나는 문장으로 보관 메일을 검색하세요.</p></div>
-      <form id="search-form">
-        <div class="search-line">
-          <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><circle cx="10.5" cy="10.5" r="5.5"/><path d="m15 15 4 4"/></svg>
-          <input id="query" type="search" maxlength="450" aria-label="검색어 또는 질문" placeholder="예: A-17 납품일은 최종 언제로 정해졌지?">
-          <button class="button primary" name="intent" value="search" type="submit">검색</button>
-          <button class="button ai-button" name="intent" value="ask" type="submit">AI에게 질문</button>
+      <section class="hero" aria-labelledby="page-title">
+        <div class="hero-copy">
+          <h1 id="page-title">필요한 메일을<br><span>다시 찾으세요.</span></h1>
+          <p>품번, 발신자, 기억나는 문장으로 보관 메일을 찾아보세요.</p>
         </div>
-        <details class="filters"><summary>검색 범위</summary>
-          <div class="filter-grid">
-            <label>보관함<select id="source"><option value="">전체</option></select></label>
-            <label>발신자<input id="sender" maxlength="200"></label>
-            <label>수신자<input id="recipient" maxlength="200"></label>
-            <label>폴더<input id="folder" maxlength="200"></label>
-            <label>시작일<input id="after" type="date"></label>
-            <label>종료일<input id="before" type="date"></label>
+        <div class="hero-art" aria-hidden="true">
+          <div class="art-orbit"></div>
+          <div class="art-paper art-paper-back"></div>
+          <div class="art-paper art-paper-front">
+            <div class="art-paper-tab"></div>
+            <div class="art-lines"></div>
+          </div>
+          <div class="art-envelope"></div>
+          <div class="art-glass"></div>
+          <div class="art-star">
+            <svg viewBox="0 0 40 40" fill="none"><path d="M20 6v28M6 20h28M10 10l20 20m0-20L10 30"/></svg>
+          </div>
+          <span class="art-plus">+</span>
+        </div>
+      </section>
+
+      <form id="search-form" class="search-form" role="search" aria-label="보관 메일 검색">
+        <label for="query" class="search-label">검색어 또는 질문</label>
+        <div class="search-line">
+          <div class="query-box">
+            <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><circle cx="10.5" cy="10.5" r="5.5"/><path d="m15 15 4 4"/></svg>
+            <input id="query" type="search" maxlength="450" placeholder="예: A-17 납품일은 최종 언제로 정해졌지?" aria-keyshortcuts="/">
+            <kbd aria-hidden="true">/</kbd>
+          </div>
+          <button id="submit-search" class="button primary" name="intent" value="search" type="submit">검색</button>
+          <button class="button ai-button" name="intent" value="ask" type="submit">
+            <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M12 3c.7 4.4 3.6 7.3 8 8-4.4.7-7.3 3.6-8 8-.7-4.4-3.6-7.3-8-8 4.4-.7 7.3-3.6 8-8Zm7 13v5m-2.5-2.5h5"/></svg>
+            AI에게 질문
+          </button>
+        </div>
+        <details class="filters" id="filter-panel">
+          <summary>
+            <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M4 7h16M4 12h16M4 17h16"/><circle cx="9" cy="7" r="2"/><circle cx="16" cy="12" r="2"/><circle cx="10" cy="17" r="2"/></svg>
+            검색 범위 <span id="filter-count" class="filter-count" hidden></span>
+            <svg class="chevron" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="m7 10 5 5 5-5"/></svg>
+          </summary>
+          <div class="filter-body">
+            <div class="filter-grid">
+              <label>보관함<select id="source"><option value="">전체</option></select></label>
+              <label>발신자<input id="sender" maxlength="200"></label>
+              <label>수신자<input id="recipient" maxlength="200"></label>
+              <label>폴더<input id="folder" maxlength="200"></label>
+              <label>시작일<input id="after" type="date"></label>
+              <label>종료일<input id="before" type="date"></label>
+            </div>
+            <button id="clear-filters" type="button" class="text-button" hidden>검색 범위 초기화</button>
           </div>
         </details>
-        <div id="context" class="context" hidden><span id="context-text"></span><button type="button" id="clear-context" class="text-button">지우기</button></div>
+        <div id="context" class="context" hidden>
+          <span id="context-text"></span><button type="button" id="clear-context" class="text-button">지우기</button>
+        </div>
       </form>
-      <p id="notice" role="status"></p>
+
+      <p id="notice" class="notice" role="status"></p>
+      <section id="welcome" class="welcome" aria-labelledby="welcome-heading">
+        <h2 id="welcome-heading">검색 시작하기</h2>
+        <div class="quick-actions">
+          <button type="button" id="recent-mail" class="quick-action">
+            <span class="quick-icon recent-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="8"/><path d="M12 7.5V12l3 2"/></svg></span>
+            <span><strong>최근 메일 보기</strong><small>등록한 보관함에서 최신순으로</small></span>
+            <span class="quick-arrow" aria-hidden="true">↗</span>
+          </button>
+          <button type="button" id="filter-shortcut" class="quick-action">
+            <span class="quick-icon scope-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none"><path d="M4 6h16l-6 7v5l-4 2v-7z"/></svg></span>
+            <span><strong>검색 범위 설정</strong><small>보관함, 날짜, 발신자로 좁히기</small></span>
+            <span class="quick-arrow" aria-hidden="true">↗</span>
+          </button>
+        </div>
+      </section>
+
       <section id="answer" class="answer" aria-live="polite" hidden></section>
-      <section id="result-section" hidden aria-labelledby="result-heading">
+      <section id="result-section" class="result-section" hidden aria-labelledby="result-heading">
         <h2 id="result-heading">검색 결과</h2>
-        <div id="results"></div>
+        <div id="results" class="results"></div>
       </section>
     </main>
+
+    <aside class="sidebar" aria-labelledby="archive-heading">
+      <div class="side-title">
+        <span class="folder-icon" aria-hidden="true">
+          <svg viewBox="0 0 24 24" fill="none"><path d="M3.5 7a2 2 0 0 1 2-2h4l2 2h7a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2h-13a2 2 0 0 1-2-2z"/><path d="M4 10h16"/></svg>
+        </span>
+        <h2 id="archive-heading">메일 보관함</h2>
+      </div>
+      <button type="button" id="add-toggle" class="button add-button" aria-controls="add-form" aria-expanded="false">
+        <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
+        보관함 추가
+      </button>
+      <form id="add-form" class="add-form" hidden>
+        <label for="path">PST 파일 또는 EML 폴더 경로</label>
+        <input id="path" placeholder="C:\메일보관\2025.pst" required spellcheck="false">
+        <button type="submit" class="button small primary">등록</button>
+        <p id="add-notice" class="form-message" role="status"></p>
+      </form>
+      <div id="sources" class="sources" aria-label="등록한 보관함"></div>
+      <div class="model-panel">
+        <span class="model-dot" aria-hidden="true"></span>
+        <p id="model-status">로컬 AI 설정 확인 중</p>
+      </div>
+    </aside>
   </div>
+
   <dialog id="viewer" aria-labelledby="viewer-title">
-    <header class="viewer-header"><h2 id="viewer-title">원문</h2><form method="dialog"><button class="square" aria-label="원문 닫기">×</button></form></header>
-    <div id="viewer-content"></div>
+    <header class="viewer-header">
+      <h2 id="viewer-title">원문</h2>
+      <form method="dialog"><button class="square" aria-label="원문 닫기">×</button></form>
+    </header>
+    <div id="viewer-content" class="viewer-content"></div>
   </dialog>
 </body>
 </html>

@@ -3,6 +3,10 @@
 const element = (id) => document.getElementById(id);
 const token = document.querySelector('meta[name="mail-session"]').content;
 const form = element("search-form");
+const addForm = element("add-form");
+const addToggle = element("add-toggle");
+const filterIds = ["source", "sender", "recipient", "folder", "after", "before"];
+const dateFormat = new Intl.DateTimeFormat("ko-KR", { dateStyle: "medium", timeStyle: "short" });
 const stateNames = {
   queued: "대기", extracting: "PST 읽는 중", headers: "메일 색인 중", attachments: "첨부 색인 중",
   embeddings: "의미 검색 준비 중", ready: "검색 가능", paused: "일시정지", error: "오류",
@@ -28,6 +32,7 @@ const issueNames = {
 let previousQuestion = "";
 let request;
 let sourceSnapshot = "";
+let sourceRequest = 0;
 
 function node(tag, text, className) {
   const result = document.createElement(tag);
@@ -61,27 +66,39 @@ function setQuestionContext(value) {
 }
 
 function formatDate(value) {
-  if (!value) return "날짜 미상";
-  return new Intl.DateTimeFormat("ko-KR", { dateStyle: "medium", timeStyle: "short" }).format(new Date(value));
+  const date = value ? new Date(value) : null;
+  return date && !Number.isNaN(date.getTime()) ? dateFormat.format(date) : "날짜 미상";
+}
+
+function showFilterCount() {
+  const count = filterIds.filter((id) => element(id).value.trim()).length;
+  const badge = element("filter-count");
+  badge.textContent = count;
+  badge.hidden = !count;
+  element("clear-filters").hidden = !count;
 }
 
 async function showSources() {
+  const version = ++sourceRequest;
   const data = await call("/api/sources");
+  if (version !== sourceRequest) return;
   const next = JSON.stringify(data);
   if (next === sourceSnapshot) return;
   sourceSnapshot = next;
   const list = element("sources");
   const scope = element("source");
   const current = scope.value;
+  const focusedAction = list.contains(document.activeElement) ? document.activeElement.dataset.action : "";
   scope.replaceChildren(new Option("전체", ""));
   list.replaceChildren();
-  if (!data.sources.length) list.append(node("p", "등록한 파일이 없습니다.", "model-status"));
+  if (!data.sources.length) list.append(node("p", "등록한 파일이 없습니다.", "source-empty"));
   for (const source of data.sources) {
     const name = source.path.split(/[\\/]/).pop();
     const entry = node("div", "", "source-card");
-    const heading = node("div", name, "source-name");
+    entry.dataset.state = source.state;
+    const heading = node("h3", name, "source-name");
     heading.title = source.path;
-    entry.append(heading, node("p", (stateNames[source.state] || source.state) + " · 메일 " + source.done.toLocaleString() + "건"));
+    entry.append(heading, node("p", (stateNames[source.state] || source.state) + " · 메일 " + source.done.toLocaleString("ko-KR") + "건", "source-state"));
     if (source.failed || source.omitted || source.partial) {
       entry.append(node("p", "메일 실패 " + source.failed + " · 첨부 누락 " + source.omitted + " · 일부 " + source.partial));
     }
@@ -97,19 +114,27 @@ async function showSources() {
     for (const [action, label] of choices) {
       const button = node("button", label, "text-button");
       button.type = "button";
+      button.dataset.action = action + "-" + source.id;
       button.addEventListener("click", async () => {
         if (action === "remove" && !confirm(name + "의 색인과 임시 추출물을 삭제할까요?")) return;
+        button.disabled = true;
         try {
           await call("/api/source-action", { source: source.id, action });
           if (action === "remove") {
             request?.abort();
             element("answer").hidden = true;
             element("result-section").hidden = true;
+            element("welcome").hidden = false;
+            form.closest("main").classList.remove("has-query");
             if (element("viewer").open) element("viewer").close();
             notice("보관함을 등록 해제했습니다.");
           }
           await showSources();
-        } catch (error) { notice(error.message); }
+        } catch (error) {
+          notice(error.message);
+        } finally {
+          button.disabled = false;
+        }
       });
       actions.append(button);
     }
@@ -118,9 +143,16 @@ async function showSources() {
     if (source.available && !["removing", "remove_failed"].includes(source.state)) scope.append(new Option(name, source.id));
   }
   if ([...scope.options].some((option) => option.value === current)) scope.value = current;
-  element("model-status").textContent = data.model
-    ? "로컬 AI · " + data.model + (data.embedding ? " · 의미 검색" : "")
-    : "일반 검색 모드 · 로컬 AI 연결 전";
+  showFilterCount();
+  if (focusedAction) {
+    const replacement = [...list.querySelectorAll("button")].find((button) => button.dataset.action === focusedAction);
+    (replacement || addToggle).focus({ preventScroll: true });
+  }
+  const modelStatus = element("model-status");
+  modelStatus.parentElement.dataset.configured = Boolean(data.model);
+  modelStatus.textContent = data.model
+    ? "로컬 AI 설정됨 · " + data.model + (data.embedding ? " · 의미 검색" : "")
+    : "로컬 AI 연결 전";
 }
 
 function highlight(text, quote) {
@@ -146,29 +178,37 @@ async function openEvidence(id, quote) {
     const item = await call("/api/evidence/" + id);
     if (version !== viewerRequest || !dialog.open) return;
     element("viewer-title").textContent = item.subject || "제목 없는 메일";
-    body.replaceChildren(
-      node("p", item.sender + " · " + formatDate(item.sent)),
-      node("p", "받는 사람 · " + (item.recipient || "정보 없음")),
-      node("p", item.archive + " · " + item.folder + (item.attachment ? " · " + item.attachment + " · " + item.location : "")),
-    );
+    dialog.scrollTop = 0;
+    const metadata = node("dl", "", "viewer-meta");
+    const fields = [
+      ["발신자", item.sender || "정보 없음"],
+      ["수신자", item.recipient || "정보 없음"],
+      ["날짜", formatDate(item.sent)],
+      ["출처", item.archive + " · " + item.folder],
+    ];
+    if (item.attachment) fields.push(["첨부", item.attachment + " · " + item.location]);
+    for (const [label, value] of fields) metadata.append(node("dt", label), node("dd", value));
+    body.replaceChildren(metadata);
     if (quote) body.append(node("blockquote", quote));
     const text = item.attachment ? item.text : item.body || item.text;
-    body.append(highlight(text, quote || item.text));
+    const original = highlight(text, quote || item.text);
+    body.append(original);
     if (item.attachments.length) {
-      body.append(node("h3", "첨부"));
+      const attachments = node("ul");
+      body.append(node("h3", "첨부"), attachments);
       for (const attachment of item.attachments) {
-        const row = node("p");
+        const row = node("li");
         if (attachment.passage) {
           const link = node("button", attachment.name, "text-button");
           link.type = "button";
           link.addEventListener("click", () => openEvidence(attachment.passage));
           row.append(link, " · " + attachment.status);
         } else row.textContent = attachment.name + " · " + attachment.status;
-        body.append(row);
+        attachments.append(row);
       }
     }
   } catch (error) {
-    if (version === viewerRequest) body.replaceChildren(node("p", error.message));
+    if (version === viewerRequest && dialog.open) body.replaceChildren(node("p", error.message));
   }
 }
 
@@ -177,7 +217,7 @@ function showResults(rows, title) {
   result.replaceChildren();
   element("result-section").hidden = false;
   element("result-heading").textContent = title + " (" + rows.length + ")";
-  if (!rows.length) result.append(node("p", "이 범위에서 일치하는 메일을 찾지 못했습니다."));
+  if (!rows.length) result.append(node("p", "이 범위에서 일치하는 메일을 찾지 못했습니다.", "result-empty"));
   for (const row of rows) {
     const button = node("button", "", "result");
     button.type = "button";
@@ -199,10 +239,10 @@ function showAnswer(data) {
     model_not_configured: "로컬 AI 모델을 연결하면 근거를 바탕으로 답변할 수 있습니다.",
     model_unavailable: "로컬 AI 모델을 열지 못했습니다. 아래 메일을 직접 확인할 수 있습니다.",
   };
-  box.replaceChildren(node("h2", "AI 답변"), node("p", statuses[data.status] || ""));
+  box.replaceChildren(node("h2", "AI 답변"), node("p", statuses[data.status] || "", "answer-status"));
   let count = 0;
   for (const claim of data.claims) {
-    const paragraph = node("p", claim.text + " ");
+    const paragraph = node("p", claim.text + " ", "answer-claim");
     for (const ref of claim.citations) {
       const cite = node("button", "[" + ++count + "]", "cite");
       cite.type = "button";
@@ -222,11 +262,17 @@ form.addEventListener("submit", async (event) => {
   const active = request = new AbortController();
   const query = element("query").value.trim();
   const ask = event.submitter?.value === "ask";
-  const filters = Object.fromEntries(["source", "sender", "recipient", "folder", "after", "before"].map((id) => [id, element(id).value]));
+  if (ask && !query) {
+    element("query").focus();
+    notice("질문을 입력하세요.");
+    return;
+  }
+  const filters = Object.fromEntries(filterIds.map((id) => [id, element(id).value]));
   const payload = { query, filters, context: ask ? previousQuestion : "" };
   element("answer").hidden = true;
   element("result-section").hidden = true;
-  if (ask && !query) { notice("질문을 입력하세요."); return; }
+  element("welcome").hidden = true;
+  form.closest("main").classList.add("has-query");
   notice(ask ? "메일에서 근거를 찾고 있습니다." : "검색 중입니다.");
   try {
     if (ask) {
@@ -245,7 +291,7 @@ form.addEventListener("submit", async (event) => {
     } else {
       const data = await call("/api/search", payload, active.signal);
       if (active.signal.aborted) return;
-      showResults(data.results, "검색 결과");
+      showResults(data.results, query ? "검색 결과" : "최근 메일");
     }
     notice("");
   } catch (error) {
@@ -253,21 +299,56 @@ form.addEventListener("submit", async (event) => {
   }
 });
 
-element("clear-context").addEventListener("click", () => setQuestionContext(""));
-element("add-toggle").addEventListener("click", () => {
-  const form = element("add-form");
-  form.hidden = !form.hidden;
-  if (!form.hidden) element("path").focus();
+element("clear-context").addEventListener("click", () => {
+  setQuestionContext("");
+  element("query").focus();
 });
-element("add-form").addEventListener("submit", async (event) => {
+for (const id of filterIds) element(id).addEventListener("input", showFilterCount);
+element("clear-filters").addEventListener("click", () => {
+  for (const id of filterIds) element(id).value = "";
+  showFilterCount();
+  element("source").focus();
+});
+element("filter-shortcut").addEventListener("click", () => {
+  element("filter-panel").open = true;
+  element("source").focus();
+});
+element("recent-mail").addEventListener("click", () => {
+  element("query").value = "";
+  form.requestSubmit(element("submit-search"));
+  element("query").focus();
+});
+document.addEventListener("keydown", (event) => {
+  if (event.key !== "/" || event.ctrlKey || event.metaKey || event.altKey || event.isComposing ||
+      element("viewer").open || event.target.closest?.("input, select, textarea, [contenteditable='true']")) return;
   event.preventDefault();
+  element("query").focus();
+});
+
+function showAddForm(open) {
+  addForm.hidden = !open;
+  addToggle.setAttribute("aria-expanded", open);
+  if (open) element("path").focus();
+}
+addToggle.addEventListener("click", () => showAddForm(addForm.hidden));
+addForm.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const button = addForm.querySelector("button[type=submit]");
+  element("add-notice").textContent = "";
+  button.disabled = true;
   try {
     await call("/api/sources", { path: element("path").value.trim().replace(/^"(.*)"$/, "$1") });
     element("path").value = "";
-    element("add-form").hidden = true;
+    showAddForm(false);
+    addToggle.focus();
     notice("보관함을 등록했습니다.");
     await showSources();
-  } catch (error) { notice(error.message); }
+  } catch (error) {
+    if (addForm.hidden) notice(error.message);
+    else element("add-notice").textContent = error.message;
+  } finally {
+    button.disabled = false;
+  }
 });
 
 async function pollSources() {
