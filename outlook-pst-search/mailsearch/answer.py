@@ -4,6 +4,7 @@ import http.client
 import json
 import re
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from .store import normalized, query_words, topic_key
 
@@ -51,8 +52,17 @@ claims에는 사실 한 문장과 그 주장을 직접 입증하는 citations를
 """
 
 
+def embedding_target(url):
+    """Resolve a shared embedding server URL, e.g. http://192.168.0.10:11434."""
+    parts = urlsplit(url)
+    if (parts.scheme not in ("http", "https") or not parts.hostname or parts.username
+            or parts.path not in ("", "/") or parts.query or parts.fragment):
+        raise ValueError("embedding_url")
+    return parts.scheme, parts.hostname, parts.port or (443 if parts.scheme == "https" else 80)
+
+
 class LocalAI:
-    def __init__(self, model, embedding_model="", port=11435, timeout=55):
+    def __init__(self, model, embedding_model="", port=11435, timeout=55, embedding_url=""):
         for name in (model, embedding_model):
             if name and (not MODEL_NAME.fullmatch(name) or "cloud" in name.casefold() or name.startswith("http")):
                 raise ValueError("Use an installed local model name.")
@@ -60,10 +70,15 @@ class LocalAI:
         self.embedding_model = embedding_model
         self.port = port
         self.timeout = timeout
+        # When set, embedding calls go to this shared Ollama host (e.g. a NAS); the
+        # generation model still uses the loopback server only.
+        self.remote = embedding_target(embedding_url) if embedding_url else None
 
-    def call(self, path, data=None, timeout=None):
-        # HTTPConnection uses a fixed IP. It does not follow redirects or environment proxies.
-        connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=timeout or self.timeout)
+    def call(self, path, data=None, timeout=None, remote=False):
+        scheme, host, port = self.remote if remote and self.remote else ("http", "127.0.0.1", self.port)
+        # A fixed host with no redirects and no environment proxies.
+        factory = http.client.HTTPSConnection if scheme == "https" else http.client.HTTPConnection
+        connection = factory(host, port, timeout=timeout or self.timeout)
         try:
             body = json.dumps(data, ensure_ascii=False).encode() if data is not None else None
             connection.request("POST" if body else "GET", path, body, {"Content-Type": "application/json"})
@@ -77,20 +92,20 @@ class LocalAI:
         finally:
             connection.close()
 
-    def ensure_model(self, name):
+    def ensure_model(self, name, remote=False):
         # Server reports a model already installed on disk. Models are never pulled by this app.
         canonical = name if ":" in name.rsplit("/", 1)[-1] else name + ":latest"
-        for model in self.call("/api/tags", timeout=2).get("models", []):
+        for model in self.call("/api/tags", timeout=2, remote=remote).get("models", []):
             if model.get("name") == canonical:
-                description = self.call("/api/show", {"model": canonical}, timeout=3)
+                description = self.call("/api/show", {"model": canonical}, timeout=3, remote=remote)
                 if any(description.get(field) for field in ("remote_model", "remote_host")):
                     break
                 return canonical
         raise RuntimeError("local_model_missing")
 
     def embed(self, texts, timeout=8):
-        model = self.ensure_model(self.embedding_model)
-        values = self.call("/api/embed", {"model": model, "input": texts, "truncate": True}, timeout)
+        model = self.ensure_model(self.embedding_model, remote=True)
+        values = self.call("/api/embed", {"model": model, "input": texts, "truncate": True}, timeout, remote=True)
         return values["embeddings"]
 
     def answer(self, question, evidence, context):
