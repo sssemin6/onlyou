@@ -226,6 +226,9 @@ class Indexer:
             except ImportIssue as exc:
                 if str(exc) in {"pst_no_mail", "pst_export", "pst_invalid"}:
                     skipped += 1
+                    # Remember the signature so an unchanged unusable PST is not
+                    # flagged as an update target on every later refresh.
+                    signatures[label] = signature
                     continue
                 raise
             extras.append((output, label))
@@ -350,6 +353,27 @@ class Indexer:
                 if signatures is not None:
                     self.store.save_pst_files(conn, source, signatures)
         shutil.rmtree(stage, ignore_errors=True)
+
+    def pending_updates(self, row):
+        """PST files under a registered folder that changed since the last import."""
+        if row["kind"] != "eml_dir":
+            return []
+        path = Path(row["path"])
+        known = self.store.pst_files(row["id"])
+        changed = []
+        try:
+            files = sorted(item for item in path.rglob("*")
+                           if item.suffix.lower() == ".pst" and item.is_file() and not item.is_symlink())
+        except OSError:
+            return []
+        for pst in files:
+            label = pst.relative_to(path).as_posix() + "/"
+            try:
+                if known.get(label) != read_signature(pst):
+                    changed.append(pst.relative_to(path).as_posix())
+            except OSError:
+                continue
+        return changed
 
     def scan_entries(self, root, *, numbered, extras=()):
         yield from self.entries(root, numbered=numbered)
