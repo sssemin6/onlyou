@@ -1,0 +1,1 @@
+{"model_format":"gguf","model_family":"bert","model_families":["bert"],"model_type":"566.70M","file_type":"F16","architecture":"amd64","os":"linux","rootfs":{"type":"layers","diff_ids":["sha256:daec91ffb5dd0c27411bd71f29932917c49cf529a641d0168496c3a501e3062c","sha256:a406579cd136771c705c521db86ca7d60a6f3de7c9b5460e6193a2df27861bde"]}}
