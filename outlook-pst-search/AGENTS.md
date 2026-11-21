@@ -41,7 +41,8 @@ PST --readpst--> EML 스풀 --> `parse_mail` --> `mails`/`passages`/`terms`(FTS5
 
 ## 검색 동작
 
-- **메일/문서 탭**: `mails.kind`('mail'/'document') 컬럼이 검색 대상을 구분한다. UI가 `filters.tab`을 보내고 `store.scope()`가 `m.kind=?` 조건을 붙인다(기존 행은 시작 시 항목 확장자로 분류 마이그레이션). 문의 검색·근거 검색 모두 탭을 따른다.
+- **메일/문서/PCF 탭**: `mails.kind`('mail'/'document'/'pcf') 컬럼이 검색 대상을 구분한다. 문서는 항목 확장자로, 파일명에 `pcf`가 들어간 문서는 'pcf'로 분류한다(매 시작 시 재분류). UI가 `filters.tab`을 보내고 `store.scope()`가 `m.kind=?` 조건을 붙인다. 문의 검색·근거 검색 모두 탭을 따른다.
+- **PCF 답변**(선주 교신문): PCF 탭의 AI 질문은 설계 이력 라우트(`/api/design/*`, 인접 문맥 확장 = COMMENT 발행~종결 묶음)를 재사용하되, 근거가 PCF면 서버가 `PCF_INSTRUCTIONS`(유사 COMMENT 정리 + 권장 회신)로 지침을 교체한다.
 - **Enter(일반 검색)**: 키워드(FTS terms + 한글 bigram grams)와 의미(임베딩 유사도)를 병합(`merge_rows`). 결과에는 일치 단어(`matched`)·유사도(`similarity`)·매치 문장(`snippet`)이 붙고 UI가 단어를 강조한다.
 - **따옴표 정확 검색**: `"단어"` — 해당 단어를 포함한 메일만. `"A" & "B"`는 모두, `"A" or "B"`는 하나라도. 파싱은 `store.quoted_plan`, 실행은 `store.exact_search`.
 - **Ctrl+Enter(AI 질문)**: 두 단계 — 첫 실행은 하이브리드 검색만, 같은 질문 재실행 시 `evidence_for` 근거 검색 후 **외부 API**가 자동 전송·작성한다(답변 제공자 UI는 제거됨). `validate`가 인용 문구의 원문 일치를 검증(실패 시 partial/insufficient로 강등). 단계 구분은 `app.js`의 `stagedQuery`.
