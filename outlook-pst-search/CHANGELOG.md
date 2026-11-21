@@ -12,7 +12,7 @@
 ### AI 연결
 - 사이드바에 로컬 AI·외부 API 연결 상태 표시(연결 시 모델명 표기).
 - 외부 API 질문(Ctrl+Enter 포함)이 전송 검토 다이얼로그 없이 자동 전송. AI 답변의 "외부 API" 배지 제거.
-- 임베딩 모델 저장소를 NAS 경로로 지정 가능(`OLLAMA_MODELS`, setup-windows.cmd에서 경로 입력). 각 PC의 Ollama가 NAS의 모델 파일을 읽어 로컬에서 임베딩. 기본 모델 `bge-m3`(이 앱에서 검증됨) / 품질 업그레이드 시 `qwen3-embedding:4b`.
+- bge-m3 임베딩 모델을 저장소에 분할 포함(95MB×12조각, 첫 실행에 결합·SHA-256 검증). setup이 Ollama 자동 실행을 해제하고, 임베딩이 필요한 순간에만 백그라운드로 시작해 앱 종료 때 함께 종료.
 - z.ai 등 Anthropic Messages 호환 게이트웨이 지속 개선(의미 검색 근거 사용).
 
 ### 성능
@@ -22,6 +22,8 @@
 - readpst 0.6.76 휴대용 번들(`vendor/readpst-win64`) 저장소 포함 — MSYS2 수동 설치 불필요.
 - `setup-windows.cmd` 첫 실행 자동 구성(파이썬 winget 설치, 번들 readpst 확인, Ollama 선택), `start.cmd` 원클릭 실행.
 - `Ctrl+Enter` AI 질문 단축키(Enter=일반 검색), "검색 시작하기" 카드 제거.
+- `start.vbs` 창 없는 실행, 브라우저 탭을 모두 닫으면 앱 자동 종료.
+- 보관함 카드에 마지막 색인 뒤 바뀐 PST를 갱신 대상으로 표시.
 - 폴더 등록 시 내부 PST 자동 가져오기(빈/깨진 PST 건너뛰고 누락 표시).
 
 ## 초기 (업스트림)
