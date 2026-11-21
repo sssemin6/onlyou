@@ -1,4 +1,5 @@
 """Background imports with persistent progress and atomic version switches."""
+import hashlib
 import http.client
 import os
 import shutil
@@ -184,6 +185,34 @@ class Indexer:
         with self.store.connection() as conn:
             conn.execute("UPDATE sources SET state=?,issue=? WHERE id=? AND state NOT IN ('paused','removing')", (state, issue, source))
 
+    @staticmethod
+    def pst_header(path):
+        with path.open("rb") as stream:
+            header = stream.read(12)
+        return len(header) == 12 and header[:4] == b"!BDN" and header[8:10] == b"SM"
+
+    def import_folder_psts(self, folder, stage, event):
+        """Also import PST files kept inside a registered mail folder."""
+        extras = []
+        files = sorted(path for path in folder.rglob("*")
+                       if path.suffix.lower() == ".pst" and path.is_file() and not path.is_symlink())
+        for pst in files:
+            self.check(event)
+            label = pst.relative_to(folder).as_posix() + "/"
+            slot = stage / ("pst-" + hashlib.sha1(label.encode("utf-8")).hexdigest()[:16])
+            try:
+                with stable_input(pst):
+                    if not self.pst_header(pst):
+                        raise ImportIssue("pst_invalid")
+                    signature = read_signature(pst)
+                    output = self.export(pst, slot, event)
+                    if read_signature(pst) != signature:
+                        raise ImportIssue("changed")
+            except PermissionError as exc:
+                raise ImportIssue("pst_in_use") from exc
+            extras.append((output, label))
+        return extras
+
     def export(self, path, stage, event):
         output = stage / "eml"
         if (stage / "export-complete").is_file():
@@ -251,14 +280,13 @@ class Indexer:
             conn.execute("UPDATE sources SET signature=?,state='extracting' WHERE id=? AND state='queued'", (signature, source))
         self.check(event)
         is_pst = row["kind"] == "pst"
+        extras = ()
         if is_pst:
             try:
                 with stable_input(path):
                     if read_signature(path) != signature:
                         raise ImportIssue("changed")
-                    with path.open("rb") as stream:
-                        header = stream.read(12)
-                    if len(header) != 12 or header[:4] != b"!BDN" or header[8:10] != b"SM":
+                    if not self.pst_header(path):
                         raise ImportIssue("pst_invalid")
                     root = self.export(path, stage, event)
                     if read_signature(path) != signature:
@@ -267,16 +295,18 @@ class Indexer:
                 raise ImportIssue("pst_in_use") from exc
         else:
             root = path
+            if path.is_dir():
+                extras = self.import_folder_psts(path, stage, event)
         self.check(event)
         self.state(source, "headers")
-        self.index_headers(root, source, version, event, numbered=is_pst)
+        self.index_headers(root, source, version, event, numbered=is_pst, extras=extras)
         self.check(event)
         progress = self.store.source(source)
         empty_eml = progress["done"] == 0 and not progress["failed"] and not is_pst
         if not progress["done"] and not empty_eml:
             raise ImportIssue("mail_parse_failed" if progress["failed"] else "pst_no_mail")
         self.state(source, "attachments")
-        self.index_attachments(root, temp, source, version, event)
+        self.index_attachments(root, temp, source, version, event, extras=extras)
         issue = None
         if self.ai is not None and self.ai.embedding_model:
             self.state(source, "embeddings")
@@ -295,10 +325,25 @@ class Indexer:
                 conn.execute("DELETE FROM problems WHERE source=? AND version<>?", (source, version))
         shutil.rmtree(stage, ignore_errors=True)
 
-    def index_headers(self, root, source, version, event, *, numbered=False):
+    def scan_entries(self, root, *, numbered, extras=()):
+        yield from self.entries(root, numbered=numbered)
+        for output, prefix in extras:
+            for path, item, folder in self.entries(output, numbered=True):
+                yield path, prefix + item, "/" + prefix.rstrip("/") + folder
+
+    @staticmethod
+    def locate(root, extras, item):
+        if root.is_file():
+            return root
+        for output, prefix in extras:
+            if item.startswith(prefix):
+                return output / item[len(prefix):]
+        return root / item
+
+    def index_headers(self, root, source, version, event, *, numbered=False, extras=()):
         with self.store.connection() as conn:
             batch = 0
-            for path, item, folder in self.entries(root, numbered=numbered):
+            for path, item, folder in self.scan_entries(root, numbered=numbered, extras=extras):
                 self.check(event)
                 if conn.execute("SELECT 1 FROM mails WHERE source=? AND version=? AND item=?", (source, version, item)).fetchone():
                     continue
@@ -316,7 +361,7 @@ class Indexer:
                 if batch % 32 == 0:
                     conn.commit()
 
-    def index_attachments(self, root, temp, source, version, event):
+    def index_attachments(self, root, temp, source, version, event, extras=()):
         with self.store.connection() as conn:
             pending = conn.execute(
                 """SELECT m.item,m.folder,m.id FROM mails m WHERE m.source=? AND m.version=? AND
@@ -326,7 +371,7 @@ class Indexer:
             while batch:
                 for row in batch:
                     self.check(event)
-                    path = root if root.is_file() else root / row["item"]
+                    path = self.locate(root, extras, row["item"])
                     try:
                         mail = parse_mail(path, row["folder"])
                     except (ValueError, OSError, LookupError, TypeError, RecursionError):
