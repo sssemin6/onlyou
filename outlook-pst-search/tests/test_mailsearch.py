@@ -177,6 +177,7 @@ class Integration(unittest.TestCase):
         folder = Path(self.workspace.name) / "pst-folder"
         folder.mkdir()
         (folder / "보관.pst").write_bytes(b"!BDN\x00\x00\x00\x00SM\x00\x00")
+        (folder / "깨진.pst").write_bytes(b"not-a-pst-header")
 
         def fake_export(pst, stage, event):
             message = EmailMessage()
@@ -197,6 +198,7 @@ class Integration(unittest.TestCase):
             self.assertEqual(status, 202)
             row = await_source(self.store, payload["source"], {"ready", "error", "empty"})
             self.assertEqual(row["state"], "ready")
+            self.assertEqual(row["omitted"], 1)  # the unreadable PST is skipped, not fatal
         status, found = self.call("/api/search", {"query": "폴더 안 PST에서", "filters": {}})
         self.assertEqual(status, 200)
         self.assertTrue(found["results"])
