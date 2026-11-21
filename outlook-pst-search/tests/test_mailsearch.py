@@ -366,6 +366,8 @@ class Integration(unittest.TestCase):
         source = self.import_mail()
         status, data = self.call("/api/search", {"query": "A-17", "filters": {"sender": "buy@example.invalid"}})
         self.assertEqual(status, 200)
+        self.assertIn("a-17", data["results"][0]["matched"])
+        self.assertTrue(any(row.get("similarity") is not None for row in data["results"]))
         subjects = {row["subject"] for row in data["results"]}
         self.assertTrue({"한빛 A-17 출하 일정", "Re: 한빛 A-17 출하 일정"} <= subjects)
         whole = self.call("/api/search", {"query": '"A-17"', "filters": {}})[1]["results"]
