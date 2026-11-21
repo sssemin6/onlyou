@@ -151,7 +151,6 @@ async function showSources() {
             request?.abort();
             element("answer").hidden = true;
             element("result-section").hidden = true;
-            element("welcome").hidden = false;
             form.closest("main").classList.remove("has-query");
             if (element("viewer").open) element("viewer").close();
             notice("보관함을 등록 해제했습니다.");
@@ -182,6 +181,11 @@ async function showSources() {
   modelStatus.textContent = data.model
     ? "로컬 AI 설정됨 · " + data.model + (data.embedding ? " · 의미 검색" : "")
     : "로컬 AI 연결 전";
+  const externalPanel = element("external-panel");
+  externalPanel.dataset.configured = Boolean(data.external);
+  element("external-status").textContent = data.external
+    ? "외부 API 연결됨 · " + data.external.model
+    : "외부 API 연결 전";
 }
 
 function highlight(text, quote) {
@@ -334,7 +338,6 @@ form.addEventListener("submit", async (event) => {
   const payload = { query, filters, context: ask ? previousQuestion : "" };
   element("answer").hidden = true;
   element("result-section").hidden = true;
-  element("welcome").hidden = true;
   form.closest("main").classList.add("has-query");
   notice(ask ? "메일에서 근거를 찾고 있습니다." : "검색 중입니다.");
   try {
@@ -417,15 +420,6 @@ element("clear-filters").addEventListener("click", () => {
   for (const id of filterIds) element(id).value = "";
   showFilterCount();
   element("source").focus();
-});
-element("filter-shortcut").addEventListener("click", () => {
-  element("filter-panel").open = true;
-  element("source").focus();
-});
-element("recent-mail").addEventListener("click", () => {
-  element("query").value = "";
-  form.requestSubmit(element("submit-search"));
-  element("query").focus();
 });
 function settingsMessage(message) {
   element("settings-status").textContent = message;
@@ -527,6 +521,12 @@ document.addEventListener("keydown", (event) => {
       (element("viewer").open || reviewDialog.open || settingsDialog.open) || event.target.closest?.("input, select, textarea, [contenteditable='true']")) return;
   event.preventDefault();
   element("query").focus();
+});
+
+element("query").addEventListener("keydown", (event) => {
+  if (event.key !== "Enter" || !(event.ctrlKey || event.metaKey) || event.isComposing) return;
+  event.preventDefault();
+  form.requestSubmit(element("submit-ask"));
 });
 
 function showAddForm(open) {
