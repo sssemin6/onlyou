@@ -310,6 +310,12 @@ class Store:
         if filters.get("tab") in ("mail", "document", "pcf"):
             clauses.append("m.kind=?")
             params.append(filters["tab"])
+        for name in ("class", "flag", "owner", "hull", "drawing"):
+            # PCF scope fields match file names or passage text until the data is structured.
+            if filters.get(name):
+                clauses.append("(instr(lower(m.item),lower(?))>0 OR EXISTS("
+                               "SELECT 1 FROM passages p WHERE p.mail=m.id AND instr(lower(p.text),lower(?))>0))")
+                params.extend((filters[name], filters[name]))
         if filters.get("after"):
             clauses.append("m.sent>=?")
             params.append(filters["after"])
