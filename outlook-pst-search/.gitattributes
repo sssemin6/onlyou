@@ -1,2 +1,4 @@
 *.cmd text eol=crlf
 *.py text eol=lf
+/graphify-out export-ignore
+/graphify-out/** export-ignore
