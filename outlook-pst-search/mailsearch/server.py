@@ -15,11 +15,11 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from .answer import LocalAI, delivery_date_answer, embedding_target, evidence_for, public_row, validate
+from .answer import LocalAI, delivery_date_answer, embedding_target, evidence_for, merge_rows, public_row, validate
 from .external import DEFAULT_MODEL, DEFAULT_URL, MAX_EXCERPTS, ExternalAI, ExternalRequestError, Reviews
 from .filesystem import local_path
 from .indexer import ImportIssue, Indexer
-from .store import Store
+from .store import Store, quoted_plan
 
 STATIC = Path(__file__).with_name("static")
 FILES = {"/": ("index.html", "text/html; charset=utf-8"), "/style.css": ("style.css", "text/css; charset=utf-8"),
@@ -70,15 +70,15 @@ class App(ThreadingHTTPServer):
 
 def filters_from(get):
     filters = {}
-    for name in ("sender", "recipient", "folder"):
+    for name in ("sender", "recipient", "subject", "body"):
         raw = get(name, "")
         if not isinstance(raw, str):
             raise ValueError(name)
         if raw.strip():
             filters[name] = raw.strip()[:200]
-    source = get("source", "")
-    if source:
-        filters["source"] = int(source)
+    attachment = get("attachment", "")
+    if attachment in ("yes", "no"):
+        filters["attachment"] = attachment
     for name in ("before", "after"):
         value = get(name, "")
         if value:
@@ -220,7 +220,17 @@ class Handler(BaseHTTPRequestHandler):
         filters = filters_from(options.get)
         store, ai = self.server.store, self.server.ai
         if route == "/api/search":
-            rows = store.lexical(query, filters, limit=180)
+            plan = quoted_plan(query)
+            if plan is not None:
+                rows = store.exact_search(plan, filters)
+            else:
+                rows = store.lexical(query, filters, limit=180)
+                if query and ai.embedding_model:
+                    try:
+                        nearby = store.semantic(ai.embed([query], timeout=6)[0], ai.embedding_model, filters)
+                        rows = merge_rows(rows, nearby, limit=60)
+                    except (OSError, ValueError, RuntimeError, KeyError, IndexError, TypeError, http.client.HTTPException):
+                        pass
             distinct = {}
             for row in rows:
                 distinct.setdefault(row["fingerprint"], public_row(row))
