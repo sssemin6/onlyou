@@ -16,7 +16,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from .answer import (DESIGN_INSTRUCTIONS, PCF_INSTRUCTIONS, LocalAI, design_retrieval, delivery_date_answer,
+from .answer import (PCF_INSTRUCTIONS, LocalAI, pcf_retrieval, delivery_date_answer,
                      evidence_for, merge_rows, numeric_answer, public_row, validate)
 from .bundled import prepare as prepare_bundled
 from .external import DEFAULT_MODEL, DEFAULT_URL, MAX_EXCERPTS, ExternalAI, ExternalRequestError, Reviews
@@ -105,6 +105,12 @@ def filters_from(get):
     tab = get("tab", "")
     if tab in ("mail", "document", "pcf"):
         filters["tab"] = tab
+    # PCF scope fields (선급·FLAG·선주·호선·도면명): matched against file names and passage
+    # text until the attributes become structured data.
+    for name in ("class", "flag", "owner", "hull", "drawing"):
+        raw = get(name, "")
+        if isinstance(raw, str) and raw.strip():
+            filters[name] = raw.strip()[:200]
     source = get("source", "")
     if source:
         filters["source"] = int(source)
@@ -230,10 +236,10 @@ class Handler(BaseHTTPRequestHandler):
             elif route == "/api/source-action":
                 self.server.indexer.command(int(payload["source"]), payload["action"])
                 self.send_json(202, {})
-            elif route in {"/api/search", "/api/candidates", "/api/answer", "/api/external/preview", "/api/design/preview"}:
+            elif route in {"/api/search", "/api/candidates", "/api/answer", "/api/external/preview", "/api/pcf/preview"}:
                 self.query(route, payload)
-            elif route in {"/api/external/send", "/api/design/send"}:
-                self.send_external(payload, design=route == "/api/design/send")
+            elif route in {"/api/external/send", "/api/pcf/send"}:
+                self.send_external(payload, pcf=route == "/api/pcf/send")
             elif route == "/api/external/settings":
                 self.change_external_settings(payload)
             else:
@@ -281,26 +287,17 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(400, {"error": "question_required"})
             return
         external = self.server.external
-        if route in {"/api/external/preview", "/api/design/preview"} and not external:
+        if route in {"/api/external/preview", "/api/pcf/preview"} and not external:
             self.send_json(403, {"error": "external_disabled"})
             return
-        if route == "/api/design/preview":
-            evidence, mode = design_retrieval(store, ai, query, filters, context)
-            if external and (payload.get("rerank") is True or os.environ.get("MAILSEARCH_DESIGN_RERANK") == "1"):
-                # Optional rerank experiment: the same provider reorders retrieval (PRD 02 section 2).
-                try:
-                    order = external.rerank(query, [(row["passage"], row["text"][:400]) for row in evidence[:10]])
-                except (OSError, ValueError, RuntimeError, KeyError, IndexError, TypeError, http.client.HTTPException):
-                    order = None
-                if order:
-                    rank = {identifier: position for position, identifier in enumerate(order)}
-                    evidence.sort(key=lambda row: rank.get(row["passage"], len(rank)))
+        if route == "/api/pcf/preview":
+            evidence, mode = pcf_retrieval(store, ai, query, filters, context)
         else:
             evidence, mode = evidence_for(store, ai, query, filters, context,
                                           semantic=(route in {"/api/answer", "/api/external/preview"}))
-        if route in {"/api/external/preview", "/api/design/preview"}:
-            # Design-history questions carry a larger evidence budget (PRD 02 section 5).
-            budget = {"limit": 2400} if route == "/api/design/preview" else {}
+        if route in {"/api/external/preview", "/api/pcf/preview"}:
+            # PCF comment questions carry a larger evidence budget.
+            budget = {"limit": 2400} if route == "/api/pcf/preview" else {}
             token, review = self.server.reviews.create(query, evidence, external.review_generation, **budget)
             self.send_json(200, {
                 **external.public, "review": token, "question": query,
@@ -335,7 +332,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.server.generation.release()
         self.send_json(200, {**result, "results": rows, "retrieval": mode})
 
-    def send_external(self, payload, design=False):
+    def send_external(self, payload, pcf=False):
         server = self.server
         if not server.external:
             self.send_json(403, {"error": "external_disabled"})
@@ -365,19 +362,16 @@ class Handler(BaseHTTPRequestHandler):
             if len(rows) != len(ids):
                 self.send_json(409, {"error": "external_source_changed"})
                 return
-            if design:
+            if pcf:
                 computed = numeric_answer(review.question, rows)
                 if computed is not None:
                     self.send_json(200, {**computed, "results": [public_row(row) for row in rows],
                                          "provider": "external"})
                     return
             try:
-                if design:
-                    # Owner-correspondence (PCF) evidence switches to comment-adjudication guidance.
-                    instructions = (PCF_INSTRUCTIONS if any(row["kind"] == "pcf" for row in rows)
-                                    else DESIGN_INSTRUCTIONS)
+                if pcf:
                     result = external.answer(review.question, excerpts,
-                                             instructions=instructions, token_limit=2800, timeout=90)
+                                             instructions=PCF_INSTRUCTIONS, token_limit=2800, timeout=90)
                 else:
                     result = external.answer(review.question, excerpts)
             except (OSError, ValueError, RuntimeError, KeyError, IndexError, TypeError, http.client.HTTPException) as exc:
