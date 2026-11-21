@@ -250,9 +250,13 @@ function showResults(rows, title) {
   for (const row of rows) {
     const button = node("button", "", "result");
     button.type = "button";
+    const reasons = [];
+    if (row.matched?.length) reasons.push("단어 " + row.matched.slice(0, 3).join(" · "));
+    if (row.similarity != null) reasons.push("유사도 " + Math.round(row.similarity * 100) + "%");
     button.append(node("strong", row.subject || "제목 없는 메일"),
-      node("span", [row.sender, formatDate(row.sent), row.archive, row.folder, row.attachment, row.attachment ? row.location : ""].filter(Boolean).join(" · "), "result-meta"),
-      node("span", row.preview, "result-preview"));
+      node("span", [row.sender, formatDate(row.sent), row.archive, row.folder, row.attachment, row.attachment ? row.location : ""].filter(Boolean).join(" · "), "result-meta"));
+    if (reasons.length) button.append(node("span", reasons.join(" · "), "result-why"));
+    button.append(node("span", row.preview, "result-preview"));
     button.addEventListener("click", () => openEvidence(row.passage));
     result.append(button);
   }
@@ -293,13 +297,19 @@ function rememberQuestion(data, query) {
   setQuestionContext((followUp && previousQuestion ? previousQuestion + " / " + query : query).slice(-450));
 }
 
+// AI 질문은 두 단계로 동작한다: 첫 Ctrl+Enter는 단어+의미 검색, 같은 질문으로 다시 누르면 AI가 정리한다.
+let stagedQuery = null;
+element("query").addEventListener("input", () => { stagedQuery = null; });
+
 form.addEventListener("submit", async (event) => {
   event.preventDefault();
   request?.abort();
   const active = request = new AbortController();
   const query = element("query").value.trim();
   const ask = event.submitter?.value === "ask";
-  const external = ask && element("provider").value === "external";
+  const escalate = ask && stagedQuery === query;
+  if (ask) stagedQuery = null;
+  const external = escalate && element("provider").value === "external";
   if (ask && !query) {
     element("query").focus();
     notice("질문을 입력하세요.");
@@ -310,8 +320,16 @@ form.addEventListener("submit", async (event) => {
   element("answer").hidden = true;
   element("result-section").hidden = true;
   form.closest("main").classList.add("has-query");
-  notice(ask ? "메일에서 근거를 찾고 있습니다." : "검색 중입니다.");
+  notice(escalate ? "메일에서 근거를 찾고 있습니다." : "검색 중입니다.");
   try {
+    if (ask && !escalate) {
+      stagedQuery = query;
+      const data = await call("/api/search", payload, active.signal);
+      if (active.signal.aborted) return;
+      showResults(data.results, query ? "검색 결과" : "최근 메일");
+      notice("단어+의미 검색 결과입니다. 한 번 더 Ctrl+Enter를 누르면 AI가 정리합니다.");
+      return;
+    }
     if (external) {
       const review = await call("/api/external/preview", payload, active.signal);
       if (active.signal.aborted) return;
