@@ -233,7 +233,8 @@ class Handler(BaseHTTPRequestHandler):
         if route == "/api/external/preview" and not external:
             self.send_json(403, {"error": "external_disabled"})
             return
-        evidence, mode = evidence_for(store, ai, query, filters, context, semantic=(route == "/api/answer"))
+        evidence, mode = evidence_for(store, ai, query, filters, context,
+                                      semantic=(route in {"/api/answer", "/api/external/preview"}))
         if route == "/api/external/preview":
             token, review = self.server.reviews.create(query, evidence, external.review_generation)
             self.send_json(200, {
