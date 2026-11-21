@@ -16,7 +16,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from .answer import (DESIGN_INSTRUCTIONS, LocalAI, design_retrieval, delivery_date_answer,
+from .answer import (DESIGN_INSTRUCTIONS, PCF_INSTRUCTIONS, LocalAI, design_retrieval, delivery_date_answer,
                      evidence_for, merge_rows, numeric_answer, public_row, validate)
 from .bundled import prepare as prepare_bundled
 from .external import DEFAULT_MODEL, DEFAULT_URL, MAX_EXCERPTS, ExternalAI, ExternalRequestError, Reviews
@@ -103,7 +103,7 @@ def filters_from(get):
     if attachment in ("yes", "no"):
         filters["attachment"] = attachment
     tab = get("tab", "")
-    if tab in ("mail", "document"):
+    if tab in ("mail", "document", "pcf"):
         filters["tab"] = tab
     source = get("source", "")
     if source:
@@ -373,8 +373,11 @@ class Handler(BaseHTTPRequestHandler):
                     return
             try:
                 if design:
+                    # Owner-correspondence (PCF) evidence switches to comment-adjudication guidance.
+                    instructions = (PCF_INSTRUCTIONS if any(row["kind"] == "pcf" for row in rows)
+                                    else DESIGN_INSTRUCTIONS)
                     result = external.answer(review.question, excerpts,
-                                             instructions=DESIGN_INSTRUCTIONS, token_limit=2800, timeout=90)
+                                             instructions=instructions, token_limit=2800, timeout=90)
                 else:
                     result = external.answer(review.question, excerpts)
             except (OSError, ValueError, RuntimeError, KeyError, IndexError, TypeError, http.client.HTTPException) as exc:
