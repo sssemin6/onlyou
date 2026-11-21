@@ -495,6 +495,48 @@ class Integration(unittest.TestCase):
         self.assertTrue(all(row["kind"] == "document" for row in documents["results"]))
         self.assertTrue(any("시험보고서" in row["subject"] for row in documents["results"]))
 
+    def test_pcf_tab_classifies_scopes_and_instructs(self):
+        """파일명에 PCF가 들어간 선주 교신문은 PCF 탭으로 분리되고 전용 지침으로 답변한다."""
+        folder = Path(self.workspace.name) / "pcf"
+        folder.mkdir()
+        (folder / "PCF-H2107-045.txt").write_text(
+            "선주 COMMENT: 좌현 발러스트 배관 밸브 등급 상향 요구. "
+            "빌더 회신: 규정서 기준 LR 등급으로 검토했고 현 설계 유지. 종결: 선주 동의로 Closed.", encoding="utf-8")
+        (folder / "배관 기준서.txt").write_text("발러스트 배관 등급 기준 안내.", encoding="utf-8")
+        _, payload = self.call("/api/sources", {"path": str(folder)})
+        await_source(self.store, payload["source"], {"ready", "error", "empty"})
+        _, pcf = self.call("/api/search", {"query": "밸브 등급", "filters": {"tab": "pcf"}})
+        self.assertTrue(pcf["results"])
+        self.assertTrue(all(row["kind"] == "pcf" for row in pcf["results"]))
+        self.assertTrue(all("PCF" in row["subject"] for row in pcf["results"]))
+        _, documents = self.call("/api/search", {"query": "배관", "filters": {"tab": "document"}})
+        self.assertTrue(documents["results"])
+        self.assertTrue(all(row["kind"] == "document" for row in documents["results"]))
+        self.assertFalse(any("PCF" in row["subject"] for row in documents["results"]))
+        self.app.external = ExternalAI("https://api.example.invalid/v1/chat/completions",
+                                       "test-model", "placeholder-token")
+        _, preview = self.call("/api/design/preview", {"query": "밸브 등급 상향 COMMENT 처리", "filters": {"tab": "pcf"}})
+        self.assertTrue(preview["results"])
+        self.assertTrue(all(row["kind"] == "pcf" for row in preview["results"]))
+        with patch("mailsearch.external.http.client.HTTPSConnection") as https:
+            connection = https.return_value
+            reply = connection.getresponse.return_value
+            reply.status = 200
+            reply.read.return_value = json.dumps({"choices": [{"message": {"content": json.dumps({
+                "status": "answered",
+                "claims": [{"text": "과거 동일 COMMENT은 현 설계 유지로 종결되었습니다.",
+                            "citations": [{"source": preview["excerpts"][0]["id"],
+                                           "quote": "현 설계 유지"}]}],
+            }, ensure_ascii=False)}}]}).encode()
+            status, data = self.call("/api/design/send",
+                {"review": preview["review"], "excerpts": [item["id"] for item in preview["excerpts"]]})
+            self.assertEqual(status, 200)
+            body = connection.request.call_args[0][2]
+            if isinstance(body, str):
+                body = body.encode()
+            self.assertIn("선주 교신문(PCF)".encode() if isinstance(body, bytes) else "선주 교신문(PCF)", body)
+        self.assertEqual(data["status"], "answered")
+
     def test_external_review_sends_only_selected_excerpt_once(self):
         self.import_mail()
         question = "한빛 A-17 납품일은 언제 확정됐어?"
