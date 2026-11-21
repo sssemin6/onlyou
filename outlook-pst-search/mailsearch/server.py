@@ -16,7 +16,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from .answer import LocalAI, delivery_date_answer, evidence_for, public_row, validate
-from .external import MAX_EXCERPTS, ExternalAI, Reviews
+from .external import DEFAULT_MODEL, DEFAULT_URL, MAX_EXCERPTS, ExternalAI, ExternalRequestError, Reviews
 from .filesystem import local_path
 from .indexer import ImportIssue, Indexer
 from .store import Store
@@ -156,10 +156,17 @@ class Handler(BaseHTTPRequestHandler):
         elif route.path == "/api/sources":
             sources = self.server.store.sources()
             ids = set(self.server.store.allowed_sources())
+            external = self.server.external
             self.send_json(200, {
                 "sources": [{**row, "available": row["id"] in ids} for row in sources],
                 "model": self.server.ai.model, "embedding": self.server.ai.embedding_model,
-                "external": self.server.external.public if self.server.external else None,
+                "external": external.public if external else None,
+            })
+        elif route.path == "/api/external/settings":
+            external = self.server.external
+            self.send_json(200, {
+                "configured": external.public if external else None,
+                "defaults": {"destination": DEFAULT_URL, "model": DEFAULT_MODEL},
             })
         elif re.fullmatch(r"/api/evidence/\d{1,16}", route.path):
             row = self.server.store.open_passage(int(route.path.rsplit("/", 1)[-1]))
@@ -194,6 +201,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.query(route, payload)
             elif route == "/api/external/send":
                 self.send_external(payload)
+            elif route == "/api/external/settings":
+                self.change_external_settings(payload)
             else:
                 self.send_json(404, {"error": "not_found"})
         except (ValueError, TypeError, KeyError, OverflowError):
@@ -220,14 +229,15 @@ class Handler(BaseHTTPRequestHandler):
         if not query:
             self.send_json(400, {"error": "question_required"})
             return
-        if route == "/api/external/preview" and not self.server.external:
+        external = self.server.external
+        if route == "/api/external/preview" and not external:
             self.send_json(403, {"error": "external_disabled"})
             return
         evidence, mode = evidence_for(store, ai, query, filters, context, semantic=(route == "/api/answer"))
         if route == "/api/external/preview":
-            token, review = self.server.reviews.create(query, evidence)
+            token, review = self.server.reviews.create(query, evidence, external.review_generation)
             self.send_json(200, {
-                **self.server.external.public, "review": token, "question": query,
+                **external.public, "review": token, "question": query,
                 "excerpts": [{"id": item.number, "text": item.text} for item in review.excerpts] if review else [],
                 "results": [public_row(row) for row in evidence],
             })
@@ -273,8 +283,12 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(409, {"error": "external_busy"})
             return
         try:
+            external = server.external
+            if not external:
+                self.send_json(403, {"error": "external_disabled"})
+                return
             review = server.reviews.take(token)
-            if review is None:
+            if review is None or review.generation is not external.review_generation:
                 self.send_json(409, {"error": "external_review_expired"})
                 return
             excerpts = [item for item in review.excerpts if item.number in selected]
@@ -286,7 +300,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(409, {"error": "external_source_changed"})
                 return
             try:
-                result = server.external.answer(review.question, excerpts)
+                result = external.answer(review.question, excerpts)
             except (OSError, ValueError, RuntimeError, KeyError, IndexError, TypeError, http.client.HTTPException):
                 self.send_json(200, {
                     "status": "external_unavailable", "claims": [], "results": [], "provider": "external",
@@ -298,6 +312,55 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(200, {
                 **checked, "results": [public_row(row) for row in verified], "provider": "external",
             })
+        finally:
+            server.outbound.release()
+
+
+    def change_external_settings(self, payload):
+        action = payload.get("action")
+        if action not in ("apply", "test", "disconnect"):
+            raise ValueError("external_settings_action")
+        server = self.server
+        if not server.outbound.acquire(blocking=False):
+            self.send_json(409, {"error": "external_busy"})
+            return
+        try:
+            if action == "disconnect":
+                server.external = None
+                server.reviews.clear()
+                self.send_json(200, {"configured": None})
+                return
+            url, model, key = (payload.get(name, "") for name in ("destination", "model", "key"))
+            if not all(isinstance(value, str) for value in (url, model, key)):
+                raise ValueError("external_settings")
+            try:
+                external = ExternalAI.from_settings(url.strip(), model.strip(), key.strip(), server.external)
+            except ValueError as exc:
+                self.send_json(400, {"error": str(exc)})
+                return
+            if action == "apply":
+                server.external = external
+                server.reviews.clear()
+                self.send_json(200, {"configured": external.public})
+                return
+            try:
+                external.test()
+            except ExternalRequestError as exc:
+                status = exc.status
+                if status in (401, 403):
+                    error = "external_test_auth"
+                elif status in (400, 404, 422):
+                    error = "external_test_endpoint"
+                elif status == 429:
+                    error = "external_test_limit"
+                else:
+                    error = "external_test_failed"
+                self.send_json(502, {"error": error})
+                return
+            except (OSError, ValueError, KeyError, IndexError, TypeError, http.client.HTTPException):
+                self.send_json(502, {"error": "external_test_failed"})
+                return
+            self.send_json(200, {"ok": True})
         finally:
             server.outbound.release()
 

@@ -12,6 +12,7 @@ from urllib.parse import urlsplit
 from .answer import ANSWER_INSTRUCTIONS, MODEL_NAME, map_citations
 
 DEFAULT_URL = "https://api.openai.com/v1/chat/completions"
+DEFAULT_MODEL = "gpt-4.1-mini"
 REVIEW_TTL = 300
 MAX_EXCERPTS = 5
 MAX_EXCERPT_LENGTH = 800
@@ -27,6 +28,12 @@ JSON_INSTRUCTIONS = """
 """
 
 
+class ExternalRequestError(RuntimeError):
+    def __init__(self, status):
+        super().__init__("external_api_http")
+        self.status = status
+
+
 class ExternalAI:
     @classmethod
     def from_environment(cls):
@@ -38,15 +45,20 @@ class ExternalAI:
         return cls(url, model, key)
 
     def __init__(self, url, model, key):
-        if not isinstance(url, str) or any(ord(ch) <= 32 or ord(ch) >= 127 for ch in url):
+        if not isinstance(url, str) or not 1 <= len(url) <= 512 or any(ord(ch) <= 32 or ord(ch) >= 127 for ch in url):
             raise ValueError("external_url")
-        endpoint = urlsplit(url)
+        try:
+            endpoint = urlsplit(url)
+            port = endpoint.port
+        except ValueError as exc:
+            raise ValueError("external_url") from exc
         if (endpoint.scheme != "https" or not endpoint.hostname or not HOST.fullmatch(endpoint.hostname)
                 or "@" in endpoint.netloc or "?" in url or "#" in url or not PATH.fullmatch(endpoint.path)):
             raise ValueError("external_url")
-        if not MODEL_NAME.fullmatch(model) or not re.fullmatch(r"[\x21-\x7e]{1,2048}", key):
-            raise ValueError("external_credentials")
-        port = endpoint.port
+        if not isinstance(model, str) or not MODEL_NAME.fullmatch(model):
+            raise ValueError("external_model")
+        if not isinstance(key, str) or not re.fullmatch(r"[\x21-\x7e]{1,2048}", key):
+            raise ValueError("external_key")
         if port == 0 or any(part in {".", ".."} for part in endpoint.path.split("/")):
             raise ValueError("external_url")
         self.host = endpoint.hostname
@@ -54,6 +66,18 @@ class ExternalAI:
         self.path = endpoint.path
         self.model = model
         self._key = key
+        self.review_generation = object()
+
+    @classmethod
+    def from_settings(cls, url, model, key, current):
+        if key:
+            return cls(url, model, key)
+        if current is None:
+            raise ValueError("external_key_required")
+        candidate = cls(url, model, current._key)
+        if (candidate.host, candidate.port, candidate.path) != (current.host, current.port, current.path):
+            raise ValueError("external_key_required")
+        return candidate
 
     @property
     def public(self):
@@ -64,21 +88,31 @@ class ExternalAI:
         messages = {"question": question, "evidence": [
             {"source": item.number, "text": item.text} for item in excerpts
         ]}
+        result = self.complete(ANSWER_INSTRUCTIONS + JSON_INSTRUCTIONS, json.dumps(messages, ensure_ascii=False),
+                               token_limit=2800 if self.host == "api.openai.com" else 1500, timeout=35)
+        return map_citations(result, {item.number: item.passage for item in excerpts})
+
+    def test(self):
+        reply = self.complete('Reply with the JSON object {"ok": true}.', "Connection test", token_limit=600, timeout=15)
+        if not isinstance(reply, dict) or reply.get("ok") is not True:
+            raise ValueError("external_test_reply")
+
+    def complete(self, instructions, content, *, token_limit, timeout):
         options = {
             "model": self.model,
             "messages": [
-                {"role": "system", "content": ANSWER_INSTRUCTIONS + JSON_INSTRUCTIONS},
-                {"role": "user", "content": json.dumps(messages, ensure_ascii=False)},
+                {"role": "system", "content": instructions},
+                {"role": "user", "content": content},
             ],
             "response_format": {"type": "json_object"},
             "stream": False,
         }
         if self.host == "api.openai.com":
-            options.update(max_completion_tokens=2800, store=False)
+            options.update(max_completion_tokens=token_limit, store=False)
         else:
-            options["max_tokens"] = 1500
+            options["max_tokens"] = token_limit
         # HTTPSConnection uses normal certificate verification and follows neither redirects nor proxies.
-        connection = http.client.HTTPSConnection(self.host, self.port, timeout=35)
+        connection = http.client.HTTPSConnection(self.host, self.port, timeout=timeout)
         try:
             connection.request(
                 "POST", self.path, json.dumps(options, ensure_ascii=False).encode("utf-8"),
@@ -86,15 +120,14 @@ class ExternalAI:
             )
             response = connection.getresponse()
             if response.status != 200:
-                raise RuntimeError("external_api_http")
+                raise ExternalRequestError(response.status)
             raw = response.read(MAX_RESPONSE + 1)
             if len(raw) > MAX_RESPONSE:
                 raise ValueError("external_response_size")
             message = json.loads(raw)["choices"][0]["message"]
-            result = json.loads(message["content"])
+            return json.loads(message["content"])
         finally:
             connection.close()
-        return map_citations(result, {item.number: item.passage for item in excerpts})
 
 
 @dataclass(frozen=True)
@@ -109,6 +142,7 @@ class Review:
     expires: float
     question: str
     excerpts: tuple[Excerpt, ...]
+    generation: object | None
 
 
 class Reviews:
@@ -116,7 +150,7 @@ class Reviews:
         self._pending = {}
         self._lock = threading.Lock()
 
-    def create(self, question, rows):
+    def create(self, question, rows, generation=None):
         texts = {}
         for row in rows:
             # Keep path, mail metadata, filename and account identifiers out of the request envelope.
@@ -132,7 +166,7 @@ class Reviews:
             return None, None
         token = secrets.token_urlsafe(24)
         now = time.monotonic()
-        review = Review(now + REVIEW_TTL, question, excerpts)
+        review = Review(now + REVIEW_TTL, question, excerpts, generation)
         with self._lock:
             self._pending = {key: value for key, value in self._pending.items() if value.expires > now}
             if len(self._pending) >= 8:
@@ -144,3 +178,7 @@ class Reviews:
         with self._lock:
             review = self._pending.pop(token, None)
         return review if review and review.expires > time.monotonic() else None
+
+    def clear(self):
+        with self._lock:
+            self._pending.clear()

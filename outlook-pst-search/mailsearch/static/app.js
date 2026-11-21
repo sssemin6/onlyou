@@ -6,6 +6,8 @@ const form = element("search-form");
 const addForm = element("add-form");
 const addToggle = element("add-toggle");
 const reviewDialog = element("review-dialog");
+const settingsDialog = element("settings-dialog");
+const settingsForm = element("settings-form");
 const filterIds = ["source", "sender", "recipient", "folder", "after", "before"];
 const dateFormat = new Intl.DateTimeFormat("ko-KR", { dateStyle: "medium", timeStyle: "short" });
 const stateNames = {
@@ -21,7 +23,15 @@ const issueNames = {
   changed: "파일이 변경되었습니다. 갱신해 주세요.",
   interrupted: "중단된 색인입니다.",
   embedding_unavailable: "의미 검색 모델을 열지 못했습니다. 일반 검색은 사용할 수 있습니다.",
-  external_disabled: "외부 API 설정이 필요합니다. 설치·실행 안내를 확인하세요.",
+  external_disabled: "상단의 API 설정에서 외부 AI를 연결해 주세요.",
+  external_url: "HTTPS 주소를 확인하세요. 주소는 /chat/completions로 끝나야 합니다.",
+  external_model: "제공자에서 안내한 모델명을 입력하세요.",
+  external_key: "API 키에 공백이 있는지 확인하세요.",
+  external_key_required: "이 주소에서 사용할 API 키를 입력하세요.",
+  external_test_auth: "인증이 거부되었습니다. API 키와 모델 사용 권한을 확인하세요.",
+  external_test_endpoint: "요청이 거부되었습니다. 주소, 모델명, JSON 모드 지원 여부를 확인하세요.",
+  external_test_limit: "제공자의 요청 한도 또는 잔액을 확인하세요.",
+  external_test_failed: "연결 테스트에 실패했습니다. 네트워크와 제공자의 응답을 확인하세요.",
   external_busy: "외부 API가 다른 질문을 처리하고 있습니다. 잠시 후 다시 시도하세요.",
   external_review_expired: "전송 검토가 만료되었습니다. 질문을 다시 실행해 주세요.",
   external_source_changed: "검토한 메일의 보관함이 변경되었습니다. 질문을 다시 실행해 주세요.",
@@ -39,6 +49,7 @@ let request;
 let sourceSnapshot = "";
 let sourceRequest = 0;
 let pendingReview;
+let settingsRequest = 0;
 
 function node(tag, text, className) {
   const result = document.createElement(tag);
@@ -406,9 +417,104 @@ element("recent-mail").addEventListener("click", () => {
   form.requestSubmit(element("submit-search"));
   element("query").focus();
 });
+function settingsMessage(message) {
+  element("settings-status").textContent = message;
+}
+
+function setSettingsBusy(busy) {
+  for (const control of settingsForm.querySelectorAll("input, button")) {
+    if (control.id !== "settings-close") control.disabled = busy;
+  }
+}
+
+function renderSettings(configured) {
+  element("settings-current").textContent = configured
+    ? "이 실행에 적용됨 · " + configured.model
+    : "외부 API 연결 전";
+  element("settings-remove").hidden = !configured;
+  element("settings-key").placeholder = configured ? "같은 주소에서 키를 유지하려면 비워 두세요" : "";
+}
+
+element("settings-open").addEventListener("click", async () => {
+  if (settingsDialog.open) return;
+  const version = ++settingsRequest;
+  settingsMessage("");
+  element("settings-current").textContent = "설정을 불러오는 중입니다.";
+  element("settings-remove").hidden = true;
+  element("settings-url").value = "";
+  element("settings-model").value = "";
+  element("settings-key").value = "";
+  setSettingsBusy(true);
+  settingsDialog.showModal();
+  try {
+    const data = await call("/api/external/settings");
+    if (version !== settingsRequest || !settingsDialog.open) return;
+    const setup = data.configured || data.defaults;
+    element("settings-url").value = setup.destination;
+    element("settings-model").value = setup.model;
+    renderSettings(data.configured);
+    setSettingsBusy(false);
+    element("settings-key").focus();
+  } catch (error) {
+    if (version === settingsRequest && settingsDialog.open) settingsMessage(error.message);
+  }
+});
+element("settings-close").addEventListener("click", () => settingsDialog.close());
+settingsDialog.addEventListener("close", () => {
+  if (!settingsDialog.open) {
+    settingsRequest++;
+    element("settings-key").value = "";
+  }
+});
+
+async function changeSettings(action) {
+  if (action !== "disconnect" && !settingsForm.reportValidity()) return;
+  const version = settingsRequest;
+  const payload = action === "disconnect" ? { action } : {
+    action,
+    destination: element("settings-url").value.trim(),
+    model: element("settings-model").value.trim(),
+    key: element("settings-key").value.trim(),
+  };
+  setSettingsBusy(true);
+  settingsMessage(action === "test" ? "테스트 문구로 연결을 확인하는 중입니다." : "");
+  try {
+    const data = await call("/api/external/settings", payload);
+    if (action !== "test") {
+      element("provider-control").hidden = !data.configured;
+      if (!data.configured) element("provider").value = "local";
+    }
+    if (version !== settingsRequest || !settingsDialog.open) return;
+    if (action === "test") {
+      settingsMessage("연결 테스트에 성공했습니다. 적용을 누르면 사용할 수 있습니다.");
+      return;
+    }
+    element("settings-key").value = "";
+    renderSettings(data.configured);
+    if (data.configured) {
+      element("settings-url").value = data.configured.destination;
+      element("settings-model").value = data.configured.model;
+    }
+    settingsMessage(data.configured
+      ? "설정을 적용했습니다. 검색 화면의 답변 제공자에서 외부 API를 선택할 수 있습니다."
+      : "외부 API 연결을 해제했습니다.");
+  } catch (error) {
+    if (version === settingsRequest && settingsDialog.open) settingsMessage(error.message);
+  } finally {
+    if (version === settingsRequest && settingsDialog.open) setSettingsBusy(false);
+  }
+}
+
+settingsForm.addEventListener("submit", (event) => {
+  event.preventDefault();
+  changeSettings("apply");
+});
+element("settings-test").addEventListener("click", () => changeSettings("test"));
+element("settings-remove").addEventListener("click", () => changeSettings("disconnect"));
+
 document.addEventListener("keydown", (event) => {
   if (event.key !== "/" || event.ctrlKey || event.metaKey || event.altKey || event.isComposing ||
-      (element("viewer").open || reviewDialog.open) || event.target.closest?.("input, select, textarea, [contenteditable='true']")) return;
+      (element("viewer").open || reviewDialog.open || settingsDialog.open) || event.target.closest?.("input, select, textarea, [contenteditable='true']")) return;
   event.preventDefault();
   element("query").focus();
 });

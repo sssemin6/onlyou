@@ -117,6 +117,61 @@ class Integration(unittest.TestCase):
         self.assertEqual((row["done"], row["omitted"]), (4, 1))
         return source
 
+    def test_external_settings_are_session_scoped_and_do_not_echo_key(self):
+        route = "/api/external/settings"
+        status, initial = self.call(route)
+        self.assertEqual(status, 200)
+        self.assertIsNone(initial["configured"])
+        self.assertEqual(initial["defaults"]["model"], "gpt-4.1-mini")
+        options = {"destination": "https://valid.example.invalid/v1/chat/completions",
+                   "model": "test-model", "key": "placeholder-token"}
+        with patch("mailsearch.external.http.client.HTTPSConnection") as https:
+            self.assertEqual(self.call(route, {"action": "apply", **options}, token=False)[0], 403)
+            status, applied = self.call(route, {"action": "apply", **options})
+            self.assertEqual(status, 200)
+            self.assertNotIn("placeholder-token", json.dumps(applied))
+            self.assertEqual(self.call(route)[1]["configured"], applied["configured"])
+            self.assertEqual(self.call("/api/sources")[1]["external"], applied["configured"])
+            https.assert_not_called()
+            same = {**options, "key": "", "model": "second"}
+            self.assertEqual(self.call(route, {"action": "apply", **same})[0], 200)
+            self.assertEqual(self.call(route, {"action": "apply", **same, "destination":
+                                               "https://another.example.invalid/v1/chat/completions"})[1]["error"],
+                             "external_key_required")
+            self.assertEqual(self.call(route, {"action": "disconnect"})[1], {"configured": None})
+            self.assertIsNone(self.call(route)[1]["configured"])
+            https.assert_not_called()
+
+    def test_external_trial_only_uses_a_fixed_message_and_leaves_configuration_unset(self):
+        route = "/api/external/settings"
+        options = {"action": "test", "destination": "https://trial.example.invalid/chat/completions",
+                   "model": "test", "key": "placeholder-token", "query": "private search"}
+        with patch("mailsearch.external.http.client.HTTPSConnection") as https:
+            con = https.return_value
+            reply = con.getresponse.return_value
+            reply.status = 401
+            self.assertEqual(self.call(route, options)[1]["error"], "external_test_auth")
+            reply.status = 200
+            reply.read.return_value = b'{"choices":[{"message":{"content":"{\\"ok\\":true}"}}]}'
+            self.assertEqual(self.call(route, options), (200, {"ok": True}))
+            sent = json.loads(con.request.call_args.args[2])
+            self.assertEqual(sent["messages"][1]["content"], "Connection test")
+            self.assertNotIn("private search", json.dumps(sent))
+            self.assertIsNone(self.call(route)[1]["configured"])
+
+    def test_external_settings_change_invalidates_outstanding_review(self):
+        self.import_mail()
+        route = "/api/external/settings"
+        current = {"action": "apply", "destination": "https://first.example.invalid/chat/completions",
+                   "model": "test", "key": "placeholder-token"}
+        self.assertEqual(self.call(route, current)[0], 200)
+        _, preview = self.call("/api/external/preview", {"query": "한빛 A-17"})
+        with patch("mailsearch.external.http.client.HTTPSConnection") as https:
+            self.assertEqual(self.call(route, {**current, "model": "different"})[0], 200)
+            status, response = self.call("/api/external/send", {"review": preview["review"], "excerpts": [1]})
+            self.assertEqual((status, response["error"]), (409, "external_review_expired"))
+            https.assert_not_called()
+
     def test_external_review_sends_only_selected_excerpt_once(self):
         self.import_mail()
         question = "한빛 A-17 납품일은 언제 확정됐어?"

@@ -557,3 +557,50 @@ mark { color: var(--ink); background: #f2cf84; }
   border-top: 1px solid var(--line);
   background: var(--paper);
 }
+
+.masthead-actions { display: flex; align-items: center; gap: 11px; }
+.settings-trigger { min-height: 34px; padding: 3px 10px; background: var(--peach); font-size: .82rem; }
+.settings-trigger svg { width: 16px; height: 16px; }
+.settings-trigger:hover { background: var(--blush); }
+.settings-dialog { max-width: 570px; }
+.settings-summary {
+  margin-bottom: 14px;
+  padding: 7px 10px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--peach);
+  font-size: .83rem;
+  font-weight: 710;
+  overflow-wrap: anywhere;
+}
+.settings-fields { display: grid; gap: 5px; }
+.settings-fields label { font-size: .84rem; font-weight: 780; }
+.settings-fields input {
+  width: 100%;
+  min-width: 0;
+  min-height: 38px;
+  margin: 0 0 6px;
+  padding: 5px 8px;
+  border: 1px solid #927b65;
+  border-radius: 6px;
+  background: var(--paper);
+}
+.settings-fields p, #settings-test-help { color: var(--muted); font-size: .78rem; }
+.settings-fields p { margin: -4px 0 7px; }
+.settings-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: end;
+  align-items: center;
+  gap: 9px 12px;
+  padding: 12px 20px;
+  border-top: 1px solid var(--line);
+}
+.settings-actions button { min-height: 38px; font-size: .85rem; }
+.settings-actions #settings-remove { margin-inline-end: auto; }
+#settings-test-help { flex-basis: 100%; text-align: end; }
+@media (max-width: 420px) {
+  .masthead-actions { gap: 7px; }
+  .masthead .local { display: none; }
+  .settings-actions { padding-inline: 14px; }
+}
