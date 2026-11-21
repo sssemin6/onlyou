@@ -207,6 +207,68 @@ class Integration(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertTrue(attachment["results"])
 
+    def test_refresh_reindexes_and_embeds_only_new_mail(self):
+        source = self.import_mail()
+        with self.store.connection() as conn:
+            vectors_before = conn.execute("SELECT count(*) FROM vectors").fetchone()[0]
+        extra = EmailMessage()
+        extra["From"] = "new@example.invalid"
+        extra["To"] = "buy@example.invalid"
+        extra["Subject"] = "증분 색인 시험"
+        extra["Message-ID"] = "<incremental@example.invalid>"
+        extra.set_content("새로 도착한 증분 색인 대상 메일입니다.")
+        (self.mail / "incremental.eml").write_bytes(extra.as_bytes())
+        self.call("/api/source-action", {"source": source, "action": "refresh"})
+        updated = await_source(self.store, source, {"ready", "error"})
+        self.assertEqual((updated["state"], updated["done"]), ("ready", 5))
+        with self.store.connection() as conn:
+            vectors_after = conn.execute("SELECT count(*) FROM vectors").fetchone()[0]
+        # The four unchanged mails keep their embeddings; only the new mail is embedded.
+        self.assertEqual(vectors_after - vectors_before, 1)
+        self.assertTrue(self.call("/api/search", {"query": "증분 색인 대상", "filters": {}})[1]["results"])
+
+    def test_folder_refresh_carries_unchanged_pst_without_reexport(self):
+        folder = Path(self.workspace.name) / "pst-folder"
+        folder.mkdir()
+        (folder / "보관.pst").write_bytes(b"!BDN\x00\x00\x00\x00SM\x00\x00")
+        (folder / "깨진.pst").write_bytes(b"not-a-pst-header")
+        exports = []
+
+        def fake_export(pst, stage, event):
+            exports.append(pst.name)
+            message = EmailMessage()
+            message["From"] = "a@example.invalid"
+            message["To"] = "b@example.invalid"
+            message["Subject"] = "폴더 PST 시험"
+            message["Message-ID"] = "<folder-pst@example.invalid>"
+            message.set_content("폴더 안 PST에서 꺼낸 메일입니다.")
+            output = stage / "eml"
+            output.mkdir(parents=True)
+            (output / "1").write_bytes(message.as_bytes())
+            (stage / "export-complete").touch()
+            return output
+
+        with patch.object(Indexer, "export", side_effect=fake_export):
+            status, payload = self.call("/api/sources", {"path": str(folder)})
+            source = payload["source"]
+            row = await_source(self.store, source, {"ready", "error", "empty"})
+            self.assertEqual((row["state"], row["done"], row["omitted"]), ("ready", 1, 1))
+            direct = EmailMessage()
+            direct["From"] = "c@example.invalid"
+            direct["To"] = "d@example.invalid"
+            direct["Subject"] = "직접 추가한 메일"
+            direct["Message-ID"] = "<direct@example.invalid>"
+            direct.set_content("폴더 바로 아래에 넣은 메일입니다.")
+            (folder / "direct.eml").write_bytes(direct.as_bytes())
+            self.call("/api/source-action", {"source": source, "action": "refresh"})
+            updated = await_source(self.store, source, {"ready", "error", "empty"})
+            self.assertEqual((updated["state"], updated["done"], updated["omitted"]), ("ready", 2, 1))
+        # The unchanged PST was carried over from the previous version, not re-exported.
+        self.assertEqual(exports, ["보관.pst"])
+        self.assertEqual(set(self.store.pst_files(source)), {"보관.pst/"})
+        self.assertTrue(self.call("/api/search", {"query": "폴더 안 PST에서", "filters": {}})[1]["results"])
+        self.assertTrue(self.call("/api/search", {"query": "직접 추가한", "filters": {}})[1]["results"])
+
     def test_external_review_sends_only_selected_excerpt_once(self):
         self.import_mail()
         question = "한빛 A-17 납품일은 언제 확정됐어?"
