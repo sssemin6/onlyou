@@ -247,6 +247,8 @@ class Store:
                 suffixes = ("pdf", "docx", "xlsx", "txt", "doc", "xls")
                 conn.execute("UPDATE mails SET kind='document' WHERE " +
                              " OR ".join("item LIKE '%.' || ?" for _ in suffixes), suffixes)
+            # Owner-correspondence (PCF) documents get their own tab; re-checked every start.
+            conn.execute("UPDATE mails SET kind='pcf' WHERE kind='document' AND lower(item) LIKE '%pcf%'")
             conn.execute("INSERT INTO terms(terms,rank) VALUES('secure-delete',1)")
 
     @contextlib.contextmanager
@@ -298,7 +300,7 @@ class Store:
         if filters.get("attachment") in ("yes", "no"):
             negate = "" if filters["attachment"] == "yes" else "NOT "
             clauses.append(f"{negate}EXISTS(SELECT 1 FROM attachments a WHERE a.mail=m.id)")
-        if filters.get("tab") in ("mail", "document"):
+        if filters.get("tab") in ("mail", "document", "pcf"):
             clauses.append("m.kind=?")
             params.append(filters["tab"])
         if filters.get("after"):
@@ -347,9 +349,10 @@ class Store:
         mail = document_identity(doc)
         cursor = conn.execute(
             """INSERT INTO mails(source,version,item,fingerprint,folder,subject,sender,recipient,sent,message_id,topic,body,kind)
-               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,'document')""",
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (source, version, item, fingerprint(mail, item), doc["folder"], doc["name"], "", "",
-             doc["sent"], "", topic_key(doc["name"]), ""),
+             doc["sent"], "", topic_key(doc["name"]), "",
+             "pcf" if "pcf" in Path(item).stem.lower() else "document"),
         )
         mail_id = cursor.lastrowid
         attachment_id = conn.execute(
