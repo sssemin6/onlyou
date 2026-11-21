@@ -7,7 +7,7 @@
 ## Windows에서 실행
 
 1. GitHub에서 **Code → Download ZIP**으로 내려받고 압축을 풉니다. 사내망에서 GitHub에 접속할 수 없으면 내려받은 소스와 필요한 의존성을 사내 반입 방식으로 옮깁니다.
-2. **setup-windows.cmd**를 한 번 실행합니다. 파이썬(없으면 winget으로 설치), 저장소에 함께 들어 있는 readpst(`vendor\readpst-win64`), 의미 검색용 Ollama+bge-m3(선택)를 확인하고 설치합니다.
+2. **setup-windows.cmd**를 한 번 실행합니다. 파이썬(없으면 winget으로 설치), 저장소에 함께 들어 있는 readpst(`vendor\readpst-win64`), 의미 검색용 Ollama+임베딩 모델(선택, NAS 경로 지정 가능)을 확인하고 설치합니다.
 3. **start.cmd**를 두 번 클릭해 실행합니다. 의미 검색 모델이 없으면 일반(키워드) 검색으로 동작합니다.
 4. 열린 브라우저에서 **보관함 추가**를 누른 뒤, Outlook을 닫고 로컬 디스크에 보관한 PST 경로를 등록합니다. 여러 파일은 한 번씩 등록하거나 PST를 모아 둔 폴더를 등록합니다. 폴더를 등록하면 그 안의 .eml 메일과 모든 PST 파일을 함께 가져오며, 빈 PST나 읽을 수 없는 PST는 건너뛰고 누락으로 표시합니다. Outlook이 사용하는 데이터 파일 대신 닫혀 있는 PST 사본을 등록하면 파일 교체·갱신 시점을 제어하기 쉽습니다.
 5. 터미널에서 **Ctrl+C**를 누르면 앱을 종료합니다. 진행 중이던 색인은 다음 실행에서 **재개**할 수 있습니다.
@@ -24,7 +24,7 @@ Linux에서도 SQLite 3.42 이상을 사용하는 Python이 필요합니다. `ps
 
 임베딩 모델과 생성 모델은 모두 선택 사항입니다. 연결하지 않아도 일반 검색과 외부 API 답변을 쓸 수 있고, 임베딩 모델을 연결하면 질문의 의미로 메일을 찾는 의미 검색이 추가됩니다.
 
-폐쇄망 반입 전에 사내에서 선택한 [Ollama](https://docs.ollama.com/) 설치 프로그램과 모델 파일을 준비해 둡니다. 생성 모델 예시는 `qwen3:4b`, 다국어 임베딩 모델 예시는 `bge-m3`입니다. 정확도와 지연은 장비에서 확인합니다. 네트워크가 허용되는 준비 환경에서 모델을 받아 모델 저장소를 반입하거나, 반입한 GGUF를 Ollama 로컬 모델로 등록할 수 있습니다. 예시 이름은 실제 설치된 로컬 모델과 일치해야 합니다.
+폐쇄망 반입 전에 사내에서 선택한 [Ollama](https://docs.ollama.com/) 설치 프로그램과 모델 파일을 준비해 둡니다. 생성 모델 예시는 `qwen3:4b`, 다국어 임베딩 모델 예시는 `qwen3-embedding:0.6b`입니다. 정확도와 지연은 장비에서 확인합니다. 네트워크가 허용되는 준비 환경에서 모델을 받아 모델 저장소를 반입하거나, 반입한 GGUF를 Ollama 로컬 모델로 등록할 수 있습니다. 예시 이름은 실제 설치된 로컬 모델과 일치해야 합니다.
 
 PowerShell에서 로컬 추론 서버를 실행합니다. Ollama가 이미 실행 중이라면 아래 별도 포트로 시작합니다.
 
@@ -38,25 +38,20 @@ ollama serve
 다른 PowerShell에서 앱을 실행합니다.
 
 ```powershell
-.\start-windows.cmd --model qwen3:4b --embedding-model bge-m3 --readpst "C:\msys64\mingw64\bin\readpst.exe"
+.\start-windows.cmd --model qwen3:4b --embedding-model qwen3-embedding:0.6b --readpst "C:\msys64\mingw64\bin\readpst.exe"
 ```
 
-설정 이전에 등록한 보관함은 **갱신**으로 의미 검색 색인을 생성합니다. 재색인 중 기존 버전으로 검색할 수 있습니다. 앱은 루프백 Ollama 포트(또는 아래 중앙 임베딩 서버)에만 연결하고 해당 서버 목록에 있는 모델만 사용합니다. Ollama의 클라우드 기능과 외부 통신은 폐쇄망 방화벽 정책으로도 차단해 주세요.
+설정 이전에 등록한 보관함은 **갱신**으로 의미 검색 색인을 생성합니다. 재색인 중 기존 버전으로 검색할 수 있습니다. 앱은 루프백 Ollama 포트에만 연결하고 해당 서버 목록에 있는 모델만 사용합니다. Ollama의 클라우드 기능과 외부 통신은 폐쇄망 방화벽 정책으로도 차단해 주세요.
 
-### 중앙 임베딩 서버(NAS) 함께 쓰기
+### 임베딩 모델을 NAS에서 불러오기
 
-여러 PC가 같은 임베딩 모델을 쓰게 하려면 NAS 등 한 곳에서 Ollama를 실행하고 각 PC는 그 주소만 가리킵니다. 각 PC에 모델을 내려받지 않아도 의미 검색이 동작합니다.
+각 PC에 모델을 내려받지 않고 NAS에 모델 파일을 한 벌만 둘 수 있습니다. Ollama의 모델 저장소 위치(`OLLAMA_MODELS`)를 NAS 경로로 지정하면 각 PC의 Ollama가 그 파일을 읽어 이 PC에서 직접 임베딩합니다. 메일 본문은 PC 밖으로 나가지 않습니다.
 
-NAS에서 Docker로 Ollama를 실행하고 모델을 받습니다.
+1. NAS에 모델 저장소 폴더를 만듭니다(예: `\\nas\ollama\models`).
+2. **setup-windows.cmd**에서 같은 경로를 입력하면 `OLLAMA_MODELS`가 사용자 환경 변수로 지정되고 Ollama가 다시 시작됩니다. 수동으로 지정할 때는 `setx OLLAMA_MODELS "\\nas\ollama\models"` 후 Ollama를 다시 시작합니다.
+3. 아무 PC 한 대에서 `ollama pull qwen3-embedding:0.6b`를 한 번만 실행하면 모든 PC가 같은 모델을 사용합니다. 추천 모델은 `qwen3-embedding:0.6b`(639MB, bge-m3보다 성능이 좋고 크기는 절반)이며 메모리 여유가 충분하면 `qwen3-embedding:4b`(2.5GB)를 씁니다.
 
-```text
-docker run -d --name ollama -p 11434:11434 -v ollama:/root/.ollama ollama/ollama
-docker exec -it ollama ollama pull qwen3-embedding:4b
-```
-
-추천 모델은 `qwen3-embedding:4b`(2.5GB, 컨텍스트 40K)입니다. 한국어 포함 다국어 검색 품질이 bge-m3보다 좋고 컨텍스트도 깁니다. NAS 메모리 여유가 4GB 미만이면 `qwen3-embedding:0.6b`(639MB)를 씁니다.
-
-`start.cmd`의 `EMBEDDING_URL`을 NAS 주소로, `EMBEDDING_MODEL`을 받아 둔 모델명으로 맞춰 두면 모든 사용자가 별도 설정 없이 의미 검색을 씁니다. 색인할 메일 본문과 질문 문장이 임베딩을 위해 NAS로 전송됩니다. 생성 모델(로컬 답변) 설정과는 독립적이라 외부 API 답변만 쓰는 환경에서는 각 PC에 Ollama가 필요 없습니다.
+모델 로드는 네트워크 공유에서 읽으므로 첫 질문이 수 초에서 수십 초 느려질 수 있고, 로드된 모델은 대기 후 자동으로 내려갑니다. 여러 PC가 동시에 pull하지 않도록 한 대에서만 받습니다.
 
 ### 외부 AI API 연결
 
