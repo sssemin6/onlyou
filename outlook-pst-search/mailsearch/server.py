@@ -21,7 +21,7 @@ from .bundled import prepare as prepare_bundled
 from .external import DEFAULT_MODEL, DEFAULT_URL, MAX_EXCERPTS, ExternalAI, ExternalRequestError, Reviews
 from .filesystem import local_path
 from .indexer import ImportIssue, Indexer
-from .store import Store, quoted_plan
+from .store import Store, normalized, query_words, quoted_plan
 
 STATIC = Path(__file__).with_name("static")
 FILES = {"/": ("index.html", "text/html; charset=utf-8"), "/style.css": ("style.css", "text/css; charset=utf-8"),
@@ -238,9 +238,15 @@ class Handler(BaseHTTPRequestHandler):
                         rows = merge_rows(rows, nearby, limit=60)
                     except (OSError, ValueError, RuntimeError, KeyError, IndexError, TypeError, http.client.HTTPException):
                         pass
+            tokens = query_words(query, fuzzy=True)[:8]
             distinct = {}
             for row in rows:
-                distinct.setdefault(row["fingerprint"], public_row(row))
+                shown = distinct.setdefault(row["fingerprint"], public_row(row))
+                if "similarity" in row and shown.get("similarity") is None:
+                    shown["similarity"] = round(row["similarity"], 3)
+                if shown.get("matched") is None:
+                    haystack = normalized(f"{row['subject']} {row['text']}")
+                    shown["matched"] = [token for token in tokens if normalized(token) in haystack]
             self.send_json(200, {"results": list(distinct.values())[:20]})
             return
         if not query:
