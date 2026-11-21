@@ -41,11 +41,11 @@ PST --readpst--> EML 스풀 --> `parse_mail` --> `mails`/`passages`/`terms`(FTS5
 
 ## 검색 동작
 
-- **메일/문서/PCF 탭**: `mails.kind`('mail'/'document'/'pcf') 컬럼이 검색 대상을 구분한다. 문서는 항목 확장자로, 파일명에 `pcf`가 들어간 문서는 'pcf'로 분류한다(매 시작 시 재분류). UI가 `filters.tab`을 보내고 `store.scope()`가 `m.kind=?` 조건을 붙인다. 문의 검색·근거 검색 모두 탭을 따른다.
-- **PCF 답변**(선주 교신문, `/api/pcf/preview`·`send`): `pcf_retrieval`(1차 근거 + 부족 시 추가 검색 1회 + 인접 문맥 확장 = COMMENT 발행~종결 묶음) → 수치 차이·합계·최댓값은 `numeric_answer`가 외부 전송 없이 즉답 → 외부 API에 `PCF_INSTRUCTIONS`(유사 COMMENT 정리 + 권장 회신)와 확대 예산(5×2,400자)으로 전송한다. 검색 범위의 선급·FLAG·선주·호선·도면명 필터는 데이터화 전까지 파일명·지문 텍스트 매칭으로 동작한다(`store.scope`의 class/flag/owner/hull/drawing).
+- **전체/메일/문서/PCF 탭**: 전체 탭은 자료 유형을 결합한다. 나머지는 mails.kind로 제한한다. 보관함은 filters.source로 제한한다.
+- **PCF 답변**: 전용 API는 PCF 문서로 범위를 고정한다. 파일명과 문서의 명시적 필드를 기준으로 필터링한다. COMMENT 번호가 같은 인접 구간으로 문맥을 확장하고, 발췌한 근거의 승인 범위·수치 단위·종결을 확인한다.
 - **Enter(일반 검색)**: 키워드(FTS terms + 한글 bigram grams)와 의미(임베딩 유사도)를 병합(`merge_rows`). 결과에는 일치 단어(`matched`)·유사도(`similarity`)·매치 문장(`snippet`)이 붙고 UI가 단어를 강조한다.
 - **따옴표 정확 검색**: `"단어"` — 해당 단어를 포함한 메일만. `"A" & "B"`는 모두, `"A" or "B"`는 하나라도. 파싱은 `store.quoted_plan`, 실행은 `store.exact_search`.
-- **Ctrl+Enter(AI 질문)**: 두 단계 — 첫 실행은 하이브리드 검색만, 같은 질문 재실행 시 `evidence_for` 근거 검색 후 **외부 API**가 자동 전송·작성한다(답변 제공자 UI는 제거됨). `validate`가 인용 문구의 원문 일치를 검증(실패 시 partial/insufficient로 강등). 단계 구분은 `app.js`의 `stagedQuery`.
+- **Ctrl+Enter(AI 근거 찾기)**: 답변 API에 보낼 질문과 발췌문을 먼저 표시한다. 사용자가 선택한 뒤 **선택한 근거로 답변**을 눌러 전송한다. 검토 토큰은 생성 경로 및 API 설정과 결합되며, 전송 직전 원본 접근을 다시 확인한다.
 
 ## 불변식 — 변경 시 반드시 유지
 
