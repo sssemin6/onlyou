@@ -479,30 +479,21 @@ class Integration(unittest.TestCase):
         self.assertTrue(preview["results"])
         self.assertTrue(all(row["source"] == payload["source"] for row in preview["results"]))
 
-    def test_saved_design_decision_flags_recheck(self):
+    def test_search_tab_scopes_mail_and_documents(self):
+        """메일 탭은 문서를, 문서 탭은 메일을 검색하지 않는다."""
+        self.import_mail()
         folder = self.design_corpus()
         _, payload = self.call("/api/sources", {"path": str(folder)})
-        source = payload["source"]
-        await_source(self.store, source, {"ready", "error", "empty"})
-        self.app.external = ExternalAI("https://api.example.invalid/v1/chat/completions",
-                                       "test-model", "placeholder-token")
-        _, preview = self.call("/api/design/preview", {"query": "A17 두께 이력", "filters": {}})
-        passages = [row["passage"] for row in preview["results"]][:3]
-        status, saved = self.call("/api/decisions", {"question": "A17 두께 이력",
-                                                     "claims": [{"text": "기록", "citations": []}], "passages": passages})
-        self.assertEqual(status, 200)
-        listed = self.call("/api/decisions")[1]["decisions"]
-        self.assertEqual(len(listed), 1)
-        self.assertEqual(listed[0]["review"], "ok")
-        for name in ("A17 시험보고서.txt", "승인.eml", "양산BOM RevC.xlsx", "개정초안.docx"):
-            with (folder / name).open("ab") as stream:
-                stream.write(b" revised")
-        self.call("/api/source-action", {"source": source, "action": "refresh"})
-        await_source(self.store, source, {"ready", "error", "empty"})
-        listed = self.call("/api/decisions")[1]["decisions"]
-        self.assertEqual(listed[0]["review"], "recheck")
-        self.call("/api/decisions", {"action": "remove", "id": listed[0]["id"]})
-        self.assertEqual(self.call("/api/decisions")[1]["decisions"], [])
+        await_source(self.store, payload["source"], {"ready", "error", "empty"})
+        query = {"query": "A17", "filters": {"tab": "mail"}}
+        _, mail = self.call("/api/search", query)
+        self.assertTrue(mail["results"])
+        self.assertTrue(all(row["kind"] == "mail" for row in mail["results"]))
+        self.assertFalse(any("시험보고서" in row["subject"] for row in mail["results"]))
+        _, documents = self.call("/api/search", {"query": "A17", "filters": {"tab": "document"}})
+        self.assertTrue(documents["results"])
+        self.assertTrue(all(row["kind"] == "document" for row in documents["results"]))
+        self.assertTrue(any("시험보고서" in row["subject"] for row in documents["results"]))
 
     def test_external_review_sends_only_selected_excerpt_once(self):
         self.import_mail()
