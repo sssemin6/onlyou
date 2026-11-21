@@ -353,15 +353,16 @@ form.addEventListener("submit", async (event) => {
       return;
     }
     if (external) {
-      const review = await call("/api/external/preview", payload, active.signal);
+      const design = element("design-mode").checked;
+      const review = await call(design ? "/api/design/preview" : "/api/external/preview", payload, active.signal);
       if (active.signal.aborted) return;
       if (!review.review) {
         showResults(review.results, "근거 후보");
         notice("외부 API로 보낼 수 있는 메일 발췌문을 찾지 못했습니다.");
         return;
       }
-      notice("외부 API 응답을 기다리고 있습니다.");
-      const answer = await call("/api/external/send",
+      notice(design ? "설계 이력 근거를 모아 검토합니다." : "외부 API 응답을 기다리고 있습니다.");
+      const answer = await call(design ? "/api/design/send" : "/api/external/send",
         { review: review.review, excerpts: review.excerpts.map((item) => item.id) }, active.signal);
       if (active.signal.aborted) return;
       showAnswer(answer);
