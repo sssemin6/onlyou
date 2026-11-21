@@ -154,6 +154,8 @@ svg { width: 21px; height: 21px; flex: none; stroke: currentColor; stroke-width:
   text-decoration: underline;
   text-underline-offset: 3px;
 }
+.design-toggle { display: inline-flex; align-items: center; gap: 7px; margin-top: 9px; font-size: .8rem; font-weight: 700; color: var(--muted); cursor: pointer; }
+.design-toggle input { width: 16px; height: 16px; accent-color: var(--accent); }
 .model-panels {
   margin-top: 16px;
   padding: 11px 0 0;
