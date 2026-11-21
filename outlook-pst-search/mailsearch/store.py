@@ -60,15 +60,6 @@ CREATE TABLE IF NOT EXISTS pst_files (
     label TEXT NOT NULL, signature TEXT NOT NULL,
     PRIMARY KEY(source, label)
 );
-CREATE TABLE IF NOT EXISTS decisions (
-    id INTEGER PRIMARY KEY AUTOINCREMENT, question TEXT NOT NULL,
-    answer TEXT NOT NULL, created TEXT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS decision_evidence (
-    decision INTEGER NOT NULL REFERENCES decisions(id) ON DELETE CASCADE,
-    passage INTEGER NOT NULL, fingerprint TEXT NOT NULL,
-    PRIMARY KEY(decision, passage)
-);
 CREATE TABLE IF NOT EXISTS vectors (
     passage INTEGER NOT NULL REFERENCES passages(id) ON DELETE CASCADE,
     model TEXT NOT NULL, value BLOB NOT NULL,
@@ -80,7 +71,7 @@ CREATE TABLE IF NOT EXISTS vector_buckets (
 ) WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS bucket_passage ON vector_buckets(passage);
 """
-MAIL_COLUMNS = "m.id,m.source,m.fingerprint,m.folder,m.subject,m.sender,m.recipient,m.sent,s.path,s.updated"
+MAIL_COLUMNS = "m.id,m.source,m.fingerprint,m.folder,m.subject,m.sender,m.recipient,m.sent,m.kind,s.path,s.updated"
 JOIN = "JOIN sources s ON s.id=m.source"
 VISIBLE_VERSION = """m.version=coalesce(s.active,s.pending)
     AND (s.active IS NOT NULL OR coalesce(s.issue,'')<>'changed')"""
@@ -249,6 +240,13 @@ class Store:
         with self.connection() as conn:
             conn.execute("PRAGMA journal_mode=WAL")
             conn.executescript(SCHEMA)
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(mails)")}
+            if "kind" not in columns:
+                # Tab scoping (mail vs document); older rows are classified by item suffix.
+                conn.execute("ALTER TABLE mails ADD COLUMN kind TEXT NOT NULL DEFAULT 'mail'")
+                suffixes = ("pdf", "docx", "xlsx", "txt", "doc", "xls")
+                conn.execute("UPDATE mails SET kind='document' WHERE " +
+                             " OR ".join("item LIKE '%.' || ?" for _ in suffixes), suffixes)
             conn.execute("INSERT INTO terms(terms,rank) VALUES('secure-delete',1)")
 
     @contextlib.contextmanager
@@ -289,44 +287,6 @@ class Store:
             ids.append(row["id"])
         return ids
 
-    def save_decision(self, question, answer, evidence):
-        with self.connection() as conn:
-            identifier = conn.execute(
-                "INSERT INTO decisions(question,answer,created) VALUES(?,?,?)",
-                (question, json.dumps(answer, ensure_ascii=False), now()),
-            ).lastrowid
-            conn.executemany("INSERT INTO decision_evidence VALUES(?,?,?)",
-                             ((identifier, row["passage"], row["fingerprint"]) for row in evidence))
-            return identifier
-
-    def decisions(self):
-        with self.connection() as conn:
-            grouped = {}
-            for row in conn.execute(
-                "SELECT d.id id,d.question question,d.answer answer,d.created created,e.fingerprint fingerprint "
-                "FROM decisions d LEFT JOIN decision_evidence e ON e.decision=d.id ORDER BY d.id DESC"
-            ):
-                item = grouped.setdefault(row["id"], {
-                    "id": row["id"], "question": row["question"], "answer": json.loads(row["answer"]),
-                    "created": row["created"], "checks": set(),
-                })
-                if row["fingerprint"] is not None:
-                    item["checks"].add(row["fingerprint"])
-            for item in grouped.values():
-                checks = item.pop("checks")
-                if not checks:
-                    item["review"] = "ok"
-                    continue
-                placeholders = json.dumps(list(checks))
-                alive = {evidence[0] for evidence in conn.execute(
-                    f"""SELECT DISTINCT m.fingerprint FROM mails m JOIN passages p ON p.mail=m.id
-                        JOIN sources s ON s.id=m.source WHERE m.fingerprint IN (SELECT value FROM json_each(?))
-                        AND {VISIBLE_VERSION}""", (placeholders,)
-                )}
-                # A saved decision needs re-review when its evidence version is gone.
-                item["review"] = "ok" if checks <= alive else "recheck"
-            return list(grouped.values())
-
     def scope(self, filters, extra=()):
         ids = self.allowed_sources(filters.get("source"))
         clauses = [VISIBLE_VERSION, "m.source IN (SELECT value FROM json_each(?))"]
@@ -338,6 +298,9 @@ class Store:
         if filters.get("attachment") in ("yes", "no"):
             negate = "" if filters["attachment"] == "yes" else "NOT "
             clauses.append(f"{negate}EXISTS(SELECT 1 FROM attachments a WHERE a.mail=m.id)")
+        if filters.get("tab") in ("mail", "document"):
+            clauses.append("m.kind=?")
+            params.append(filters["tab"])
         if filters.get("after"):
             clauses.append("m.sent>=?")
             params.append(filters["after"])
@@ -383,8 +346,8 @@ class Store:
         """Index a standalone document: one archive row with located passages."""
         mail = document_identity(doc)
         cursor = conn.execute(
-            """INSERT INTO mails(source,version,item,fingerprint,folder,subject,sender,recipient,sent,message_id,topic,body)
-               VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+            """INSERT INTO mails(source,version,item,fingerprint,folder,subject,sender,recipient,sent,message_id,topic,body,kind)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,'document')""",
             (source, version, item, fingerprint(mail, item), doc["folder"], doc["name"], "", "",
              doc["sent"], "", topic_key(doc["name"]), ""),
         )
@@ -400,8 +363,8 @@ class Store:
     def adopt_mail(self, conn, version, old_id):
         """Copy an imported mail with its index and embeddings into a new version."""
         new_id = conn.execute(
-            """INSERT INTO mails(source,version,item,fingerprint,folder,subject,sender,recipient,sent,message_id,topic,body)
-               SELECT source,?,item,fingerprint,folder,subject,sender,recipient,sent,message_id,topic,body
+            """INSERT INTO mails(source,version,item,fingerprint,folder,subject,sender,recipient,sent,message_id,topic,body,kind)
+               SELECT source,?,item,fingerprint,folder,subject,sender,recipient,sent,message_id,topic,body,kind
                FROM mails WHERE id=?""", (version, old_id)
         ).lastrowid
         conn.execute("INSERT INTO replies(mail,parent) SELECT ?,parent FROM replies WHERE mail=?", (new_id, old_id))
