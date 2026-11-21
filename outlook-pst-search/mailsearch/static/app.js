@@ -40,7 +40,7 @@ const issueNames = {
   external_review_expired: "전송 검토가 만료되었습니다. 질문을 다시 실행해 주세요.",
   external_source_changed: "검토한 메일의 보관함이 변경되었습니다. 질문을 다시 실행해 주세요.",
   source_path: "이 PC에서 읽을 수 있는 경로를 입력하세요.",
-  source_format: "PST, EML 파일 또는 EML이 든 폴더만 등록할 수 있습니다.",
+  source_format: "PST, EML·문서 파일(PDF·DOCX·XLSX·TXT) 또는 그런 파일이 든 폴더를 등록할 수 있습니다.",
   source_busy: "현재 작업이 끝난 뒤 다시 시도하세요.",
   source_missing: "보관함을 찾지 못했습니다.",
   evidence_missing: "이 근거의 보관함이 갱신되었거나 접근 권한이 사라졌습니다.",
