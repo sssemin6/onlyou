@@ -55,6 +55,11 @@ CREATE TABLE IF NOT EXISTS problems (
     source INTEGER NOT NULL REFERENCES sources(id), version INTEGER NOT NULL, item TEXT NOT NULL,
     code TEXT NOT NULL, PRIMARY KEY(source, version, item)
 );
+CREATE TABLE IF NOT EXISTS pst_files (
+    source INTEGER NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+    label TEXT NOT NULL, signature TEXT NOT NULL,
+    PRIMARY KEY(source, label)
+);
 CREATE TABLE IF NOT EXISTS vectors (
     passage INTEGER NOT NULL REFERENCES passages(id) ON DELETE CASCADE,
     model TEXT NOT NULL, value BLOB NOT NULL,
@@ -138,6 +143,17 @@ def fts_query(words, mode):
 def topic_key(subject):
     subject = re.sub(r"^(?:(?:re|fw|fwd|답장|전달)\s*:\s*)+", "", normalized(subject)).strip()
     return re.sub(r"\s+", " ", subject)
+
+
+def fingerprint(mail, item):
+    attachment_names = [name for name, _ in mail["attachments"]]
+    identity = [mail[key] for key in ("message_id", "subject", "sender", "recipient", "sent", "body")]
+    # An attachment-bearing copy may contain a different revision under the same name.
+    return hashlib.sha256(json.dumps([identity, attachment_names, item if attachment_names else ""], ensure_ascii=False).encode()).hexdigest()
+
+
+def like_prefix(prefix):
+    return prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
 
 
 def sections(text, size=1100):
@@ -257,14 +273,10 @@ class Store:
         return " AND ".join(clauses), params
 
     def add_mail(self, conn, source, version, item, mail):
-        attachment_names = [name for name, _ in mail["attachments"]]
-        identity = [mail[key] for key in ("message_id", "subject", "sender", "recipient", "sent", "body")]
-        # An attachment-bearing copy may contain a different revision under the same name.
-        fingerprint = hashlib.sha256(json.dumps([identity, attachment_names, item if attachment_names else ""], ensure_ascii=False).encode()).hexdigest()
         cursor = conn.execute(
             """INSERT INTO mails(source,version,item,fingerprint,folder,subject,sender,recipient,sent,message_id,topic,body)
                VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (source, version, item, fingerprint, *(mail[k] for k in ("folder", "subject", "sender", "recipient", "sent", "message_id")),
+            (source, version, item, fingerprint(mail, item), *(mail[k] for k in ("folder", "subject", "sender", "recipient", "sent", "message_id")),
              topic_key(mail["subject"]), mail["body"]),
         )
         mail_id = cursor.lastrowid
@@ -289,6 +301,65 @@ class Store:
             (passage_id, index_text(mail["subject"]), index_text(mail["sender"] + " " + mail["recipient"]),
              index_text(name), index_text(text)),
         )
+
+    def adopt_mail(self, conn, version, old_id):
+        """Copy an imported mail with its index and embeddings into a new version."""
+        new_id = conn.execute(
+            """INSERT INTO mails(source,version,item,fingerprint,folder,subject,sender,recipient,sent,message_id,topic,body)
+               SELECT source,?,item,fingerprint,folder,subject,sender,recipient,sent,message_id,topic,body
+               FROM mails WHERE id=?""", (version, old_id)
+        ).lastrowid
+        conn.execute("INSERT INTO replies(mail,parent) SELECT ?,parent FROM replies WHERE mail=?", (new_id, old_id))
+        attachments = {}
+        for row in conn.execute("SELECT id,name,status FROM attachments WHERE mail=? ORDER BY id", (old_id,)):
+            attachments[row["id"]] = conn.execute(
+                "INSERT INTO attachments(mail,name,status) VALUES(?,?,?)", (new_id, row["name"], row["status"])
+            ).lastrowid
+        for row in conn.execute("SELECT id,attachment,location,start,text FROM passages WHERE mail=? ORDER BY id", (old_id,)):
+            passage = conn.execute(
+                "INSERT INTO passages(mail,attachment,location,start,text) VALUES(?,?,?,?,?)",
+                (new_id, attachments.get(row["attachment"]), row["location"], row["start"], row["text"]),
+            ).lastrowid
+            conn.execute(
+                "INSERT INTO terms(rowid,subject,people,label,text) SELECT ?,subject,people,label,text FROM terms WHERE rowid=?",
+                (passage, row["id"]),
+            )
+            conn.execute("INSERT INTO vectors(passage,model,value) SELECT ?,model,value FROM vectors WHERE passage=?", (passage, row["id"]))
+            conn.executemany(
+                "INSERT INTO vector_buckets(model,bucket,passage) SELECT model,bucket,? FROM vector_buckets WHERE passage=?",
+                ((passage, row["id"]),),
+            )
+        return new_id
+
+    def try_adopt(self, conn, source, previous, version, item, mail):
+        """Reuse the previous version's work when the mail content is unchanged."""
+        old = conn.execute(
+            "SELECT id FROM mails WHERE source=? AND version=? AND item=? AND fingerprint=?",
+            (source, previous, item, fingerprint(mail, item)),
+        ).fetchone()
+        if old is None:
+            return False
+        self.adopt_mail(conn, version, old["id"])
+        return True
+
+    def carry_prefix(self, conn, source, previous, version, prefix):
+        """Adopt every previous-version mail under an unchanged PST's item prefix."""
+        rows = conn.execute(
+            "SELECT id FROM mails WHERE source=? AND version=? AND item LIKE ? ESCAPE '\\'",
+            (source, previous, like_prefix(prefix)),
+        ).fetchall()
+        for row in rows:
+            self.adopt_mail(conn, version, row["id"])
+        return len(rows)
+
+    def pst_files(self, source):
+        with self.connection() as conn:
+            return {row["label"]: row["signature"] for row in
+                    conn.execute("SELECT label,signature FROM pst_files WHERE source=?", (source,))}
+
+    def save_pst_files(self, conn, source, signatures):
+        conn.execute("DELETE FROM pst_files WHERE source=?", (source,))
+        conn.executemany("INSERT INTO pst_files VALUES(?,?,?)", ((source, *item) for item in signatures.items()))
 
     def lexical(self, question, filters, fuzzy=False, limit=100):
         where, params = self.scope(filters)
