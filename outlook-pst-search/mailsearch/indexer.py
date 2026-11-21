@@ -339,6 +339,14 @@ class Indexer:
                            previous=previous, carried=carried, temp=temp)
         self.check(event)
         progress = self.store.source(source)
+        if not progress["done"] and progress["omitted"] and not is_pst:
+            with self.store.connection() as conn:
+                missing_document = conn.execute(
+                    "SELECT 1 FROM problems WHERE source=? AND version=? AND code<>'parse' LIMIT 1",
+                    (source, version),
+                ).fetchone()
+            if missing_document:
+                raise ImportIssue("document_extract_failed")
         empty_eml = progress["done"] == 0 and not progress["failed"] and not is_pst
         if not progress["done"] and not empty_eml:
             raise ImportIssue("mail_parse_failed" if progress["failed"] else "pst_no_mail")
@@ -419,18 +427,25 @@ class Indexer:
                     continue
                 if path.suffix.lower() in DOCUMENT_SUFFIXES:
                     try:
-                        status, locations = extract_document(path, workspace, self.pdf)
+                        status, locations = extract_document(path, workspace, self.pdf, check=lambda: self.check(event))
                     except OSError:
                         status, locations = "추출 실패 또는 암호화", []
                     if not locations:
-                        conn.execute("INSERT INTO problems VALUES(?,?,?,'extract')", (source, version, item))
+                        conn.execute("INSERT INTO problems VALUES(?,?,?,?)", (source, version, item, status))
                         conn.execute("UPDATE sources SET omitted=omitted+1 WHERE id=?", (source,))
                     else:
                         doc = {"name": path.name, "folder": folder, "sent": document_date(path),
                                "status": status, "sections": locations}
-                        if previous is None or not self.store.try_adopt(conn, source, previous, version, item, document_identity(doc)):
+                        adopted = previous is not None and self.store.try_adopt(
+                            conn, source, previous, version, item, document_identity(doc))
+                        if adopted:
+                            conn.execute("""UPDATE attachments SET status=? WHERE mail IN (
+                                SELECT id FROM mails WHERE source=? AND version=? AND item=?)""",
+                                         (status, source, version, item))
+                        else:
                             self.store.add_document(conn, source, version, item, doc)
-                        conn.execute("UPDATE sources SET done=done+1 WHERE id=?", (source,))
+                        conn.execute("UPDATE sources SET done=done+1,partial=partial+? WHERE id=?",
+                                     (int(status.startswith("일부 색인")), source))
                     batch += 1
                     if batch % 32 == 0:
                         conn.commit()
@@ -473,14 +488,14 @@ class Indexer:
                         if attachment["status"] != "대기":
                             continue
                         self.check(event)
-                        status, locations = extract_attachment(name, part, temp, self.pdf)
+                        status, locations = extract_attachment(name, part, temp, self.pdf, check=lambda: self.check(event))
                         for location, text in locations:
                             for start, segment in sections(text):
                                 self.store.add_passage(conn, row["id"], mail, attachment["id"], name, location, start, segment)
                         conn.execute("UPDATE attachments SET status=? WHERE id=?", (status, attachment["id"]))
                         conn.execute(
                             "UPDATE sources SET omitted=omitted+?,partial=partial+? WHERE id=?",
-                            (int(status not in {"완료", "일부 색인"}), int(status == "일부 색인"), source),
+                            (int(not locations), int(bool(locations) and status.startswith("일부 색인")), source),
                         )
                         conn.commit()
                 batch = pending.fetchmany(128)
