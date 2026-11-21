@@ -21,7 +21,7 @@ const issueNames = {
   pst_export: "PST 추출에 실패했습니다. Outlook에서 해당 파일이 열리는지, 로컬 디스크에 여유 공간이 있는지 확인하세요.",
   pst_invalid: "Outlook PST 헤더를 읽을 수 없습니다. Outlook에서 만든 .pst 파일인지 확인하세요.",
   pst_no_mail: "추출된 메일이 없습니다. Outlook에서 이 PST를 열어 받은 편지함이나 하위 폴더에 메일이 있는지 확인하세요.",
-  eml_no_mail: "폴더에서 .eml 메일을 찾지 못했습니다. PST를 가져오려면 파일 전체 경로를 등록하세요.",
+  eml_no_mail: "폴더에서 메일을 찾지 못했습니다. 폴더에 .eml 또는 .pst 파일이 있는지 확인하세요.",
   mail_parse_failed: "가져온 메일을 읽을 수 없습니다. 아래 실패 건수를 확인하고 다시 색인해 보세요.",
   readpst_dependencies: "readpst가 시작되지 않았습니다. MSYS2에서 함께 설치된 DLL이 있는지 확인하세요.",
   disk_or_source: "파일 접근 권한과 저장 공간을 확인하세요.",
