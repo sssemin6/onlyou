@@ -501,35 +501,6 @@ mark { color: var(--ink); background: #f2cf84; }
   border-radius: 6px;
   background: var(--paper);
 }
-.provider-badge {
-  display: inline-block;
-  margin-inline-start: 9px;
-  padding: 2px 7px;
-  border: 1px solid var(--ink);
-  border-radius: 4px;
-  background: var(--gold);
-  box-shadow: 1px 1px var(--ink);
-  font: 750 .71rem/1.4 var(--sans);
-  vertical-align: middle;
-}
-.review-hint { color: var(--accent-dark); font-size: .86rem; }
-.review-fieldset { min-inline-size: 0; margin: 17px 0 0; padding: 0; border: 0; }
-.review-fieldset legend { padding: 0; font-size: .94rem; font-weight: 780; }
-.review-excerpt { margin-top: 9px; }
-.excerpt-toggle { display: inline-flex; align-items: center; gap: 6px; min-height: 32px; font-size: .83rem; cursor: pointer; }
-.excerpt-toggle input { width: 17px; height: 17px; accent-color: var(--accent); }
-.review-actions {
-  position: sticky;
-  bottom: 0;
-  display: flex;
-  flex-wrap: wrap;
-  justify-content: end;
-  gap: 8px 11px;
-  padding: 10px 16px 13px;
-  border-top: 1px solid var(--line);
-  background: var(--paper);
-}
-
 .masthead-actions { display: flex; align-items: center; gap: 11px; }
 .settings-trigger { min-height: 34px; padding: 3px 10px; background: var(--peach); font-size: .82rem; }
 .settings-trigger svg { width: 16px; height: 16px; }
