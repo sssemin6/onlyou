@@ -15,8 +15,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from mailsearch.answer import LocalAI, delivery_date_answer, validate
-from mailsearch.external import ExternalAI, Excerpt, Reviews
-from mailsearch.extract import extract_attachment
+from mailsearch.external import ExternalAI, Excerpt, Reviews, pcf_batches
+from mailsearch.extract import convert_legacy, extract_attachment
 from mailsearch.indexer import Indexer
 from mailsearch.server import App
 from mailsearch.store import Store
@@ -466,6 +466,120 @@ class Integration(unittest.TestCase):
             self.assertEqual(self.call("/api/external/send", {"review": review, "excerpts": [1]})[0], 409)
             generate.assert_not_called()
 
+    def word_pcf(self, *, repeat=False, unresolved=False):
+        from xml.sax.saxutils import escape
+
+        def cell(text="", prop=""):
+            return f"<w:tc><w:tcPr>{prop}</w:tcPr><w:p><w:r><w:t>{escape(text)}</w:t></w:r></w:p></w:tc>"
+
+        def row(*cells):
+            return "<w:tr>" + "".join(cells) + "</w:tr>"
+
+        head = row(cell("No."), cell("Owner", '<w:gridSpan w:val="2"/>'), cell("Yard", '<w:gridSpan w:val="2"/>'))
+        first = row(cell("1", '<w:vMerge w:val="restart"/>'),
+                    cell("a"), cell("검토 요청"), cell("a"), cell("Draft response"))
+        second = row(cell(prop="<w:vMerge/>"), cell("b"), cell("접근공간 확인"), cell("b"), cell())
+        tail = "추가 설명 " * 150 + "Not closed. Please revise the method."
+        third = row(cell(prop="<w:vMerge/>"), cell("c"), cell(tail), cell("c"), cell("Revision pending"))
+        other = row(cell("1" if repeat else "2"), cell("a"), cell("다른 건"), cell("a"), cell("Spurious response"))
+        orphan = row(cell(), cell("d"), cell("연결 안 된 기타 사항"), cell("d"), cell("Orphan"))
+        text = '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>'
+        text += '<w:p><w:r><w:t>Rev.: B</w:t></w:r></w:p>'
+        text += "<w:tbl>" + head + first + second + third + (orphan if unresolved else "") + "</w:tbl>"
+        text += "<w:tbl>" + head + other + "</w:tbl></w:body></w:document>"
+        path = Path(self.workspace.name) / "PCF-H2107.docx"
+        path.write_bytes(self.document_zip({"word/document.xml": text}))
+        source = self.call("/api/sources", {"path": str(path)})[1]["source"]
+        self.assertEqual(await_source(self.store, source, {"ready", "error"})["state"], "ready")
+        return path, {"source": source, "tab": "pcf", "hull": "H2107"}
+
+    def test_word_pcf_resolves_case_and_sends_reviewed_cells(self):
+        path, filters = self.word_pcf()
+        _, result = self.call("/api/search", {"query": "접근공간 확인", "filters": filters})
+        seed = next(row for row in result["results"] if "No. 1" in row["location"])
+        _, evidence = self.call("/api/evidence/" + str(seed["passage"]))
+        self.assertEqual(evidence["pcf"]["revision"], "B")
+        self.assertEqual([r["label"] for r in evidence["pcf"]["cells"]], list("aabbcc"))
+        self.assertEqual(evidence["pcf"]["cells"][3]["text"], "")
+        self.assertTrue(evidence["pcf"]["cells"][4]["text"].endswith("Please revise the method."))
+        self.assertNotIn("Spurious", json.dumps(evidence["pcf"]))
+        self.app.external = ExternalAI("https://intranet.example.invalid/v1/chat/completions", "model", "key")
+        payload = {"query": "1-b의 처리 경과", "filters": filters, "passage": seed["passage"]}
+        self.assertNotIn("review", self.call("/api/pcf/preview", payload)[1])
+        with patch.dict(os.environ, {"MAILSEARCH_PCF_INTERNAL_URL": self.app.external.public["destination"],
+                                    "MAILSEARCH_PCF_INPUT_BYTES": "12000"}):
+            preview = self.call("/api/pcf/preview", payload)[1]
+            self.assertEqual((preview["pcf_coverage"]["expected"], len(preview["excerpts"])), (6, 6))
+            with patch.object(self.app.external, "complete") as complete:
+                quote = "Not closed. Please revise the method."
+                complete.return_value = {"status": "answered", "unknowns": [], "claims": [
+                    {"text": "선주는 방법 수정을 요청했습니다.", "citations": [{"source": 5, "quote": quote}]},
+                    {"text": "선주가 종결했습니다.", "citations": [{"source": 5, "quote": quote}]},
+                    {"text": "조선소가 방법 수정을 요청했습니다.", "citations": [{"source": 5, "quote": quote}]},
+                ]}
+                status, reply = self.call("/api/pcf/send", {"review": preview["review"], "excerpts": [1, 2, 3, 4, 5]})
+                self.assertEqual(status, 200)
+                self.assertEqual(reply["status"], "partial")
+                self.assertEqual(len(reply["claims"]), 1)
+                self.assertEqual(reply["claims"][0]["citations"][0]["location"], "PCF T1R2 · No. 1 · T1R4C3 · OWNER")
+                sent = json.loads(complete.call_args.args[1])
+                self.assertEqual([item["source"] for item in sent["evidence"]], [1, 2, 3, 4, 5])
+                self.assertEqual(sent["evidence"][3]["text"], "")
+                self.assertFalse(sent["coverage"]["complete"])
+                self.assertEqual(reply["pcf_coverage"]["included"], 5)
+                self.assertNotIn(path.name, complete.call_args.args[1])
+
+            preview = self.call("/api/pcf/preview", payload)[1]
+            path.write_bytes(path.read_bytes() + b"changed")
+            with patch.object(self.app.external, "complete") as complete:
+                self.assertEqual(self.call("/api/pcf/send", {"review": preview["review"], "excerpts": [1]})[0], 409)
+                complete.assert_not_called()
+
+    def test_word_pcf_combines_long_comment_with_original_citations(self):
+        _, filters = self.word_pcf()
+        self.app.external = ExternalAI("https://intranet.example.invalid/v1/chat/completions", "model", "key")
+        with patch.dict(os.environ, {"MAILSEARCH_PCF_INTERNAL_URL": self.app.external.public["destination"],
+                                    "MAILSEARCH_PCF_INPUT_BYTES": "4700"}):
+            _, preview = self.call("/api/pcf/preview", {"query": "1번 경과", "filters": filters})
+            self.assertGreater(preview["pcf_coverage"]["calls"], 2)
+            sent = []
+
+            def generate(instructions, content, **kwargs):
+                payload = json.loads(content)
+                sent.append(payload)
+                for item in payload["evidence"]:
+                    if "Please revise the method." in item["text"]:
+                        return {"status": "answered", "unknowns": [], "claims": [{
+                            "text": "선주가 방법 수정을 요청했습니다.",
+                            "citations": [{"source": item["source"], "quote": "Please revise the method."}],
+                        }]}
+                return {"status": "insufficient", "unknowns": [], "claims": []}
+
+            with patch.object(self.app.external, "complete", side_effect=generate):
+                status, result = self.call("/api/pcf/send", {"review": preview["review"],
+                                           "excerpts": [item["id"] for item in preview["excerpts"]]})
+            self.assertEqual(status, 200)
+            self.assertEqual(result["pcf_coverage"]["included"], 6)
+            self.assertTrue(result["pcf_coverage"]["synthesized"])
+            self.assertIn("verified_findings", sent[-1])
+            self.assertEqual(result["claims"][0]["citations"][0]["passage"], preview["excerpts"][4]["source"]["passage"])
+            self.assertTrue(all(item["text"] in preview["excerpts"][4]["text"] for item in sent[-1]["evidence"]))
+
+    def test_word_pcf_repeated_numbers_and_orphan_rows(self):
+        _, filters = self.word_pcf(repeat=True, unresolved=True)
+        self.app.external = ExternalAI("https://intranet.example.invalid/v1/chat/completions", "model", "key")
+        question = {"query": "1번 처리 이력", "filters": filters}
+        with patch.dict(os.environ, {"MAILSEARCH_PCF_INTERNAL_URL": self.app.external.public["destination"],
+                                    "MAILSEARCH_PCF_INPUT_BYTES": "12000"}):
+            _, found = self.call("/api/pcf/preview", question)
+            self.assertTrue(found["choose_case"])
+            self.assertEqual(len(found["results"]), 2)
+            seed = next(row for row in found["results"] if row["location"].startswith("PCF T1"))
+            _, preview = self.call("/api/pcf/preview", {**question, "passage": seed["passage"]})
+        self.assertEqual(len(preview["excerpts"]), 6)
+        self.assertNotIn("Orphan", json.dumps(preview))
+        self.assertIn("연결 확인 필요", preview["pcf_coverage"]["warnings"][0])
+
     def test_sources_report_kind_counts(self):
         """사이드바 섹션 구분을 위한 소스별 종류 카운트."""
         self.import_mail()
@@ -860,6 +974,40 @@ class AttachmentsAndCitations(unittest.TestCase):
         self.assertEqual(validate(result, [row], "납품일은 언제인가?")["status"], "insufficient")
         result["claims"][0]["citations"][0]["quote"] = "메일에 없는 문구"
         self.assertEqual(validate(result, [row])["status"], "insufficient")
+
+
+class WordPCFProcessing(unittest.TestCase):
+    def test_legacy_uses_extension_without_leading_dot(self):
+        for old, new in ((".doc", "docx"), (".xls", "xlsx")):
+            with tempfile.TemporaryDirectory() as tmp:
+                source = Path(tmp) / ("source" + old)
+                source.write_bytes(b"legacy bytes")
+
+                def convert(args, **_):
+                    self.assertEqual(args[args.index("--convert-to") + 1], new)
+                    self.assertEqual(Path(args[-1]).read_bytes(), b"legacy bytes")
+                    Path(args[-1]).with_suffix("." + new).write_bytes(b"converted bytes")
+
+                with patch("mailsearch.extract.office_binary", return_value="soffice"), patch(
+                        "mailsearch.extract.subprocess.run", side_effect=convert):
+                    self.assertEqual(convert_legacy(source, old, tmp), (b"converted bytes", None))
+                self.assertEqual(source.read_bytes(), b"legacy bytes")
+
+    def test_word_pcf_split_preserves_unicode_offsets_and_empty_cell(self):
+        text = "한글 \"※ " * 1400 + "마지막 회신"
+        excerpts = [Excerpt(1, 10, text), Excerpt(2, 20, "")]
+        case = {"expected": 2, "warnings": [], "cells": {
+            10: {"row": 2, "side": "OWNER", "label": "a", "no": "1"},
+            20: {"row": 2, "side": "YARD", "label": "a", "no": "1"},
+        }}
+        batches = pcf_batches("1번 경과", excerpts, case, 5500)
+        self.assertGreater(len(batches), 1)
+        self.assertTrue(all(not batch["coverage"]["complete"] for batch in batches))
+        cells = [item for batch in batches for item in batch["evidence"]]
+        self.assertEqual("".join(cell["text"] for cell in cells if cell["source"] == 1), text)
+        self.assertEqual(cells[-1]["text"], "")
+        for cell in cells[:-1]:
+            self.assertEqual(text[cell["offset"]:cell["offset"] + len(cell["text"])], cell["text"])
 
 
 if __name__ == "__main__":
