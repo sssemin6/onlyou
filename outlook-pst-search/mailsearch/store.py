@@ -15,7 +15,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from functools import lru_cache
 
-from .pcf import COMMENT_HEADER, PCF_FIELDS, pcf_field_value
+from .pcf import COMMENT_HEADER, PCF_CELL, PCF_FIELDS, case_key, cell_location, pcf_field_value
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS sources (
@@ -49,6 +49,9 @@ CREATE TABLE IF NOT EXISTS passages (
     attachment INTEGER REFERENCES attachments(id) ON DELETE CASCADE, location TEXT NOT NULL,
     start INTEGER NOT NULL, text TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS pcf_documents (
+    mail INTEGER PRIMARY KEY REFERENCES mails(id) ON DELETE CASCADE, data TEXT NOT NULL
+);
 CREATE INDEX IF NOT EXISTS passages_mail ON passages(mail);
 CREATE VIRTUAL TABLE IF NOT EXISTS terms USING fts5(subject, people, label, text, tokenize='unicode61');
 CREATE TRIGGER IF NOT EXISTS passage_remove AFTER DELETE ON passages BEGIN
@@ -74,7 +77,7 @@ CREATE TABLE IF NOT EXISTS vector_buckets (
 ) WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS bucket_passage ON vector_buckets(passage);
 """
-MAIL_COLUMNS = "m.id,m.source,m.fingerprint,m.folder,m.subject,m.sender,m.recipient,m.sent,m.kind,s.path,s.updated"
+MAIL_COLUMNS = "m.id,m.source,m.fingerprint,m.folder,m.subject,m.sender,m.recipient,m.sent,m.kind,m.item,s.path,s.updated"
 JOIN = "JOIN sources s ON s.id=m.source"
 VISIBLE_VERSION = """m.version=coalesce(s.active,s.pending)
     AND (s.active IS NOT NULL OR coalesce(s.issue,'')<>'changed')"""
@@ -182,6 +185,8 @@ def like_prefix(prefix):
 def document_identity(doc):
     """Fingerprint basis for a document: filename and extracted content, never timestamps."""
     digest = hashlib.sha256("\n".join(f"{location}\n{text}" for location, text in doc["sections"]).encode()).hexdigest()
+    if doc.get("pcf"):
+        digest = hashlib.sha256((digest + json.dumps(doc["pcf"], sort_keys=True)).encode()).hexdigest()
     marker = "pcf-sections-v1" if document_kind(doc["name"]) == "pcf" else ""
     return {"message_id": marker, "subject": doc["name"], "sender": "", "recipient": "",
             "sent": "", "body": digest, "reply_ids": "", "attachments": [(doc["name"], None)]}
@@ -386,7 +391,7 @@ class Store:
             self.add_passage(conn, mail_id, mail, attachment_id, name, "파일명", 0, name)
         return mail_id
 
-    def add_passage(self, conn, mail_id, mail, attachment, name, location, start, text):
+    def add_passage(self, conn, mail_id, mail, attachment, name, location, start, text, search_label=None):
         passage_id = conn.execute(
             "INSERT INTO passages(mail,attachment,location,start,text) VALUES(?,?,?,?,?)",
             (mail_id, attachment, location, start, text),
@@ -394,7 +399,7 @@ class Store:
         conn.execute(
             "INSERT INTO terms(rowid,subject,people,label,text) VALUES(?,?,?,?,?)",
             (passage_id, index_text(mail["subject"]), index_text(mail["sender"] + " " + mail["recipient"]),
-             index_text(name), index_text(text)),
+             index_text(search_label or name), index_text(text)),
         )
 
     def add_document(self, conn, source, version, item, doc):
@@ -411,6 +416,19 @@ class Store:
         attachment_id = conn.execute(
             "INSERT INTO attachments(mail,name,status) VALUES(?,?,?)", (mail_id, doc["name"], doc["status"])
         ).lastrowid
+        if doc.get("pcf"):
+            structure = doc["pcf"]
+            conn.execute("INSERT INTO pcf_documents VALUES(?,?)",
+                         (mail_id, json.dumps(structure, ensure_ascii=False)))
+            for comment in structure.get("comments", []):
+                for row in comment["rows"]:
+                    for side in ("owner", "yard"):
+                        cell = row[side]
+                        if cell is not None:
+                            location = cell_location(comment, side, cell)
+                            label = f'{doc["name"]} COMMENT NO. {comment["number"]} {cell["label"]} {side}'
+                            self.add_passage(conn, mail_id, mail, attachment_id, doc["name"], location, 0,
+                                             cell["text"], search_label=label)
         is_pcf = document_kind(doc["name"]) == "pcf"
         for location, text in doc["sections"]:
             offsets = [0]
@@ -429,6 +447,7 @@ class Store:
                FROM mails WHERE id=?""", (version, old_id)
         ).lastrowid
         conn.execute("INSERT INTO replies(mail,parent) SELECT ?,parent FROM replies WHERE mail=?", (new_id, old_id))
+        conn.execute("INSERT INTO pcf_documents SELECT ?,data FROM pcf_documents WHERE mail=?", (new_id, old_id))
         attachments = {}
         for row in conn.execute("SELECT id,name,status FROM attachments WHERE mail=? ORDER BY id", (old_id,)):
             attachments[row["id"]] = conn.execute(
@@ -657,3 +676,53 @@ class Store:
                    FROM attachments a WHERE a.mail=? ORDER BY a.id""", (row["id"],)
             )]
         return result
+
+    def pcf_case(self, seed, filters=None):
+        """Resolve a cell to its full case in the visible indexed document version."""
+        match = PCF_CELL.fullmatch(seed["location"])
+        if not match:
+            return None
+        with self.connection() as conn:
+            stored = conn.execute("SELECT data FROM pcf_documents WHERE mail=?", (seed["id"],)).fetchone()
+            if stored is None:
+                return None
+            doc = json.loads(stored["data"])
+            case = next((item for item in doc["comments"] if case_key(item) == match[1]), None)
+            if case is None:
+                return None
+            ids = [row[0] for row in conn.execute(
+                "SELECT id FROM passages WHERE mail=? AND location LIKE ?",
+                (seed["id"], f"PCF {match[1]} · %"),
+            )]
+            visible = {row["location"]: row for row in self.passages(ids, filters, conn)}
+            resolved = []
+            for item in case["rows"]:
+                for side in ("owner", "yard"):
+                    cell = item[side]
+                    if cell is not None:
+                        row = visible.get(cell_location(case, side, cell))
+                        if row is not None:
+                            resolved.append({**row, "pcf_cell": {
+                                "no": case["number"], "row": item["row"], "label": cell["label"],
+                                "side": side.upper(),
+                            }})
+            if not resolved:
+                return None
+            return {
+                "number": case["number"], "rows": resolved, "expected": 2 * len(case["rows"]),
+                "warnings": [*doc["warnings"], *case["warnings"]],
+                "source_version": doc["source_version"], "revision": doc.get("revision"),
+            }
+
+    def pcf_by_number(self, number, filters):
+        where, params = self.scope(filters)
+        with self.connection() as conn:
+            rows = conn.execute(
+                f"""SELECT {MAIL_COLUMNS},p.id passage,p.text,p.location,p.start,a.name attachment
+                    FROM pcf_documents d JOIN mails m ON m.id=d.mail {JOIN}
+                    JOIN passages p ON p.mail=m.id JOIN attachments a ON a.id=p.attachment
+                    WHERE {where} AND p.location GLOB ? GROUP BY m.id,substr(p.location,1,instr(p.location,' · ') - 1)
+                    ORDER BY m.sent DESC LIMIT 20""",
+                (*params, f"PCF T* · No. {number} · T*"),
+            )
+            return [dict(row) for row in rows]
