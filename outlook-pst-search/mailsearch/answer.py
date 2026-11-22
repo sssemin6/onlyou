@@ -65,6 +65,7 @@ claims에는 사실 한 문장과 그 주장을 직접 입증하는 citations를
 업체나 프로젝트가 여러 개라면 ambiguous, 근거가 없으면 insufficient, 일부만 확인되면 partial을 사용한다.
 메일 발송 일자 자체를 묻는 경우에만 Sent 줄을 날짜의 근거로 사용한다. 업무 일정과 금액은 반드시 본문이나 첨부에 있는 구절을 인용한다.
 예를 들어 메일 발송 시각이 5월 1일이고 본문이 "6월 10일 납품으로 승인합니다."라면, 납품일을 묻는 질문에는 "최종 승인 납품일은 6월 10일입니다."라고 답하고 본문을 인용한다.
+상충하는 회신의 우선순위가 불명확하면 ambiguous로 표시하고 각 입장과 원문 인용을 따로 남긴다. 행위 주체, 조건, 수치와 단위를 원문대로 보존한다.
 최신이라는 이유만으로 확정된 것으로 판단하지 않는다. 날짜를 단독으로 쓰지 말고 질문에 맞는 문장으로 답한다.
 """
 
@@ -253,7 +254,7 @@ def pcf_retrieval(store, ai, question, filters, context):
     return list(expanded.values())[:14], mode
 
 
-def evidence_for(store, ai, question, filters, context, semantic=True, limit=9):
+def evidence_for(store, ai, question, filters, context, semantic=True, limit=9, expand=False):
     search_text = f"{question} {context}".strip()
     lexical = store.lexical(search_text, filters, fuzzy=True)
     semantic_rows = []
@@ -270,7 +271,8 @@ def evidence_for(store, ai, question, filters, context, semantic=True, limit=9):
     for row in seeds:
         group = row["fingerprint"]
         counts[group] = counts.get(group, 0) + 1
-        if counts[group] <= 2 or (limit > 9 and PCF_CELL.fullmatch(row["location"])):
+        per_document = 8 if expand and row.get("kind") == "document" else 2
+        if counts[group] <= per_document or (limit > 9 and PCF_CELL.fullmatch(row["location"])):
             chosen.append(row)
     linked = store.related(list(dict.fromkeys(row["id"] for row in chosen[:7])), filters)
     seen = set()
@@ -282,16 +284,139 @@ def evidence_for(store, ai, question, filters, context, semantic=True, limit=9):
             evidence.append(row)
         if len(evidence) == limit:
             break
+    if expand:
+        # Reserve places for matched passages, related replies and their original context.
+        expanded = {}
+        for row in evidence[:4]:
+            expanded[row["passage"]] = row
+        contexts = [store.evidence_context(row, filters) for row in evidence[:6]]
+        for position in range(3):
+            for group in contexts:
+                if position < len(group) and len(expanded) < 12:
+                    row = group[position]
+                    expanded.setdefault(row["passage"], row)
+        for row in evidence[4:]:
+            expanded.setdefault(row["passage"], row)
+        evidence = list(expanded.values())
     return evidence, mode
+
+
+# Keep numbers, currency, units and weekdays attached to the statement that supports them.
+FACT_VALUE = re.compile(r"(?<![\w.])(?:[±+−-]?\d[\d,]*(?:\.\d+)?\s*(?:만원|억원|원|달러|USD|EUR|kg|mm|cm|MPa|kPa|kW|%|개|건|월|일)|[월화수목금토일]요일)", re.I)
+ACTOR = re.compile(r"([가-힣A-Za-z0-9]+(?:팀|부서|업체|본부|부장|과장|대리|담당자)|선주|조선소|고객사|공급사)(?:에서|측이|이|가|은|는)")
+LIMITATION = re.compile(r"(?:[가-힣A-Za-z0-9]+(?:에만|에서만|만)(?=\s)|[가-힣A-Za-z0-9]+에\s*한해|조건부|[가-힣A-Za-z]+(?:을|를) 조건으로|[가-힣A-Za-z]+ (?:완료 )?(?:후에만|시에만)|조건하에|subject to|only if)", re.I)
+UNSETTLED = re.compile(r"미승인|미확정|미합의|미결재|검토\s*중|보류|재검토|확정되지|승인되지|합의되지|않았|아닙|거절|반려|초안|not\s+(?:yet\s+)?(?:confirmed|agreed|approved)|approval requested|tentative", re.I)
+STATE = re.compile(r"요청|보류|철회|취소|반려|거절|미승인|미확정|미합의|최소|최대|이상|이하|미만|초과")
+ITEM_CODE = re.compile(r"(?<![A-Za-z0-9])[A-Za-z0-9]+(?:[-_][A-Za-z0-9]+)+")
+PROPOSAL = re.compile(r"요청|제안|예정|초안|검토|tentative|request|propos", re.I)
+CLAUSE = re.compile(r"[^\n!?。]+?(?:\.(?!\d)|(?=[\n!?。])|$)")
+
+
+def fact_values(text):
+    return {re.sub(r"[\s,]", "", m.group()).casefold() for m in FACT_VALUE.finditer(text)}
+
+
+def same_statement(text, body_quotes, cited_rows, active_approval, local_metadata):
+    actors = set(ACTOR.findall(text))
+    facts = fact_values(text)
+    states = set(STATE.findall(text))
+    codes = {code.casefold() for code in ITEM_CODE.findall(text)}
+    uncertain = UNSETTLED.search(text)
+    if not (facts or actors or active_approval or states or uncertain or codes):
+        return True
+    for quote, row in zip(body_quotes, cited_rows):
+        for match in CLAUSE.finditer(row["text"]):
+            line = match.group().strip()
+            # Check surrounding original wording even if the model quoted only "승인".
+            if not line or (quote not in line and line not in quote):
+                continue
+            support = line if line in quote else quote
+            proven_actors = set(ACTOR.findall(support))
+            sender = row["sender"] if local_metadata else row.get("reviewed_sender", "")
+            if (len(actors) == 1 and not proven_actors and not row.get("attachment") and not row.get("start")
+                    and line in QUOTED_MAIL.split(row["text"], 1)[0]):
+                proven_actors.update(actor for actor in actors if actor in sender)
+            if codes - {code.casefold() for code in ITEM_CODE.findall(support)}:
+                continue
+            if not facts <= fact_values(support) or actors - proven_actors:
+                continue
+            if uncertain and not UNSETTLED.search(support):
+                continue
+            if not states <= set(STATE.findall(support)):
+                continue
+            if facts and PROPOSAL.search(line) and not (APPROVED.search(line) or PROPOSAL.search(text)):
+                continue
+            if active_approval:
+                if not APPROVED.search(support) or NEGATED.search(line) or UNSETTLED.search(line):
+                    continue
+                if re.search(r"(?:승인|합의|확정|결재)\s*(?:을|를)?\s*(?:요청|예정|받으면|되면|여부)", line):
+                    continue
+                if any(term not in text for term in LIMITATION.findall(line)):
+                    continue
+            return True
+    return False
+
+
+def conflicting_decisions(question, rows):
+    """Return the original opposing statements for the same named topic and event."""
+    events = set(re.findall(r"납품|납기|출하|계약|예산|발주|지급|납입|검수", question))
+    if not events or not DECISION_QUESTION.search(question):
+        return None
+    subjects = {}
+    positions = {}
+    codes = {code.casefold() for code in ITEM_CODE.findall(question)}
+    words = query_words(question, fuzzy=True)
+    for row in rows:
+        if row["location"] != "본문" or row.get("kind", "mail") != "mail" or row.get("start", 0):
+            continue
+        topic = topic_key(row["subject"])
+        if not topic or not all(code in topic for code in codes) or not any(word in topic for word in words):
+            continue
+        for match in CLAUSE.finditer(QUOTED_MAIL.split(row["text"], 1)[0]):
+            line = match.group().strip()
+            if not line or len(line) > QUOTE_LIMIT:
+                continue
+            for event in events:
+                if event not in line or LIMITATION.search(line):
+                    continue
+                group = positions.setdefault((row["source"], topic, event), {})
+                if re.search(r"보류|철회|반려|취소", line) and not PROPOSAL.search(line) and not re.search(r"여부|하지 않|하지 않았", line):
+                    group.setdefault("held", (row, line))
+                elif APPROVAL_SENTENCE.search(line) and not NEGATED.search(line) and not UNSETTLED.search(line):
+                    group.setdefault("approved", (row, line))
+            dates = list(DELIVERY_DATE.finditer(line))
+            if (not DELIVERY.search(question) or len(dates) != 1 or len(line) > QUOTE_LIMIT or not DELIVERY.search(line)
+                    or not APPROVAL_SENTENCE.search(line) or NEGATED.search(line) or UNSETTLED.search(line)):
+                continue
+            date = dates[0]
+            key = (date[1], int(date[2]), int(date[3]))
+            statements = subjects.setdefault((row["source"], topic), {})
+            statements.setdefault(key, (row, line))
+    alternatives = next((list(group.values()) for group in positions.values() if len(group) == 2), [])
+    for statements in subjects.values():
+        days = {(month, day) for year, month, day in statements}
+        years = {year for year, month, day in statements if year}
+        if len(days) > 1 or len(years) > 1:
+            alternatives = list(statements.values())[:3]
+            break
+    if alternatives:
+        return {"status": "ambiguous", "claims": [
+            {"text": line, "citations": [{**public_row(row), "quote": line}]} for row, line in alternatives
+        ]}
+    return None
 
 
 def validate(result, candidates, question="", *, text_for=source_text, pcf=False, claim_limit=5, complete=True):
     business_date = re.search(r"납기|납품|출하|출고|입고|일정|마감|공급가|단가|금액", question)
     sent_date = re.search(r"발송일|발송\s*(?:시각|날짜)|(?:메일|회신)(?:이|을)?\s*언제\s*(?:보냈|왔)", question)
+    if not pcf:
+        conflict = conflicting_decisions(question, candidates)
+        if conflict:
+            return conflict
     if not isinstance(result, dict) or result.get("status") not in ("answered", "partial", "insufficient", "ambiguous"):
         return {"status": "insufficient", "claims": []}
     status = result["status"]
-    if status in {"insufficient", "ambiguous"}:
+    if status == "insufficient" or (status == "ambiguous" and pcf):
         return {"status": status, "claims": []}
     by_id = {row["passage"]: row for row in candidates}
     claims = []
@@ -324,6 +449,9 @@ def validate(result, candidates, question="", *, text_for=source_text, pcf=False
         if not citations or not text or stated_numbers - proof_numbers:
             continue
         active_approval = APPROVED.search(text) and not NEGATED.search(text) and not UNCONFIRMED.search(text)
+        if not pcf and not (sent_date and not body_quotes) and not same_statement(
+                text, body_quotes, cited_rows, active_approval and not UNSETTLED.search(text), text_for is source_text):
+            continue
         if active_approval and (not APPROVED.search(text_proof) or NEGATED.search(text_proof)):
             continue
         if CANCELLED.search(text) and not CANCELLED.search(text_proof):
@@ -372,6 +500,9 @@ def validate(result, candidates, question="", *, text_for=source_text, pcf=False
                 ):
                     continue
         claims.append({"text": text, "citations": citations})
+    if status == "ambiguous":
+        sources = {ref["passage"] for claim in claims for ref in claim["citations"]}
+        return {"status": "ambiguous", "claims": claims if len(sources) >= 2 else []}
     return {"status": (status if len(proposed) == len(claims) else "partial") if claims else "insufficient", "claims": claims}
 
 
@@ -394,13 +525,13 @@ def delivery_date_answer(question, evidence, context=""):
         if not any(len(term) >= 2 and term in topic for term in terms):
             continue
         block = QUOTED_MAIL.split(row["text"], 1)[0]
-        if CANCELLED.search(block) or re.search(r"재협의|변경\s*검토|변경\s*확정|변경\s*승인", block):
+        if CANCELLED.search(block) or UNSETTLED.search(block) or re.search(r"재협의|변경\s*검토|변경\s*확정|변경\s*승인", block):
             return None
         for sentence in re.split(r"(?<=[.!?])\s+|\n+", block):
             sentence = sentence.strip()
             dates = list(DELIVERY_DATE.finditer(sentence))
             if (len(dates) != 1 or not DELIVERY.search(sentence) or not APPROVAL_SENTENCE.search(sentence)
-                    or NEGATED.search(sentence) or len(sentence) > QUOTE_LIMIT):
+                    or NEGATED.search(sentence) or UNSETTLED.search(sentence) or LIMITATION.search(sentence) or len(sentence) > QUOTE_LIMIT):
                 continue
             date = dates[0]
             try:
