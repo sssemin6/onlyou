@@ -593,6 +593,105 @@ class Integration(unittest.TestCase):
         self.assertEqual(list(mail_only["counts"]), ["mail"])
         self.assertGreater(mail_only["counts"]["mail"], 0)
 
+    def test_reviewed_intranet_context_and_legacy_limit(self):
+        path = self.mail / "history.txt"
+        tail = "검수 결과는 적합으로 최종 확정했습니다."
+        path.write_text("PX-421 검수기록 " + "가" * 900 + tail)
+        source = self.call("/api/sources", {"path": str(path)})[1]["source"]
+        await_source(self.store, source, {"ready"})
+        url = "https://intranet.example.invalid/v1/chat/completions"
+        self.app.external = ExternalAI(url, "model", "key")
+        query = {"query": "PX-421 검수기록", "filters": {"source": source}}
+        legacy = self.call("/api/external/preview", query)[1]
+        self.assertFalse(any(tail in item["text"] for item in legacy["excerpts"]))
+        with patch.dict(os.environ, MAILSEARCH_INTERNAL_URL=url):
+            status, wide = self.call("/api/external/preview", query)
+            self.assertEqual(status, 200)
+            chosen = next(item for item in wide["excerpts"] if tail in item["text"])
+            self.assertEqual(chosen["context"]["subject"], path.name)
+            with patch.object(self.app.external, "complete", return_value={"status": "insufficient"}) as wire:
+                self.assertEqual(self.call("/api/external/send", {"review": wide["review"], "excerpts": [chosen["id"]]})[0], 200)
+                sent = json.loads(wire.call_args.args[1])
+                self.assertEqual(sent["evidence"], [{"source": chosen["id"], "text": chosen["text"], "context": chosen["context"]}])
+                self.assertNotIn(str(self.mail), wire.call_args.args[1])
+
+    def test_internal_review_finds_decision_at_end_of_linked_reply(self):
+        self.ai.embedding_model = ""
+        folder = self.mail / "chain"
+        folder.mkdir()
+        marker = "계약 갱신 대상을 전 지점으로 확정했습니다."
+        for i, body in enumerate(["ZX-144 계약 갱신 검토", "회의 기록 " * 700 + marker]):
+            mail = EmailMessage()
+            mail["From"] = "team@example.invalid"
+            mail["Subject"] = "ZX-144 계약 갱신" if not i else "후속 회신"
+            mail["Message-ID"] = f"<chain{i}@example.invalid>"
+            if i:
+                mail["In-Reply-To"] = "<chain0@example.invalid>"
+            mail.set_content(body)
+            (folder / f"{i}.eml").write_bytes(mail.as_bytes())
+        source = self.call("/api/sources", {"path": str(folder)})[1]["source"]
+        await_source(self.store, source, {"ready"})
+        url = "https://intranet.example.invalid/v1/messages"
+        self.app.external = ExternalAI(url, "model", "key")
+        with patch.dict(os.environ, MAILSEARCH_INTERNAL_URL=url):
+            _, review = self.call("/api/external/preview", {"query": "ZX-144", "filters": {"source": source}})
+            tail = next(item for item in review["excerpts"] if marker in item["text"])
+            self.assertEqual(tail["context"]["subject"], "후속 회신")
+        with patch.object(self.app.external, "complete") as wire:
+            status, _ = self.call("/api/external/send", {"review": review["review"], "excerpts": [tail["id"]]})
+            self.assertEqual(status, 409)
+            wire.assert_not_called()
+
+    def test_intranet_sheet_context_and_more_than_five_reviewed_sources(self):
+        book = self.mail / "ledger.xlsx"
+        rows = ["<row><c r='A1' t='inlineStr'><is><t>가격표</t></is></c></row>",
+                "<row><c r='A2' t='inlineStr'><is><t>단가 (만원)</t></is></c></row>"]
+        for i in range(3, 14):
+            rows.append(f"<row><c r='A{i}' t='inlineStr'><is><t>INV-925 항목 {i}</t></is></c></row>")
+        with zipfile.ZipFile(book, "w") as archive:
+            archive.writestr("xl/workbook.xml", '<workbook xmlns:r="rel"><sheet name="예산" r:id="s"/></workbook>')
+            archive.writestr("xl/_rels/workbook.xml.rels", '<Relationships><r Id="s" Target="worksheets/s.xml"/></Relationships>')
+            archive.writestr("xl/worksheets/s.xml", "<worksheet>" + "".join(rows) + "</worksheet>")
+        source = self.call("/api/sources", {"path": str(book)})[1]["source"]
+        await_source(self.store, source, {"ready"})
+        url = "https://intranet.example.invalid/v1/messages"
+        self.app.external = ExternalAI(url, "model", "key")
+        with patch.dict(os.environ, MAILSEARCH_INTERNAL_URL=url):
+            _, preview = self.call("/api/external/preview", {"query": "INV-925 항목", "filters": {"source": source}})
+            items = preview["excerpts"]
+            self.assertTrue(any("만원" in item["text"] for item in items))
+            self.assertTrue(any("가격표" in item["text"] for item in items))
+            self.assertGreater(len(items), 5)
+            approval = {"review": preview["review"], "excerpts": [item["id"] for item in items]}
+            with patch.object(self.app.external, "complete", return_value={"status": "insufficient"}) as wire:
+                self.assertEqual(self.call("/api/external/send", approval)[0], 200)
+                self.assertEqual(len(json.loads(wire.call_args.args[1])["evidence"]), len(items))
+                self.assertLessEqual(len(wire.call_args.args[1].encode()), self.app.external.internal_budget)
+
+    def test_semantic_limits_apply_inside_selected_archive(self):
+        from mailsearch.store import buckets, pack_vector
+        blob = pack_vector([1., 0.])
+        with self.store.connection() as conn:
+            for name, count in (("wanted", 1), ("noise", 2410)):
+                folder = self.mail / name
+                folder.mkdir()
+                source = conn.execute("INSERT INTO sources(path,kind,active) VALUES(?,'eml_dir',1)", (str(folder),)).lastrowid
+                if name == "wanted":
+                    wanted = source
+                for number in range(count):
+                    ident = self.store.add_mail(conn, source, 1, str(number), {
+                        "subject": "same", "sender": name, "recipient": "", "sent": "", "folder": "/",
+                        "attachments": [], "message_id": "", "reply_ids": "", "body": "shared"})
+                    pid = conn.execute("SELECT id FROM passages WHERE mail=?", (ident,)).fetchone()[0]
+                    conn.execute("INSERT INTO vectors VALUES(?,'test',?)", (pid, blob))
+                    conn.executemany("INSERT INTO vector_buckets VALUES('test',?,?)", [(b, pid) for b in buckets([1., 0.])])
+        for filters in ({"source": wanted}, {"sender": "wanted"}):
+            result = self.store.semantic([1., 0.], "test", filters)
+            self.assertEqual([row["source"] for row in result], [wanted])
+        result = self.store.semantic([1., 0.], "test", {"source": source})
+        self.assertTrue(result)
+        self.assertTrue(all(row["source"] == source for row in result))
+
     def test_external_review_sends_only_selected_excerpt_once(self):
         self.import_mail()
         question = "한빛 A-17 납품일은 언제 확정됐어?"
@@ -958,6 +1057,56 @@ class AttachmentsAndCitations(unittest.TestCase):
         self.assertEqual(validate(result, [row], pcf=True)["status"], "answered")
         claim["text"] = "이 건은 종결됐습니다."
         self.assertEqual(validate(result, [row], pcf=True)["status"], "insufficient")
+
+    def test_general_claim_requires_same_actor_status_unit_and_condition(self):
+        row = {"id": 1, "source": 1, "path": "fixture.pst", "folder": "Inbox", "updated": None,
+               "passage": 1, "sent": "", "sender": "", "recipient": "", "subject": "부품 구매",
+               "attachment": None, "location": "본문"}
+        def check(original, claim, quote=None):
+            value = {"text": claim, "citations": [{"source": 1, "quote": quote or original}]}
+            return validate({"status": "answered", "claims": [value]}, [{**row, "text": original}])["status"]
+        for original, claim, quote in [
+            ("구매팀은 금요일 납품을 요청했습니다.", "구매팀은 금요일 납품을 확정했습니다.", None),
+            ("구매팀이 금요일 납품 승인을 요청합니다.", "구매팀이 금요일 납품 승인", "구매팀이 금요일 납품 승인"),
+            ("구매팀이 영업팀에 금요일 납품을 확정했습니다.", "영업팀이 금요일 납품을 확정했습니다.", None),
+            ("구매팀이 시범점에만 20만원을 승인했습니다.", "구매팀이 20만원을 승인했습니다.", None),
+            ("구매팀이 20만원을 승인했습니다.", "구매팀이 20원을 승인했습니다.", None),
+            ("20만원을 요청했습니다. 30만원을 승인했습니다.", "20만원을 승인했습니다.", None),
+            ("수요일 납품을 요청했습니다.", "납품일은 수요일입니다.", None),
+            ("B-17 가격은 5만원입니다.", "A-17 가격은 5만원입니다.", None),
+            ("기준은 최대 5개입니다.", "기준은 최소 5개입니다.", None),
+            ("예산을 승인했습니다.", "예산은 미승인입니다.", None),
+            ("예산은 확정됐습니다.", "예산은 미확정입니다.", None),
+        ]:
+            with self.subTest(claim=claim):
+                self.assertEqual(check(original, claim, quote), "insufficient")
+        text = "구매팀이 시범점에만 20만원을 승인했습니다."
+        self.assertEqual(check(text, text), "answered")
+
+    def test_inconsistent_decision_returns_both_verbatim_citations(self):
+        base = {"id": 1, "source": 1, "path": "fixture.pst", "folder": "Inbox", "updated": None,
+                "sent": "", "sender": "", "recipient": "", "subject": "AX-12 납품", "attachment": None,
+                "location": "본문", "start": 0}
+        rows = [{**base, "passage": i, "text": f"4월 {day}일 납품으로 확정합니다."}
+                for i, day in enumerate([20, 21], 1)]
+        proposed = {"status": "answered", "claims": [{"text": rows[0]["text"],
+                    "citations": [{"source": 1, "quote": rows[0]["text"]}]}]}
+        answer = validate(proposed, rows, "AX-12 납품 언제로 확정됐어?")
+        self.assertEqual(answer["status"], "ambiguous")
+        self.assertEqual([c["citations"][0]["quote"] for c in answer["claims"]], [r["text"] for r in rows])
+
+    def test_conflicting_budget_replies_keep_hold_and_approval(self):
+        base = {"id": 1, "source": 1, "path": "fixture.pst", "folder": "Inbox", "updated": None,
+                "sent": "", "sender": "", "recipient": "", "subject": "AX-12 예산", "attachment": None,
+                "location": "본문", "start": 0}
+        rows = [{**base, "passage": i, "text": text} for i, text in enumerate(
+            ["AX-12 예산을 승인합니다.", "AX-12 예산 집행을 보류합니다."], 1)]
+        proposed = {"status": "answered", "claims": [{"text": rows[0]["text"],
+                    "citations": [{"source": 1, "quote": rows[0]["text"]}]}]}
+        question = "AX-12 예산이 승인됐어?"
+        self.assertEqual(validate(proposed, rows, question)["status"], "ambiguous")
+        rows[1]["subject"] = "BX-12 예산"
+        self.assertEqual(validate(proposed, rows, question)["status"], "answered")
 
     def test_invalid_quote_unproven_amount_and_approval(self):
         row = {
