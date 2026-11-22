@@ -9,6 +9,7 @@ import time
 from dataclasses import dataclass
 from urllib.parse import urlsplit
 
+from .store import query_words
 from .answer import ANSWER_INSTRUCTIONS, MODEL_NAME, map_citations
 
 DEFAULT_URL = "https://api.openai.com/v1/chat/completions"
@@ -16,17 +17,18 @@ DEFAULT_MODEL = "gpt-4.1-mini"
 REVIEW_TTL = 300
 MAX_EXCERPTS = 5
 MAX_EXCERPT_LENGTH = 800
+MAX_INTERNAL_EXCERPTS = 16
 MAX_PCF_CELLS = 1600
 MAX_PCF_BATCHES = 12
 MAX_RESPONSE = 128 * 1024
 HOST = re.compile(r"(?:[A-Za-z0-9-]+\.)*[A-Za-z0-9-]+", re.ASCII)
 PATH = re.compile(r"/(?:[A-Za-z0-9._~-]+/)*(?:chat/completions|messages)", re.ASCII)
 JSON_INSTRUCTIONS = """
-입력 JSON에는 question과 evidence가 있다. 메일 발신자·제목·발송 시간은 별도로 주어지지 않는다.
+입력 JSON에는 question과 evidence가 있다. context가 있으면 제목·발신자·발송 시각·위치를 확인할 수 있다.
 응답은 아래 구조의 JSON 객체 하나여야 한다.
 {"status":"answered","claims":[{"text":"메일 근거를 확인한 한국어 문장","citations":[{"source":1,"quote":"자료에서 연속된 실제 인용"}]}]}
 각 문장에 인용 1~3개를 넣고 quote는 4~300자 사이로 유지한다. source는 evidence 항목의 source 번호다.
-답을 확인할 수 없으면 status를 insufficient 또는 ambiguous로 하고 claims를 빈 목록으로 설정한다.
+근거가 부족하면 insufficient와 빈 claims를 반환한다. 회신이 상충하면 ambiguous와 각 입장을 뒷받침하는 개별 claims를 반환한다.
 """
 
 
@@ -94,14 +96,22 @@ class ExternalAI:
         raw = os.environ.get("MAILSEARCH_PCF_INPUT_BYTES", "12000")
         return int(raw) if re.fullmatch(r"[0-9]{4,6}", raw) and 3000 <= int(raw) <= 96000 else 0
 
+    @property
+    def internal_budget(self):
+        if os.environ.get("MAILSEARCH_INTERNAL_URL") != self.public["destination"]:
+            return 0
+        raw = os.environ.get("MAILSEARCH_INTERNAL_INPUT_BYTES", "24000")
+        return int(raw) if re.fullmatch(r"[0-9]{4,6}", raw) and 3000 <= int(raw) <= 96000 else 0
+
     def answer_pcf(self, content):
-        return self.complete(PCF_WORD_INSTRUCTIONS, pcf_json(content), token_limit=2800, timeout=90)
+        return self.complete(PCF_WORD_INSTRUCTIONS, compact_json(content), token_limit=2800, timeout=90)
 
     def answer(self, question, excerpts, instructions=ANSWER_INSTRUCTIONS, token_limit=None, timeout=35):
-        messages = {"question": question, "evidence": [
-            {"source": item.number, "text": item.text} for item in excerpts
-        ]}
-        result = self.complete(instructions + JSON_INSTRUCTIONS, json.dumps(messages, ensure_ascii=False),
+        messages = evidence_payload(question, excerpts)
+        if any(item.context for item in excerpts):
+            instructions += "\ncontext 필드는 사용자가 검토한 원문 위치와 메일 정보다. 발신자가 인용된 타인의 발언을 했다고 추정하지 않는다."
+
+        result = self.complete(instructions + JSON_INSTRUCTIONS, compact_json(messages),
                                token_limit=token_limit or (2800 if self.host == "api.openai.com" else 1500),
                                timeout=timeout)
         return map_citations(result, {item.number: item.passage for item in excerpts})
@@ -171,6 +181,46 @@ class Excerpt:
     number: int
     passage: int
     text: str
+    context: dict | None = None
+
+
+def evidence_payload(question, excerpts):
+    return {"question": question, "evidence": [
+        {"source": item.number, "text": item.text, **({"context": item.context} if item.context else {})}
+        for item in excerpts
+    ]}
+
+
+def internal_excerpts(question, rows, budget):
+    items = []
+    seen = set()
+    for row in rows:
+        text = row["text"].strip()
+        if row["location"] in {"파일명", "제목"} or not text or text == "본문 없음":
+            continue
+        key = (row["fingerprint"], row["attachment"], row["location"], text)
+        if key in seen:
+            continue
+        seen.add(key)
+        context = {field: row[field][:240] for field in ("subject", "sender", "sent", "attachment", "location") if row.get(field)}
+        if row.get("attachment"):
+            context["attachment"] = re.split(r"[/\\]", row["attachment"])[-1][:240]
+        candidate = Excerpt(len(items) + 1, row["passage"], text, context)
+        if len(compact_json(evidence_payload(question, [*items, candidate])).encode("utf-8")) <= budget:
+            items.append(candidate)
+        elif not items:
+            # Keep the matching portion of a single passage on very small budgets.
+            tokens = query_words(question, fuzzy=True)
+            center = next((text.lower().index(term) for term in tokens if term in text.lower()), 0)
+            for length in (700, 350, 175):
+                start = max(0, min(len(text) - length, center - length // 3))
+                short = Excerpt(1, row["passage"], text[start:start + length], context)
+                if len(compact_json(evidence_payload(question, [short])).encode("utf-8")) <= budget:
+                    items.append(short)
+                    break
+        if len(items) == MAX_INTERNAL_EXCERPTS:
+            break
+    return tuple(items)
 
 
 @dataclass(frozen=True)
@@ -181,6 +231,7 @@ class Review:
     generation: object | None
     pcf: bool = False
     case: dict | None = None
+    internal_budget: int = 0
 
 
 class Reviews:
@@ -188,9 +239,11 @@ class Reviews:
         self._pending = {}
         self._lock = threading.Lock()
 
-    def create(self, question, rows, generation=None, limit=MAX_EXCERPT_LENGTH, *, pcf=False, case=None):
+    def create(self, question, rows, generation=None, limit=MAX_EXCERPT_LENGTH, *, pcf=False, case=None, internal_budget=0):
         if case is not None:
             excerpts = tuple(Excerpt(n, row["passage"], row["text"]) for n, row in enumerate(rows, 1))
+        elif internal_budget:
+            excerpts = internal_excerpts(question, rows, internal_budget)
         else:
             texts = {}
             for row in rows:
@@ -206,7 +259,7 @@ class Reviews:
             return None, None
         token = secrets.token_urlsafe(24)
         now = time.monotonic()
-        review = Review(now + REVIEW_TTL, question, excerpts, generation, pcf, case)
+        review = Review(now + REVIEW_TTL, question, excerpts, generation, pcf, case, internal_budget)
         with self._lock:
             self._pending = {key: value for key, value in self._pending.items() if value.expires > now}
             if len(self._pending) >= 8:
@@ -241,12 +294,12 @@ insufficient와 ambiguous에서는 claims를 비운다. unknowns는 근거에서
 """
 
 
-def pcf_json(content):
+def compact_json(content):
     return json.dumps(content, ensure_ascii=False, separators=(",", ":"))
 
 
 def pcf_input_fits(content, budget):
-    return len(PCF_WORD_INSTRUCTIONS.encode()) + len(pcf_json(content).encode()) + 512 <= budget
+    return len(PCF_WORD_INSTRUCTIONS.encode()) + len(compact_json(content).encode()) + 512 <= budget
 
 
 def pcf_batches(question, excerpts, case, budget):
