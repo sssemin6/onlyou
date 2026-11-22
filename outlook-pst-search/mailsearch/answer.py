@@ -10,7 +10,7 @@ import time
 from pathlib import Path
 
 from .extract import CREATE_FLAGS
-from .pcf import comment_number
+from .pcf import PCF_CELL, WORD_SUFFIXES, comment_number
 from .store import normalized, query_words, topic_key
 
 QUOTE_LIMIT = 300
@@ -28,6 +28,10 @@ PCF_MEASUREMENT = re.compile(
 )
 PENDING_PCF = re.compile(r"미종결|보류|검토\s*중|미완료|취소|철회|번복|not\s+closed|pending|reopened", re.I)
 UNCONFIRMED = re.compile(r"확인\s*되지|미확인|확인\s*불가|근거가?\s*없")
+PCF_UNCERTAIN = re.compile(r"초안|회신안|미확인|미발신|미발송|예정|요청|조건부|재개|않았|불가|draft|propos(?:al|ed)|"
+                           r"pending|reopened|subject to|not\b|requested|will\s+(?:send|submit|close)", re.I)
+PCF_SENT = re.compile(r"(?:발신|발송|송부)(?:했|됨| 완료)|(?:sent|dispatched|issued)(?:\b|$)", re.I)
+PCF_ACCEPTED = re.compile(r"(?:선주|OWNER).{0,24}(?:수락|승인|동의)|accepted|consent", re.I)
 DELIVERY_DATE = re.compile(r"(?<!\d)(?:(\d{4})년\s*)?(\d{1,2})월\s*(\d{1,2})일")
 DELIVERY = re.compile(r"납기|납품|출하|출고")
 DECISION_QUESTION = re.compile(r"결국|최종|확정|승인|정해|결정")
@@ -216,6 +220,21 @@ def merge_rows(lexical, semantic, limit=9):
     return [row for _, row in sorted(scores.values(), key=lambda value: value[0], reverse=True)[:limit]]
 
 
+def pcf_candidates(store, ai, question, filters, context):
+    """Select a COMMENT by explicit number or rank its matched cells."""
+    number = comment_number(question)
+    if number is None:
+        term = re.search(r"(?:\bno\.\s*([0-9]+)|(?<![0-9A-Za-z])([0-9]+)(?:-[a-z](?![a-z0-9])|\s*번))", question, re.I)
+        number = (term[1] or term[2]) if term else None
+    if number is not None:
+        return store.pcf_by_number(number, filters), number
+    return evidence_for(store, ai, question, filters, context, limit=40)[0], None
+
+
+def pcf_word(row):
+    return row["kind"] == "pcf" and Path(row["subject"]).suffix.casefold() in WORD_SUFFIXES
+
+
 def pcf_retrieval(store, ai, question, filters, context):
     """Retrieve relevant comments before expanding unambiguous neighboring context."""
     filters = {**filters, "tab": "pcf"}
@@ -234,7 +253,7 @@ def pcf_retrieval(store, ai, question, filters, context):
     return list(expanded.values())[:14], mode
 
 
-def evidence_for(store, ai, question, filters, context, semantic=True):
+def evidence_for(store, ai, question, filters, context, semantic=True, limit=9):
     search_text = f"{question} {context}".strip()
     lexical = store.lexical(search_text, filters, fuzzy=True)
     semantic_rows = []
@@ -245,13 +264,13 @@ def evidence_for(store, ai, question, filters, context, semantic=True):
             mode = "hybrid" if semantic_rows else "keyword"
         except (OSError, ValueError, RuntimeError, KeyError, IndexError, TypeError, http.client.HTTPException):
             mode = "keyword_only"
-    seeds = merge_rows(lexical, semantic_rows, limit=18)
+    seeds = merge_rows(lexical, semantic_rows, limit=max(18, limit))
     chosen = []
     counts = {}
     for row in seeds:
         group = row["fingerprint"]
         counts[group] = counts.get(group, 0) + 1
-        if counts[group] <= 2:
+        if counts[group] <= 2 or (limit > 9 and PCF_CELL.fullmatch(row["location"])):
             chosen.append(row)
     linked = store.related(list(dict.fromkeys(row["id"] for row in chosen[:7])), filters)
     seen = set()
@@ -261,12 +280,12 @@ def evidence_for(store, ai, question, filters, context, semantic=True):
         if key not in seen:
             seen.add(key)
             evidence.append(row)
-        if len(evidence) == 9:
+        if len(evidence) == limit:
             break
     return evidence, mode
 
 
-def validate(result, candidates, question="", *, text_for=source_text, pcf=False):
+def validate(result, candidates, question="", *, text_for=source_text, pcf=False, claim_limit=5, complete=True):
     business_date = re.search(r"납기|납품|출하|출고|입고|일정|마감|공급가|단가|금액", question)
     sent_date = re.search(r"발송일|발송\s*(?:시각|날짜)|(?:메일|회신)(?:이|을)?\s*언제\s*(?:보냈|왔)", question)
     if not isinstance(result, dict) or result.get("status") not in ("answered", "partial", "insufficient", "ambiguous"):
@@ -279,11 +298,12 @@ def validate(result, candidates, question="", *, text_for=source_text, pcf=False
     proposed = result.get("claims", [])
     if not isinstance(proposed, list):
         proposed = []
-    for claim in proposed[:5]:
+    for claim in proposed[:claim_limit]:
         if not isinstance(claim, dict) or not isinstance(claim.get("text"), str) or not 1 <= len(claim["text"]) <= 440:
             continue
         citations = []
         body_quotes = []
+        cited_rows = []
         for ref in claim.get("citations", [])[:3] if isinstance(claim.get("citations"), list) else ():
             if not isinstance(ref, dict) or type(ref.get("source")) is not int or ref["source"] not in by_id:
                 continue
@@ -294,6 +314,7 @@ def validate(result, candidates, question="", *, text_for=source_text, pcf=False
                 citations.append({**public_row(row), "quote": quote})
                 if quote in row["text"]:
                     body_quotes.append(quote)
+                    cited_rows.append(row)
         proof = " ".join(ref["quote"] for ref in citations)
         text_proof = " ".join(body_quotes)
         numerical_proof = text_proof if business_date and not sent_date else proof
@@ -323,8 +344,32 @@ def validate(result, candidates, question="", *, text_for=source_text, pcf=False
 
             if measurements(text) - measurements(text_proof):
                 continue
-            if CLOSED_PCF.search(text) and not PENDING_PCF.search(text) and not UNCONFIRMED.search(text):
-                if not any(CLOSED_PCF.search(quote) and not PENDING_PCF.search(quote) for quote in body_quotes):
+            positive_close = (CLOSED_PCF.search(text) and not PENDING_PCF.search(text)
+                              and not UNCONFIRMED.search(text) and not PCF_UNCERTAIN.search(text))
+            if positive_close:
+                if not any(CLOSED_PCF.search(quote) and not PENDING_PCF.search(quote)
+                           and not UNCONFIRMED.search(quote) and not PCF_UNCERTAIN.search(quote)
+                           for quote in body_quotes):
+                    continue
+            sides = {row["pcf_cell"]["side"] for row in cited_rows if row.get("pcf_cell")}
+            if sides and sides != {"OWNER", "YARD"}:
+                if re.match(r"^\s*(?:선주|OWNER)(?:가|는|의|에서|\s|$)", text, re.I) and "OWNER" not in sides:
+                    continue
+                if re.match(r"^\s*(?:조선소|YARD)(?:가|는|의|에서|\s|$)", text, re.I) and "YARD" not in sides:
+                    continue
+            if sides and (positive_close or PCF_SENT.search(text) or PCF_ACCEPTED.search(text)):
+                if not complete and (positive_close or re.search(r"최종|전체|마지막|현재 상태", text)):
+                    continue
+                if any(PCF_UNCERTAIN.search(row["text"]) for row in cited_rows):
+                    continue
+                if (positive_close or PCF_ACCEPTED.search(text)) and "OWNER" not in sides:
+                    continue
+                if PCF_SENT.search(text) and not any(PCF_SENT.search(quote) for quote in body_quotes):
+                    continue
+                if PCF_ACCEPTED.search(text) and not any(
+                    PCF_ACCEPTED.search(quote) and row.get("pcf_cell", {}).get("side") == "OWNER"
+                    for quote, row in zip(body_quotes, cited_rows)
+                ):
                     continue
         claims.append({"text": text, "citations": citations})
     return {"status": (status if len(proposed) == len(claims) else "partial") if claims else "insufficient", "claims": claims}
