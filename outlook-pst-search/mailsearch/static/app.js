@@ -40,6 +40,7 @@ const issueNames = {
   changed: "파일이 변경되었습니다. 갱신해 주세요.",
   interrupted: "중단된 색인입니다.",
   embedding_unavailable: "의미 검색 모델을 열지 못했습니다. 일반 검색은 사용할 수 있습니다.",
+  pcf_input_too_large: "선택한 COMMENT이 현재 입력 한도를 초과합니다.",
   external_disabled: "상단의 API 설정에서 답변에 사용할 AI를 연결해 주세요.",
   external_url: "HTTPS 주소를 확인하세요. 주소는 /chat/completions 또는 /messages로 끝나야 합니다.",
   external_model: "제공자에서 안내한 모델명을 입력하세요.",
@@ -299,9 +300,20 @@ async function openEvidence(id, quote) {
     for (const [label, value] of fields) metadata.append(node("dt", label), node("dd", value));
     body.replaceChildren(metadata);
     if (quote) body.append(node("blockquote", quote));
-    const text = item.attachment ? item.text : item.body || item.text;
-    const original = highlight(text, quote || item.text);
-    body.append(original);
+    if (item.pcf) {
+      body.append(node("h3", "COMMENT " + item.pcf.number + (item.pcf.revision ? " · Rev. " + item.pcf.revision : "")));
+      for (const warning of item.pcf.warnings) body.append(node("p", warning, "answer-status"));
+      for (const cell of item.pcf.cells) {
+        const heading = cell.location + (cell.label ? " · " + cell.label : "");
+        body.append(node("h4", heading));
+        const original = highlight(cell.text || "원본 셀 빈칸", cell.passage === id ? quote : null);
+        body.append(original);
+        if (cell.passage === id) requestAnimationFrame(() => original.scrollIntoView({ block: "nearest" }));
+      }
+    } else {
+      const text = item.attachment ? item.text : item.body || item.text;
+      body.append(highlight(text, quote || item.text));
+    }
     if (mail && item.attachments.length) {
       const attachments = node("ul");
       body.append(node("h3", "첨부"), attachments);
@@ -397,6 +409,14 @@ function showAnswer(data) {
     }
     box.append(paragraph);
   }
+  if (data.pcf_coverage) {
+    const coverage = data.pcf_coverage;
+    box.append(node("p", "전체 " + coverage.expected + "셀 중 " + coverage.included + "셀 처리", "answer-status"));
+    if (coverage.split && !coverage.synthesized) box.append(node("p", "나누어 처리한 구간별 답변입니다.", "answer-status"));
+    if (coverage.failed) box.append(node("p", "일부 API 호출을 완료하지 못했습니다.", "answer-status"));
+    for (const warning of coverage.warnings || []) box.append(node("p", warning, "answer-status"));
+    for (const unknown of data.unknowns || []) box.append(node("p", "확인 필요 · " + unknown, "answer-status"));
+  }
   box.hidden = false;
 }
 
@@ -426,6 +446,13 @@ function showReview(data, pcf) {
   element("review-question").textContent = data.question;
   const excerpts = element("review-excerpts");
   excerpts.replaceChildren();
+  if (data.pcf_coverage) {
+    const coverage = data.pcf_coverage;
+    excerpts.append(node("p", "전체 " + coverage.expected + "셀 중 " + coverage.included +
+      "셀 선택 가능 · 전체 선택 시 최대 " + coverage.calls + "회 호출", "answer-status"));
+    if (coverage.revision) excerpts.append(node("p", "Rev. " + coverage.revision, "answer-status"));
+    for (const warning of coverage.warnings) excerpts.append(node("p", warning, "answer-status"));
+  }
   for (const excerpt of data.excerpts) {
     const card = node("div", "", "review-excerpt");
     const label = node("label", "", "review-choice");
@@ -441,12 +468,41 @@ function showReview(data, pcf) {
     const original = node("button", "원문 보기", "text-button");
     original.type = "button";
     original.addEventListener("click", () => openEvidence(title.passage));
-    card.append(label, original, node("p", excerpt.text));
+    card.append(label, original, node("p", excerpt.text || "원본 셀 빈칸"));
     excerpts.append(card);
   }
   reviewSend.disabled = false;
   reviewBox.hidden = false;
   reviewBox.scrollIntoView({ block: "nearest" });
+}
+
+async function previewAnswer(route, payload, active, pcf) {
+  const data = await call(route, payload, active.signal);
+  if (active.signal.aborted) return;
+  if (data.review) {
+    notice("");
+    element("result-section").hidden = true;
+    showReview(data, pcf);
+    return;
+  }
+  showResults(data.results, "근거 후보");
+  notice(data.pcf_issue || "답변에 보낼 발췌문을 찾지 못했습니다.");
+  if (!data.choose_case) return;
+  const choices = element("results").querySelectorAll(".result");
+  data.results.forEach((result, index) => {
+    const button = node("button", "이 COMMENT으로 답변", "text-button");
+    button.type = "button";
+    choices[index].after(button);
+    button.addEventListener("click", async () => {
+      request?.abort();
+      const next = request = new AbortController();
+      try {
+        await previewAnswer(route, { ...payload, passage: result.passage }, next, pcf);
+      } catch (error) {
+        if (!next.signal.aborted) notice(error.message);
+      }
+    });
+  });
 }
 
 element("query").addEventListener("input", clearSearch);
@@ -468,15 +524,7 @@ form.addEventListener("submit", async (event) => {
   notice(ask ? "답변에 쓸 근거를 찾고 있습니다." : "검색 중입니다.");
   try {
     if (ask) {
-      const data = await call(pcf ? "/api/pcf/preview" : "/api/external/preview", payload, active.signal);
-      if (active.signal.aborted) return;
-      if (data.review) {
-        notice("");
-        showReview(data, pcf);
-      } else {
-        showResults(data.results, "근거 후보");
-        notice("답변에 보낼 발췌문을 찾지 못했습니다.");
-      }
+      await previewAnswer(pcf ? "/api/pcf/preview" : "/api/external/preview", payload, active, pcf);
     } else {
       const data = await call("/api/search", payload, active.signal);
       if (active.signal.aborted) return;
