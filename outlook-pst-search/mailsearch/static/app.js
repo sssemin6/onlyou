@@ -387,7 +387,7 @@ function showAnswer(data) {
   const box = element("answer");
   const statuses = {
     answered: "선택한 근거로 찾은 답변", partial: "일부 근거만 확인했습니다",
-    ambiguous: "여러 건이 해당합니다. 품번이나 기간을 질문에 추가해 주세요.",
+    ambiguous: data.claims.length ? "근거에 서로 다른 내용이 있습니다. 각 원문을 확인해 주세요." : "여러 건이 해당합니다. 품번이나 기간을 질문에 추가해 주세요.",
     insufficient: "검색된 자료에서 답을 확인하지 못했습니다.",
     model_busy: "로컬 AI가 다른 질문을 처리 중입니다. 잠시 후 다시 시도하세요.",
     model_not_configured: "로컬 AI 모델을 연결하면 근거를 바탕으로 답변할 수 있습니다.",
@@ -468,7 +468,12 @@ function showReview(data, pcf) {
     const original = node("button", "원문 보기", "text-button");
     original.type = "button";
     original.addEventListener("click", () => openEvidence(title.passage));
-    card.append(label, original, node("p", excerpt.text || "원본 셀 빈칸"));
+    card.append(label, original);
+    if (excerpt.context) {
+      const { subject, sender, sent, attachment, location } = excerpt.context;
+      card.append(node("p", "함께 전송 · " + [subject, sender, sent, attachment, location].filter(Boolean).join(" · ")));
+    }
+    card.append(node("p", excerpt.text || "원본 셀 빈칸"));
     excerpts.append(card);
   }
   reviewSend.disabled = false;
