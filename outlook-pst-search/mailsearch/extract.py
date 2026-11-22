@@ -1,4 +1,5 @@
 """Extract searchable text and preserve attachment locations."""
+import hashlib
 import io
 import os
 import re
@@ -14,6 +15,8 @@ from email.utils import parsedate_to_datetime
 from html.parser import HTMLParser
 from pathlib import Path, PurePosixPath
 from xml.etree import ElementTree as ET
+
+from .pcf import word_comments, word_metadata
 
 MAX_MAIL = 180 * 1024**2
 MAX_ATTACHMENT = 25 * 1024**2
@@ -120,18 +123,23 @@ def xml_member(zipped, name):
     return ET.fromstring(data)
 
 
-def office_text(data, suffix):
+def office_text(data, suffix, *, structure=None, check=lambda: None):
     with zipfile.ZipFile(io.BytesIO(data)) as zipped:
         members = zipped.infolist()
         if len(members) > 3000 or sum(x.file_size for x in members if x.filename.endswith((".xml", ".rels"))) > MAX_XML_TOTAL:
             raise ValueError("office_size")
         if suffix == ".docx":
             root = xml_member(zipped, "word/document.xml")
+            if structure is not None:
+                structure["comments"], structure["warnings"] = word_comments(root, check)
             lines = [
                 "".join(t.text or "" for t in para.iter() if local_name(t.tag) == "t")
                 for para in root.iter() if local_name(para.tag) == "p"
             ]
-            yield "본문", "\n".join(lines)
+            text = "\n".join(lines)
+            if structure is not None:
+                structure.update(word_metadata(text))
+            yield "본문", text
             return
         book = xml_member(zipped, "xl/workbook.xml")
         rels = xml_member(zipped, "xl/_rels/workbook.xml.rels")
@@ -181,17 +189,21 @@ def office_binary():
     return None
 
 
-def convert_legacy(source, suffix, temporary):
+def convert_legacy(source, suffix, temporary, *, content=None):
     """Convert a legacy Office file to its OOXML form without running the original."""
     binary = office_binary()
     if not binary:
         return None, "변환기 미설치(구형 Office)"
     with tempfile.TemporaryDirectory(dir=temporary, prefix="convert-") as directory:
         target = Path(directory) / ("input" + suffix)
-        shutil.copyfile(source, target)
+        if content is None:
+            shutil.copyfile(source, target)
+        else:
+            target.write_bytes(content)
         try:
             subprocess.run(
-                [binary, "--headless", "--convert-to", LEGACY_SUFFIXES[suffix], "--outdir", directory, str(target)],
+                [binary, "-env:UserInstallation=" + (target.parent / "profile").as_uri(),
+                 "--headless", "--convert-to", LEGACY_SUFFIXES[suffix].lstrip("."), "--outdir", directory, str(target)],
                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                 timeout=90, check=True, creationflags=CREATE_FLAGS,
             )
@@ -200,7 +212,8 @@ def convert_legacy(source, suffix, temporary):
         converted = Path(directory) / ("input" + LEGACY_SUFFIXES[suffix])
         if not converted.is_file():
             return None, "추출 실패 또는 암호화"
-        return converted.read_bytes(), None
+        with converted.open("rb") as output:
+            return output.read(MAX_ATTACHMENT + 1), None
 
 
 def tesseract_binary():
@@ -275,7 +288,7 @@ def pdf_pages(input_pdf, pages, check):
     return locations, status
 
 
-def extract_bytes(content, suffix, temporary, pdf_command, *, check=lambda: None):
+def extract_bytes(content, suffix, temporary, pdf_command, *, check=lambda: None, structure=None):
     """(status, [(location, text)]) for document bytes; never raises."""
     if suffix not in {".txt", ".pdf", ".docx", ".xlsx"}:
         return "미지원 형식", []
@@ -307,7 +320,7 @@ def extract_bytes(content, suffix, temporary, pdf_command, *, check=lambda: None
                     pages.pop()
                 locations, ocr_status = pdf_pages(input_pdf, pages, check)
         else:
-            locations = office_text(content, suffix)
+            locations = office_text(content, suffix, structure=structure, check=check)
         result = []
         remaining = MAX_TEXT
         limited = suffix == ".pdf" and (len(buffer) > MAX_TEXT * 4 or len(pages) >= 800)
@@ -321,7 +334,7 @@ def extract_bytes(content, suffix, temporary, pdf_command, *, check=lambda: None
             limited |= len(text) > remaining
             result.append((location, text[:remaining]))
             remaining -= len(text[:remaining])
-        if not result:
+        if not result and not (structure and structure.get("comments")):
             return ocr_status or "텍스트 없음", result
         return ("일부 색인" if limited else ocr_status or "완료"), result
     except (ValueError, OSError, KeyError, IndexError, RuntimeError, ET.ParseError,
@@ -329,23 +342,42 @@ def extract_bytes(content, suffix, temporary, pdf_command, *, check=lambda: None
         return "추출 실패 또는 암호화", []
 
 
-def extract_document(path, temporary, pdf_command, *, check=lambda: None):
+def extract_document(path, temporary, pdf_command, *, check=lambda: None, structure=None):
     """(status, [(location, text)]) for a standalone document file."""
     suffix = path.suffix.lower()
     if suffix not in DOCUMENT_SUFFIXES:
         return "미지원 형식", []
-    if suffix in LEGACY_SUFFIXES:
-        content, failure = convert_legacy(path, suffix, temporary)
-        if content is None:
-            return failure, []
-        return extract_bytes(content, LEGACY_SUFFIXES[suffix], temporary, pdf_command, check=check)
     try:
-        if path.stat().st_size > MAX_ATTACHMENT:
+        with path.open("rb") as original:
+            content = original.read(MAX_ATTACHMENT + 1)
+        if len(content) > MAX_ATTACHMENT:
             return "용량 초과", []
-        content = path.read_bytes()
+        if structure is not None:
+            structure.update(schema_version=1, parser_version="pcf-word-v1",
+                             source_version=hashlib.sha256(content).hexdigest(),
+                             converter="LibreOffice" if suffix == ".doc" else None)
+        if suffix in LEGACY_SUFFIXES:
+            content, failure = convert_legacy(path, suffix, temporary, content=content)
+            if content is None:
+                return failure, []
+            suffix = LEGACY_SUFFIXES[suffix]
     except OSError:
         return "추출 실패 또는 암호화", []
-    return extract_bytes(content, suffix, temporary, pdf_command, check=check)
+    status, locations = extract_bytes(content, suffix, temporary, check=check, pdf_command=pdf_command,
+                                      structure=structure)
+    if structure is not None and "comments" in structure:
+        size = sum(len(cell["text"]) + len(cell["label"])
+                   for case in structure["comments"] for row in case["rows"]
+                   for cell in (row["owner"], row["yard"]) if cell)
+        count = sum(len(case["rows"]) for case in structure["comments"])
+        if size > MAX_TEXT or count > MAX_LOCATIONS:
+            structure["comments"] = []
+            structure["warnings"].append("PCF 표 크기 한도 초과")
+        if structure["warnings"] or any(case["warnings"] for case in structure["comments"]):
+            status = "일부 색인 · PCF 표 확인 필요"
+        elif not structure["comments"]:
+            status = "일부 색인 · PCF 표를 찾지 못함"
+    return status, locations
 
 
 def extract_attachment(name, part, temporary, pdf_command, *, check=lambda: None):
