@@ -1,6 +1,7 @@
 """Loopback-only web application."""
 import argparse
 import datetime
+import hashlib
 import hmac
 import http.client
 import json
@@ -16,12 +17,14 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from .answer import (PCF_INSTRUCTIONS, LocalAI, pcf_retrieval, delivery_date_answer,
+from .answer import (PCF_INSTRUCTIONS, LocalAI, map_citations, pcf_candidates, pcf_retrieval, pcf_word, delivery_date_answer,
                      evidence_for, merge_rows, public_row, validate)
 from .bundled import prepare as prepare_bundled
-from .external import DEFAULT_MODEL, DEFAULT_URL, MAX_EXCERPTS, ExternalAI, ExternalRequestError, Reviews
+from .external import DEFAULT_MODEL, DEFAULT_URL, MAX_EXCERPTS, MAX_PCF_CELLS, ExternalAI, ExternalRequestError, Reviews, pcf_batches, pcf_input_fits
+from .extract import MAX_ATTACHMENT
 from .filesystem import local_path
 from .indexer import ImportIssue, Indexer
+from .pcf import PCF_CELL
 from .store import Store, normalized, query_words, quoted_plan
 
 STATIC = Path(__file__).with_name("static")
@@ -212,8 +215,15 @@ class Handler(BaseHTTPRequestHandler):
             if row is None:
                 self.send_json(404, {"error": "evidence_missing"})
             else:
-                self.send_json(200, {**public_row(row), "text": row["text"], "body": row["body"],
-                                     "start": row["start"], "attachments": row["attachments"]})
+                case = self.server.store.pcf_case(row)
+                payload = {**public_row(row), "text": row["text"], "body": row["body"],
+                           "start": row["start"], "attachments": row["attachments"]}
+                if case:
+                    payload["pcf"] = {"number": case["number"], "warnings": case["warnings"], "revision": case["revision"],
+                                      "cells": [{**item["pcf_cell"], "location": item["location"],
+                                                 "passage": item["passage"], "text": item["text"]}
+                                                for item in case["rows"]]}
+                self.send_json(200, payload)
         else:
             self.send_json(404, {"error": "not_found"})
 
@@ -273,7 +283,9 @@ class Handler(BaseHTTPRequestHandler):
             tokens = query_words(query, fuzzy=True)[:8]
             distinct = {}
             for row in rows:
-                shown = distinct.setdefault(row["fingerprint"], public_row(row))
+                cell = PCF_CELL.fullmatch(row["location"]) if filters.get("tab") == "pcf" else None
+                key = (row["id"], cell[1]) if cell else row["fingerprint"]
+                shown = distinct.setdefault(key, public_row(row))
                 if "similarity" in row and shown.get("similarity") is None:
                     shown["similarity"] = round(row["similarity"], 3)
                 if shown.get("matched") is None:
@@ -293,7 +305,10 @@ class Handler(BaseHTTPRequestHandler):
         pcf = route == "/api/pcf/preview"
         if pcf:
             filters["tab"] = "pcf"
+            if self.preview_pcf_word(payload.get("passage"), query, context, filters, external):
+                return
             evidence, mode = pcf_retrieval(store, ai, query, filters, context)
+            evidence = [row for row in evidence if not pcf_word(row)]
         else:
             evidence, mode = evidence_for(store, ai, query, filters, context,
                                           semantic=(route in {"/api/answer", "/api/external/preview"}))
@@ -334,6 +349,164 @@ class Handler(BaseHTTPRequestHandler):
                 self.server.generation.release()
         self.send_json(200, {**result, "results": rows, "retrieval": mode})
 
+    def preview_pcf_word(self, passage, question, context, filters, external):
+        store = self.server.store
+        if passage is not None:
+            if type(passage) is not int or not 1 <= passage < 10**16:
+                raise ValueError("passage")
+            hits, number = store.passages([passage], filters), None
+        else:
+            hits, number = pcf_candidates(store, self.server.ai, question, filters, context)
+        seeds = {}
+        for hit in hits:
+            match = PCF_CELL.fullmatch(hit["location"])
+            if match:
+                seeds.setdefault((hit["id"], match[1]), hit)
+        if not seeds and passage is None:
+            if number is None and not any(pcf_word(row) for row in hits):
+                return False
+            if number is not None:
+                return False
+        if len(seeds) != 1:
+            self.send_json(200, {
+                "results": [public_row(row) for row in seeds.values()] or [public_row(row) for row in hits[:10]],
+                "choose_case": bool(seeds), "pcf_issue": "COMMENT을 선택하세요." if seeds else
+                "구조화된 COMMENT을 찾지 못했습니다. 색인 상태와 원본 표를 확인하세요.",
+            })
+            return True
+        seed = next(iter(seeds.values()))
+        case = store.pcf_case(seed, filters)
+        if case is None:
+            self.send_json(409, {"error": "external_source_changed"})
+            return True
+        rows = case.pop("rows")
+        case["cells"] = {row["passage"]: row["pcf_cell"] for row in rows}
+        results = [public_row(row) for row in rows]
+        budget = external.pcf_budget
+        if not budget:
+            self.send_json(200, {"results": [public_row(seed)], "pcf_issue":
+                                 "PCF 전체 답변은 등록된 사내 API 주소에서 사용할 수 있습니다. 원문은 열 수 있습니다."})
+            return True
+        token, review = self.server.reviews.create(
+            question, rows, external.review_generation, pcf=True, case=case)
+        try:
+            batches = pcf_batches(question, review.excerpts, case, budget)
+        except ValueError:
+            self.server.reviews.take(token)
+            self.send_json(200, {"results": [public_row(seed)], "pcf_issue":
+                                 "이 COMMENT은 현재 전송 한도를 초과합니다. 셀 원문을 확인할 수 있습니다."})
+            return True
+        self.send_json(200, {
+            **external.public, "review": token, "question": question, "results": results,
+            "pcf_coverage": {"expected": case["expected"], "included": len(rows),
+                             "calls": len(batches) + (len(batches) > 1), "warnings": case["warnings"],
+                             "revision": case["revision"]},
+            "excerpts": [{"id": item.number, "text": item.text, "source": source}
+                         for item, source in zip(review.excerpts, results)],
+        })
+        return True
+
+    def send_pcf_word(self, external, review, excerpts):
+        store = self.server.store
+        ids = [item.passage for item in excerpts]
+        case = review.case
+
+        def visible():
+            rows = store.passages(ids, {"tab": "pcf"})
+            if len(rows) != len(ids):
+                return {}
+            try:
+                row = rows[0]
+                root = Path(row["path"])
+                original = local_path(root / row["item"] if root.is_dir() else root, strict=True)
+                if original != root and not original.is_relative_to(root):
+                    return {}
+                with original.open("rb") as handle:
+                    digest = hashlib.sha256(handle.read(MAX_ATTACHMENT + 1)).hexdigest()
+                if digest != case["source_version"]:
+                    return {}
+            except (OSError, ValueError, RuntimeError):
+                return {}
+            return {row["passage"]: row for row in rows}
+
+        budget = external.pcf_budget
+        if not budget:
+            self.send_json(409, {"error": "external_review_expired"})
+            return
+        try:
+            batches = pcf_batches(review.question, excerpts, case, budget)
+        except ValueError:
+            self.send_json(400, {"error": "pcf_input_too_large"})
+            return
+        passage_by_number = {item.number: item.passage for item in excerpts}
+        claims, unknowns, results, statuses, used_lengths = [], [], {}, [], {}
+        failed = False
+        for batch in batches:
+            if not visible():
+                self.send_json(409, {"error": "external_source_changed"})
+                return
+            mapping = {item["source"]: passage_by_number[item["source"]] for item in batch["evidence"]}
+            try:
+                result = map_citations(external.answer_pcf(batch), mapping)
+            except (OSError, ValueError, RuntimeError, KeyError, IndexError, TypeError, http.client.HTTPException):
+                failed = True
+                break
+            rows = visible()
+            if not rows:
+                self.send_json(409, {"error": "external_source_changed"})
+                return
+            verified = []
+            for item in batch["evidence"]:
+                passage = mapping[item["source"]]
+                row = rows[passage]
+                verified.append({**row, "text": item["text"], "pcf_cell": case["cells"][passage]})
+                used_lengths[passage] = used_lengths.get(passage, 0) + len(item["text"])
+                results[passage] = public_row(row)
+            checked = validate(result, verified, review.question, text_for=lambda row: row["text"],
+                               pcf=True, claim_limit=12, complete=batch["coverage"]["complete"])
+            statuses.append(checked["status"])
+            for claim in checked["claims"]:
+                if claim not in claims:
+                    claims.append(claim)
+            if isinstance(result, dict) and isinstance(result.get("unknowns"), list):
+                unknowns.extend(value[:220] for value in result["unknowns"][:8] if isinstance(value, str))
+        if not visible():
+            self.send_json(409, {"error": "external_source_changed"})
+            return
+        included = sum(used_lengths.get(item.passage, -1) == len(item.text) for item in excerpts)
+        status = statuses[0] if len(batches) == 1 and statuses else "insufficient"
+        if claims and (len(batches) > 1 or not batches[0]["coverage"]["complete"] or unknowns):
+            status = "partial"
+        synthesized = False
+        calls = len(statuses)
+        if len(batches) > 1 and claims and not failed and included == case["expected"] and not case["warnings"]:
+            rows = visible()
+            if not rows:
+                self.send_json(409, {"error": "external_source_changed"})
+                return
+            try:
+                combined = combine_pcf_findings(external, review, rows, claims, budget)
+            except (OSError, ValueError, RuntimeError, KeyError, IndexError, TypeError, http.client.HTTPException):
+                failed = True
+                combined = None
+            if not visible():
+                self.send_json(409, {"error": "external_source_changed"})
+                return
+            if combined is not None:
+                calls += 1
+                if combined["claims"]:
+                    synthesized = True
+                    claims, unknowns, status = combined["claims"], combined["unknowns"], combined["status"]
+        if failed and not statuses:
+            status = "external_unavailable"
+        self.send_json(200, {
+            "status": status, "claims": claims, "unknowns": list(dict.fromkeys(unknowns))[:8],
+            "results": list(results.values()), "provider": "external",
+            "pcf_coverage": {"included": included, "expected": case["expected"], "calls": calls,
+                             "warnings": case["warnings"], "failed": failed,
+                             "split": len(batches) > 1, "synthesized": synthesized},
+        })
+
     def send_external(self, payload, pcf=False):
         server = self.server
         if not server.external:
@@ -341,7 +514,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         token, selected = payload.get("review"), payload.get("excerpts")
         if (not isinstance(token, str) or not re.fullmatch(r"[\w-]{32}", token, re.ASCII)
-                or not isinstance(selected, list) or not 1 <= len(selected) <= MAX_EXCERPTS
+                or not isinstance(selected, list) or not 1 <= len(selected) <= (MAX_PCF_CELLS if pcf else MAX_EXCERPTS)
                 or any(type(number) is not int for number in selected)):
             raise ValueError("external_review")
         if not server.outbound.acquire(blocking=False):
@@ -358,6 +531,11 @@ class Handler(BaseHTTPRequestHandler):
                 return
             excerpts = [item for item in review.excerpts if item.number in selected]
             if len(excerpts) != len(selected):
+                raise ValueError("external_excerpts")
+            if review.case is not None:
+                self.send_pcf_word(external, review, excerpts)
+                return
+            if len(excerpts) > MAX_EXCERPTS:
                 raise ValueError("external_excerpts")
             ids = [item.passage for item in excerpts]
             scope = {"tab": "pcf"} if pcf else {}
@@ -434,6 +612,40 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(200, {"ok": True})
         finally:
             server.outbound.release()
+
+
+
+def combine_pcf_findings(external, review, rows, claims, budget):
+    """Combine verified batches using only their cited original excerpts."""
+    evidence, findings, verified, source_ids = [], [], [], {}
+    for claim in claims:
+        ids = []
+        for ref in claim["citations"]:
+            passage, quote = ref["passage"], ref["quote"]
+            key = (passage, quote)
+            if key not in source_ids:
+                source = len(evidence) + 1
+                source_ids[key] = source
+                meta = review.case["cells"][passage]
+                evidence.append({"source": source, "case": "C1", **meta, "text": quote})
+                verified.append({**rows[passage], "passage": source, "text": quote, "pcf_cell": meta})
+            ids.append(source_ids[key])
+        findings.append({"sources": ids})
+    content = {"question": review.question, "coverage": {"complete": True},
+               "verified_findings": findings, "evidence": evidence}
+    if not pcf_input_fits(content, budget):
+        return None
+    result = external.answer_pcf(content)
+    checked = validate(result, verified, review.question, text_for=lambda row: row["text"], pcf=True, claim_limit=12)
+    original_by_source = {source: key[0] for key, source in source_ids.items()}
+    for claim in checked["claims"]:
+        for ref in claim["citations"]:
+            ref["passage"] = original_by_source[ref["passage"]]
+    unknowns = result.get("unknowns", []) if isinstance(result, dict) else []
+    checked["unknowns"] = [value[:220] for value in unknowns[:8] if isinstance(value, str)] if isinstance(unknowns, list) else []
+    if checked["unknowns"] and checked["status"] == "answered":
+        checked["status"] = "partial"
+    return checked
 
 
 def main(argv=None):
