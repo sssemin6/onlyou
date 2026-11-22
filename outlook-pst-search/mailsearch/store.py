@@ -340,6 +340,8 @@ class Store:
         clauses = [VISIBLE_VERSION, "m.source IN (SELECT value FROM json_each(?))",
                    "CASE WHEN m.kind<>'mail' THEN document_readable(s.path,m.item) ELSE 1 END"]
         params = [json.dumps(ids)]
+        if filters.get("regular_only"):
+            clauses.append("m.kind IN ('mail','document')")
         for name, col in {"sender": "m.sender", "recipient": "m.recipient", "subject": "m.subject"}.items():
             if filters.get(name):
                 clauses.append(f"instr(lower({col}),lower(?))>0")
@@ -568,20 +570,26 @@ class Store:
         where, params = self.scope(filters)
         with self.connection() as conn:
             # Exact cosine for small indexes. Limit comparisons for large archives.
-            total = len(conn.execute("SELECT passage FROM vectors WHERE model=? LIMIT 2001", (model,)).fetchall())
-            candidate_clause = ""
-            options = []
-            if total > 2000:
-                probes = [candidate for bucket in buckets(vector) for candidate in (bucket, *(bucket ^ (1 << n) for n in range(11)))]
-                candidate_clause = """ AND v.passage IN (
-                    SELECT passage FROM vector_buckets WHERE model=? AND bucket IN (SELECT value FROM json_each(?))
-                    GROUP BY passage ORDER BY count(*) DESC,passage DESC LIMIT 2400)"""
-                options = [model, json.dumps(probes)]
+            scoped = f"""FROM sources s JOIN mails m ON m.source=s.id CROSS JOIN passages p ON p.mail=m.id
+                         CROSS JOIN vectors v ON v.passage=p.id AND v.model=? WHERE {where}"""
+            ids = conn.execute("SELECT p.id " + scoped + " LIMIT 2001", (model, *params)).fetchall()
+            if len(ids) <= 2000:
+                chosen = [row[0] for row in ids]
+            else:
+                probes = [candidate for bucket in buckets(vector)
+                          for candidate in (bucket, *(bucket ^ (1 << n) for n in range(11)))]
+                ranked = conn.execute(
+                    f"""SELECT b.passage FROM vector_buckets b JOIN passages p ON p.id=b.passage
+                        JOIN mails m ON m.id=p.mail {JOIN}
+                        WHERE b.model=? AND b.bucket IN (SELECT value FROM json_each(?)) AND {where}
+                        GROUP BY b.passage ORDER BY count(*) DESC,b.passage DESC LIMIT 2400""",
+                    (model, json.dumps(probes), *params),
+                )
+                chosen = [row[0] for row in ranked]
             vectors = conn.execute(
-                f"""SELECT v.passage,v.value FROM vectors v JOIN passages p ON p.id=v.passage
-                    JOIN mails m ON m.id=p.mail {JOIN} WHERE v.model=? AND {where}{candidate_clause}""",
-                (model, *params, *options),
-            ).fetchall()
+                "SELECT passage,value FROM vectors WHERE model=? AND passage IN (SELECT value FROM json_each(?))",
+                (model, json.dumps(chosen)),
+            )
             scores = []
             for row in vectors:
                 if len(row["value"]) != len(vector) * 4:
@@ -646,6 +654,33 @@ class Store:
                 linked.append(row["passage"])
         found = {row["passage"]: row for row in self.passages(linked[:6], filters)}
         return [found[item] for item in linked[:6] if item in found]
+
+    def evidence_context(self, row, filters):
+        """Fetch reviewable context from the same mail part or worksheet."""
+        location = row["location"]
+        sheet, sep, cells = location.rpartition("!")
+        is_sheet = sep and re.fullmatch(r"[A-Z]+[0-9]+~[A-Z]+[0-9]+", cells)
+        with self.connection() as conn:
+            base = """SELECT id FROM passages WHERE mail=? AND attachment IS
+                      (SELECT attachment FROM passages WHERE id=?)"""
+            args = (row["id"], row["passage"])
+            if is_sheet:
+                prefix = sheet + "!"
+                base += " AND substr(location,1,length(?))=?"
+                args += (prefix, prefix)
+                queries = [(base + " ORDER BY id LIMIT 2", args),
+                           (base + " AND id<? ORDER BY id DESC LIMIT 1", (*args, row["passage"]))]
+            else:
+                base += " AND location=?"
+                args += (location,)
+                queries = [(base + " AND id>? ORDER BY id LIMIT 1", (*args, row["passage"])),
+                           (base + " AND id<? ORDER BY id DESC LIMIT 1", (*args, row["passage"]))]
+                if location == "본문":
+                    queries.insert(0, (base + " ORDER BY id DESC LIMIT 1", args))
+            ids = dict.fromkeys(item[0] for sql, params in queries for item in conn.execute(sql, params))
+            ids.pop(row["passage"], None)
+            found = {item["passage"]: item for item in self.passages(list(ids), filters, conn)} if ids else {}
+            return [found[key] for key in ids if key in found]
 
     def neighbors(self, mail, passage, conn=None):
         """Passages of the same mail or document directly around the given passage."""
