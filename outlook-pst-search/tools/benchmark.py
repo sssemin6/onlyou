@@ -7,7 +7,7 @@ import tempfile
 import time
 from pathlib import Path
 
-from mailsearch.store import Store
+from mailsearch.store import Store, buckets, pack_vector
 
 
 def percentile_95(samples):
@@ -53,11 +53,48 @@ def run(count, repetitions):
         print(f"Common Korean terms: {len(broad_times)} searches, median {statistics.median(broad_times):.1f} ms, P95 {percentile_95(broad_times):.1f} ms")
 
 
+def scoped_semantic(count, repetitions):
+    """Tie every bucket to reproduce candidate starvation across archives."""
+    vector = [1., 0.] * 48
+    packed, bands = pack_vector(vector), list(buckets(vector))
+    with tempfile.TemporaryDirectory(prefix="semantic-scope-") as directory:
+        root = Path(directory)
+        store = Store(root / "index")
+        targets = []
+        middle = count // 10
+        for name, size in (("small", 20), ("medium", middle), ("large", count - middle - 20)):
+            folder = root / name
+            folder.mkdir()
+            with store.connection() as conn:
+                source = conn.execute("INSERT INTO sources(path,kind,active) VALUES(?,'eml_dir',1)", (str(folder),)).lastrowid
+                for number in range(size):
+                    mail = store.add_mail(conn, source, 1, str(number), {
+                        "subject": "common", "sender": name, "recipient": "", "sent": "", "folder": "/",
+                        "attachments": [], "message_id": "", "reply_ids": "", "body": "shared evidence",
+                    })
+                    passage = conn.execute("SELECT id FROM passages WHERE mail=?", (mail,)).fetchone()[0]
+                    conn.execute("INSERT INTO vectors VALUES(?,'demo',?)", (passage, packed))
+                    conn.executemany("INSERT INTO vector_buckets VALUES('demo',?,?)", [(band, passage) for band in bands])
+            if name != "large":
+                targets.append((name, source))
+        for name, source in targets:
+            times = []
+            for _ in range(repetitions + 1):
+                start = time.perf_counter()
+                rows = store.semantic(vector, "demo", {"source": source}, limit=20)
+                times.append((time.perf_counter() - start) * 1000)
+            hits = sum(row["source"] == source for row in rows)
+            print(f"{name}: {hits}/20 scoped hits, warm P95 {percentile_95(times[1:]):.1f} ms")
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--count", type=int, default=50_000)
     parser.add_argument("--repetitions", type=int, default=100)
+    parser.add_argument("--semantic-scope", action="store_true", help="Measure filtered vector search with colliding buckets")
     args = parser.parse_args()
     if args.count < 1 or args.repetitions < 1:
         parser.error("Benchmark parameters must be positive")
-    run(args.count, args.repetitions)
+    if args.semantic_scope and args.count < 25000:
+        parser.error("Use at least 25000 passages to exercise both scoped search paths")
+    (scoped_semantic if args.semantic_scope else run)(args.count, args.repetitions)
