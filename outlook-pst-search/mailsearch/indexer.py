@@ -11,7 +11,8 @@ from pathlib import Path
 
 from .extract import CREATE_FLAGS, DOCUMENT_SUFFIXES, extract_attachment, extract_document, parse_mail
 from .filesystem import local_path, stable_input
-from .store import buckets, document_identity, now, pack_vector, read_signature, sections, vector_array
+from .pcf import WORD_SUFFIXES
+from .store import buckets, document_kind, document_identity, now, pack_vector, read_signature, sections, vector_array
 
 
 NO_MAIL = {"pst_no_mail", "eml_no_mail"}
@@ -426,16 +427,18 @@ class Indexer:
                 if conn.execute("SELECT 1 FROM problems WHERE source=? AND version=? AND item=?", (source, version, item)).fetchone():
                     continue
                 if path.suffix.lower() in DOCUMENT_SUFFIXES:
+                    structured = {} if (path.suffix.lower() in WORD_SUFFIXES and document_kind(path.name) == "pcf") else None
                     try:
-                        status, locations = extract_document(path, workspace, self.pdf, check=lambda: self.check(event))
+                        status, locations = extract_document(
+                            path, workspace, self.pdf, check=lambda: self.check(event), structure=structured)
                     except OSError:
                         status, locations = "추출 실패 또는 암호화", []
-                    if not locations:
+                    if not locations and not (structured and structured.get("comments")):
                         conn.execute("INSERT INTO problems VALUES(?,?,?,?)", (source, version, item, status))
                         conn.execute("UPDATE sources SET omitted=omitted+1 WHERE id=?", (source,))
                     else:
                         doc = {"name": path.name, "folder": folder, "sent": document_date(path),
-                               "status": status, "sections": locations}
+                               "status": status, "sections": locations, "pcf": structured}
                         adopted = previous is not None and self.store.try_adopt(
                             conn, source, previous, version, item, document_identity(doc))
                         if adopted:
