@@ -613,7 +613,7 @@ function setSettingsBusy(busy) {
 
 function renderSettings() {
   const gateway = settingsProvider.value === "intranet";
-  element("settings-generic").hidden = hd;
+  element("settings-generic").hidden = gateway;
   element("settings-gateway").hidden = !gateway;
   element("settings-url").required = !gateway;
   element("settings-model").required = !gateway;
@@ -667,8 +667,13 @@ element("settings-open").addEventListener("click", async () => {
   element("settings-key").value = "";
   setSettingsBusy(true);
   settingsDialog.showModal();
+  const loading = new AbortController();
+  const timeout = setTimeout(() => loading.abort(), 10000);
   try {
-    const [internal, external] = await Promise.all([call("/api/intranet/settings"), call("/api/external/settings")]);
+    const [internal, external] = await Promise.all([
+      call("/api/intranet/settings", undefined, loading.signal),
+      call("/api/external/settings", undefined, loading.signal),
+    ]);
     if (version !== settingsRequest || !settingsDialog.open) return;
     gatewaySettings = internal;
     genericSettings = external;
@@ -678,7 +683,14 @@ element("settings-open").addEventListener("click", async () => {
     setSettingsBusy(false);
     element("settings-key").focus();
   } catch (error) {
-    if (version === settingsRequest && settingsDialog.open) settingsMessage(error.message);
+    if (version !== settingsRequest || !settingsDialog.open) return;
+    element("settings-current").textContent = "API 설정을 불러오지 못했습니다.";
+    settingsMessage(error.name === "AbortError"
+      ? "응답 시간이 초과되었습니다. 설정 창을 닫고 다시 열어 주세요."
+      : error.message + " 설정 창을 닫고 다시 열어 주세요.");
+  } finally {
+    clearTimeout(timeout);
+    loading.abort();
   }
 });
 settingsProvider.addEventListener("change", () => {
