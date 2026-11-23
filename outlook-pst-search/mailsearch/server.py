@@ -5,6 +5,7 @@ import hashlib
 import hmac
 import http.client
 import json
+import logging
 import os
 import re
 import secrets
@@ -13,18 +14,20 @@ import sys
 import threading
 import time
 import webbrowser
+from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from urllib.parse import urlsplit
 
 from .answer import (PCF_INSTRUCTIONS, LocalAI, map_citations, pcf_candidates, pcf_retrieval, pcf_word, delivery_date_answer,
                      evidence_for, merge_rows, public_row, validate)
-from .embedding import ENDPOINT as EMBEDDING_ENDPOINT, MODEL as BGE_MODEL
+from .embedding import MODEL as BGE_MODEL, gateway_origin, logger as gateway_logger
 from .external import DEFAULT_MODEL, DEFAULT_URL, MAX_EXCERPTS, MAX_INTERNAL_EXCERPTS, MAX_PCF_CELLS, ExternalAI, ExternalRequestError, Reviews, pcf_batches, pcf_input_fits
 from .extract import MAX_ATTACHMENT
 from .filesystem import local_path
 from .indexer import ImportIssue, Indexer
-from .intranet import CHAT_URL, DEFAULTS as HD_DEFAULTS, MODELS as HD_MODELS, IntranetAI, LOCAL_EMBEDDING
+from .intranet import CHAT_PATH, LOCAL_EMBEDDING, IntranetAI, available_models
 from .pcf import PCF_CELL
 from .store import Store, normalized, pack_vector, query_words, quoted_plan
 
@@ -198,13 +201,13 @@ class Handler(BaseHTTPRequestHandler):
             ids = set(self.server.store.allowed_sources(sources=sources))
             external = self.server.external
             embedding = self.server.ai.embedding_api
-            use_hd = embedding and embedding.index_key
+            use_gateway = embedding and embedding.index_key
             self.send_json(200, {
                 "sources": [{**row, "available": row["id"] in ids,
                              "updates": self.server.indexer.pending_updates(row)} for row in sources],
                 "model": self.server.ai.model,
-                "embedding": embedding.model if use_hd else self.server.ai.embedding_model,
-                "embedding_endpoint": EMBEDDING_ENDPOINT if use_hd else None,
+                "embedding": embedding.model if use_gateway else self.server.ai.embedding_model,
+                "embedding_endpoint": embedding.endpoint if use_gateway else None,
                 "external": external.public if external else None,
             })
         elif route.path == "/api/ping":
@@ -589,7 +592,10 @@ class Handler(BaseHTTPRequestHandler):
     def intranet_settings(self):
         local, current = self.server.ai.embedding_config
         configured = isinstance(current, IntranetAI)
-        selections = dict(current.models if configured else HD_DEFAULTS)
+        models = available_models()
+        origin = gateway_origin()
+        defaults = {"answer": next(iter(models["answer"]), ""), "rerank": "", "embedding": BGE_MODEL if origin else ""}
+        selections = dict(current.models if configured else defaults)
         if not configured and self.server.embedding_selection is not None:
             selections.update(answer="", rerank="", embedding=self.server.embedding_selection)
         if local.split(":")[0] == BGE_MODEL and not (current and current.index_key):
@@ -597,7 +603,7 @@ class Handler(BaseHTTPRequestHandler):
             if not configured:
                 selections["answer"] = ""
         return {
-            "destination": CHAT_URL, "models": HD_MODELS,
+            "destination": origin + CHAT_PATH if origin else "", "models": models,
             "configured": configured,
             "selections": selections,
             "active_answer": configured and current.answer_client is not None and self.server.external is current.answer_client,
@@ -641,7 +647,7 @@ class Handler(BaseHTTPRequestHandler):
                 return
             with server.indexer.lock:
                 if server.indexer.events:
-                    self.send_json(409, {"error": "hd_indexing"})
+                    self.send_json(409, {"error": "gateway_indexing"})
                     return
                 server.ai.configure_embedding(local_model, candidate)
                 server.embedding_selection = LOCAL_EMBEDDING if local_model == BGE_MODEL else ""
@@ -741,6 +747,23 @@ def combine_pcf_findings(external, review, rows, claims, budget):
     return checked
 
 
+@contextmanager
+def gateway_diagnostics(root):
+    try:
+        handler = RotatingFileHandler(root / "api-connection.log", maxBytes=256 * 1024, backupCount=1, encoding="utf-8")
+    except OSError as exc:
+        print(f"Cannot open gateway diagnostic log ({exc.strerror or type(exc).__name__}).", file=sys.stderr)
+        yield
+        return
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    gateway_logger.addHandler(handler)
+    try:
+        yield
+    finally:
+        gateway_logger.removeHandler(handler)
+        handler.close()
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Outlook PST mail search on this PC")
     default_data = Path(os.environ.get("LOCALAPPDATA", Path.home())) / ("OutlookMailSearch" if os.name == "nt" else ".outlook-mail-search")
@@ -766,20 +789,20 @@ def main(argv=None):
     embedding_api = None
     if embedding_key:
         try:
-            models = dict.fromkeys(HD_MODELS, "")
+            models = dict.fromkeys(available_models(), "")
             if not args.embedding_model:
                 models["embedding"] = BGE_MODEL
             elif args.embedding_model.split(":")[0] == BGE_MODEL:
                 models["embedding"] = LOCAL_EMBEDDING
             embedding_api = IntranetAI(embedding_key, models)
         except ValueError:
-            print("Embedding API disabled: check the LITELLM_API_KEY environment variable.", file=sys.stderr)
+            print("Embedding API disabled: check LITELLM_API_KEY and MAILSEARCH_GATEWAY_URL.", file=sys.stderr)
     del embedding_key
     try:
         root = local_path(args.data)
         root.mkdir(mode=0o700, parents=True, exist_ok=True)
         ai = LocalAI(args.model, args.embedding_model, args.ollama_port, embedding_api=embedding_api)
-        with SessionLock(root):
+        with SessionLock(root), gateway_diagnostics(root):
             store = Store(root)
             indexer = Indexer(store, args.readpst, args.pdftotext, ai)
             with App(args.port, store, indexer, ai, external) as app:
