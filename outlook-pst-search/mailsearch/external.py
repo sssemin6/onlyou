@@ -49,7 +49,7 @@ class ExternalAI:
         url = os.environ.get("MAILSEARCH_EXTERNAL_URL") or DEFAULT_URL
         return cls(url, model, key)
 
-    def __init__(self, url, model, key, *, intranet=False):
+    def __init__(self, url, model, key, *, intranet=False, gateway=None, tls=None):
         if not isinstance(url, str) or not 1 <= len(url) <= 512 or any(ord(ch) <= 32 or ord(ch) >= 127 for ch in url):
             raise ValueError("external_url")
         try:
@@ -71,7 +71,8 @@ class ExternalAI:
         self.path = endpoint.path
         self.anthropic = endpoint.path.endswith("/messages")
         self.model = model
-        origin = gateway_origin()
+        origin = gateway_origin(gateway)
+        self.tls = tls
         self.gateway = origin if origin and self.public["destination"] == origin + "/v1/chat/completions" else ""
         self.intranet = intranet and bool(self.gateway)
         self._key = key
@@ -163,7 +164,7 @@ class ExternalAI:
             headers = {"Authorization": f"Bearer {self._key}", "Content-Type": "application/json"}
         if self.gateway:
             try:
-                payload = request_gateway_json(self.gateway, self.path, options, headers, timeout=timeout, max_bytes=MAX_RESPONSE)
+                payload = request_gateway_json(self.gateway, self.path, options, headers, timeout=timeout, max_bytes=MAX_RESPONSE, tls=self.tls)
             except GatewayRequestError as exc:
                 raise ExternalRequestError(exc.status) from exc
         else:
