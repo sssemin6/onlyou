@@ -19,11 +19,12 @@ from urllib.parse import urlsplit
 
 from .answer import (PCF_INSTRUCTIONS, LocalAI, map_citations, pcf_candidates, pcf_retrieval, pcf_word, delivery_date_answer,
                      evidence_for, merge_rows, public_row, validate)
-from .embedding import ENDPOINT as EMBEDDING_ENDPOINT, MODEL as EMBEDDING_MODEL, EmbeddingAPI
+from .embedding import ENDPOINT as EMBEDDING_ENDPOINT
 from .external import DEFAULT_MODEL, DEFAULT_URL, MAX_EXCERPTS, MAX_INTERNAL_EXCERPTS, MAX_PCF_CELLS, ExternalAI, ExternalRequestError, Reviews, pcf_batches, pcf_input_fits
 from .extract import MAX_ATTACHMENT
 from .filesystem import local_path
 from .indexer import ImportIssue, Indexer
+from .intranet import CHAT_URL, DEFAULTS as HD_DEFAULTS, MODELS as HD_MODELS, IntranetAI
 from .pcf import PCF_CELL
 from .store import Store, normalized, query_words, quoted_plan
 
@@ -195,21 +196,25 @@ class Handler(BaseHTTPRequestHandler):
             sources = self.server.store.sources()
             ids = set(self.server.store.allowed_sources(sources=sources))
             external = self.server.external
+            embedding = self.server.ai.embedding_api
+            use_hd = embedding and embedding.index_key
             self.send_json(200, {
                 "sources": [{**row, "available": row["id"] in ids,
                              "updates": self.server.indexer.pending_updates(row)} for row in sources],
                 "model": self.server.ai.model,
-                "embedding": EMBEDDING_MODEL if self.server.ai.embedding_api else self.server.ai.embedding_model,
-                "embedding_endpoint": EMBEDDING_ENDPOINT if self.server.ai.embedding_api else None,
+                "embedding": embedding.model if use_hd else self.server.ai.embedding_model,
+                "embedding_endpoint": EMBEDDING_ENDPOINT if use_hd else None,
                 "external": external.public if external else None,
             })
         elif route.path == "/api/ping":
             self.server.last_seen = time.time()
             self.send_json(200, {"ok": True})
+        elif route.path == "/api/intranet/settings":
+            self.send_json(200, self.intranet_settings())
         elif route.path == "/api/external/settings":
             external = self.server.external
             self.send_json(200, {
-                "configured": external.public if external else None,
+                "configured": external.public if external and not external.intranet else None,
                 "defaults": {"destination": DEFAULT_URL, "model": DEFAULT_MODEL},
             })
         elif re.fullmatch(r"/api/evidence/\d{1,16}", route.path):
@@ -252,6 +257,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.query(route, payload)
             elif route in {"/api/external/send", "/api/pcf/send"}:
                 self.send_external(payload, pcf=route == "/api/pcf/send")
+            elif route == "/api/intranet/settings":
+                self.change_intranet_settings(payload)
             elif route == "/api/external/settings":
                 self.change_external_settings(payload)
             else:
@@ -278,10 +285,12 @@ class Handler(BaseHTTPRequestHandler):
                 rows = store.lexical(query, filters, limit=180)
                 if query and ai.embedding_index:
                     try:
-                        nearby = store.semantic(ai.embed([query], timeout=6)[0], ai.embedding_index, filters)
+                        nearby = ai.semantic_search(store, query, filters)
                         rows = merge_rows(rows, nearby, limit=60)
                     except (OSError, ValueError, RuntimeError, KeyError, IndexError, TypeError, http.client.HTTPException):
                         pass
+            if query and plan is None:
+                rows = ai.rerank_candidates(query, rows)
             tokens = query_words(query, fuzzy=True)[:8]
             distinct = {}
             for row in rows:
@@ -576,6 +585,55 @@ class Handler(BaseHTTPRequestHandler):
             server.outbound.release()
 
 
+    def intranet_settings(self):
+        current = self.server.ai.embedding_api
+        configured = isinstance(current, IntranetAI)
+        return {
+            "destination": CHAT_URL, "models": HD_MODELS,
+            "configured": configured,
+            "selections": current.models if configured else HD_DEFAULTS,
+            "active_answer": configured and current.answer_client is not None and self.server.external is current.answer_client,
+        }
+
+    def change_intranet_settings(self, payload):
+        action = payload.get("action")
+        if action not in ("apply", "test", "disconnect"):
+            raise ValueError("intranet_settings_action")
+        server = self.server
+        if not server.outbound.acquire(blocking=False):
+            self.send_json(409, {"error": "external_busy"})
+            return
+        try:
+            current = server.ai.embedding_api
+            if not isinstance(current, IntranetAI):
+                current = None
+            candidate = None
+            if action != "disconnect":
+                key = payload.get("key", "")
+                if not isinstance(key, str):
+                    raise ValueError("embedding_api_key")
+                try:
+                    candidate = IntranetAI.from_settings(key.strip(), payload.get("selections"), current)
+                except ValueError as exc:
+                    self.send_json(400, {"error": str(exc)})
+                    return
+            if action == "test":
+                self.send_json(200, {"checks": candidate.test_models()})
+                return
+            with server.indexer.lock:
+                if server.indexer.events:
+                    self.send_json(409, {"error": "hd_indexing"})
+                    return
+                server.ai.embedding_api = candidate
+                if candidate and candidate.answer_client:
+                    server.external = candidate.answer_client
+                elif current and server.external is current.answer_client:
+                    server.external = None
+                server.reviews.clear()
+            self.send_json(200, self.intranet_settings())
+        finally:
+            server.outbound.release()
+
     def change_external_settings(self, payload):
         action = payload.get("action")
         if action not in ("apply", "test", "disconnect"):
@@ -585,16 +643,20 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(409, {"error": "external_busy"})
             return
         try:
+            current = server.external
+            if current and current.intranet:
+                current = None
             if action == "disconnect":
-                server.external = None
-                server.reviews.clear()
+                if current:
+                    server.external = None
+                    server.reviews.clear()
                 self.send_json(200, {"configured": None})
                 return
             url, model, key = (payload.get(name, "") for name in ("destination", "model", "key"))
             if not all(isinstance(value, str) for value in (url, model, key)):
                 raise ValueError("external_settings")
             try:
-                external = ExternalAI.from_settings(url.strip(), model.strip(), key.strip(), server.external)
+                external = ExternalAI.from_settings(url.strip(), model.strip(), key.strip(), current)
             except ValueError as exc:
                 self.send_json(400, {"error": str(exc)})
                 return
@@ -682,9 +744,12 @@ def main(argv=None):
         os.environ.pop("MAILSEARCH_EXTERNAL_API_KEY", None)
     embedding_key = os.environ.pop("LITELLM_API_KEY", "")
     embedding_api = None
-    if embedding_key and not args.embedding_model:
+    if embedding_key:
         try:
-            embedding_api = EmbeddingAPI(embedding_key)
+            models = dict.fromkeys(HD_MODELS, "")
+            if not args.embedding_model:
+                models["embedding"] = HD_DEFAULTS["embedding"]
+            embedding_api = IntranetAI(embedding_key, models)
         except ValueError:
             print("Embedding API disabled: check the LITELLM_API_KEY environment variable.", file=sys.stderr)
     del embedding_key
