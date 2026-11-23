@@ -630,6 +630,68 @@ let lastSettingsProvider;
 const settingsDrafts = {};
 const settingsProvider = element("settings-provider");
 const gatewayAdvanced = element("gateway-advanced");
+const ollamaPanel = element("ollama-setup");
+let ollamaRequest = 0;
+
+const ollamaPhases = {
+  checking: "로컬 Ollama 상태를 확인하고 필요하면 실행합니다.",
+  installing: "Ollama를 설치하는 중입니다.",
+  downloading: "BGE-M3를 내려받는 중입니다.",
+};
+const ollamaErrors = {
+  ollama_not_started: "Ollama를 시작하지 못했습니다. 실행 상태를 확인하고 다시 시도하세요.",
+  ollama_install_failed: "Ollama 설치에 실패했습니다. WinGet과 인터넷 연결을 확인하세요.",
+  ollama_model_check_failed: "BGE-M3 보유 여부를 확인하지 못했습니다. Ollama 상태를 확인하세요.",
+  ollama_model_download_failed: "BGE-M3 다운로드에 실패했습니다. 인터넷 연결과 디스크 공간을 확인하세요.",
+};
+
+function renderOllamaSetup(state) {
+  const busy = state.phase !== "idle";
+  const status = (value, yes, no) => value === null ? "미확인" : value ? yes : no;
+  const parts = [
+    "Ollama " + status(state.installed, "설치됨", "미설치"),
+    status(state.running, "실행 중", "미실행"),
+    "BGE-M3 " + status(state.model_present, "보유", "미보유"),
+  ];
+  if (state.error) parts.push(ollamaErrors[state.error]);
+  else if (state.installed === false && !state.can_install) parts.push("자동 프로그램 설치에는 Windows와 WinGet이 필요합니다.");
+  element("ollama-setup-status").textContent = busy ? ollamaPhases[state.phase] : parts.join(" · ");
+  element("ollama-install").hidden = busy || !state.can_install;
+  element("ollama-install").textContent = state.installed ? "BGE-M3 다운로드" : "Ollama와 BGE-M3 설치";
+  element("ollama-install-help").hidden = busy || !state.can_install;
+  element("ollama-check").hidden = busy || state.model_present === true;
+}
+
+async function updateOllamaSetup(action) {
+  const version = ++ollamaRequest;
+  const current = () => version === ollamaRequest && settingsDialog.open && !ollamaPanel.hidden;
+  const endpoint = "/api/ollama/setup";
+  renderOllamaSetup({ phase: "checking" });
+  try {
+    let state = await call(endpoint, { action }, AbortSignal.timeout(10000));
+    while (current()) {
+      renderOllamaSetup(state);
+      if (state.phase === "idle") return;
+      await new Promise(resolve => setTimeout(resolve, 1000));
+      if (!current()) return;
+      state = await call(endpoint, undefined, AbortSignal.timeout(10000));
+    }
+  } catch {
+    if (current()) {
+      element("ollama-setup-status").textContent = "로컬 Ollama 상태를 불러오지 못했습니다.";
+      element("ollama-check").hidden = false;
+    }
+  }
+}
+
+function showOllamaSetup() {
+  ++ollamaRequest;
+  ollamaPanel.hidden = settingsProvider.value !== "intranet" || element("gateway-embedding")?.value !== localEmbedding;
+  if (!ollamaPanel.hidden) updateOllamaSetup("check");
+}
+
+element("ollama-install").addEventListener("click", () => updateOllamaSetup("install"));
+element("ollama-check").addEventListener("click", () => updateOllamaSetup("check"));
 
 function setSettingsBusy(busy) {
   const inactive = settingsProvider.value === "intranet" ? "settings-generic" : "settings-gateway";
@@ -666,6 +728,7 @@ function readSettingsFields(gateway) {
 
 settingsForm.addEventListener("input", (event) => {
   if (event.target !== settingsProvider) {
+    if (event.target.id === "gateway-url") element("gateway-test-unverified").checked = false;
     const provider = settingsProvider.value;
     settingsDrafts[provider] = readSettingsFields(provider === "intranet");
   }
@@ -713,10 +776,12 @@ function renderSettings() {
       }
       field.value = fields.selections[role];
       roles.append(title, field);
+      if (role === "embedding") roles.append(ollamaPanel);
     }
     setGatewayAnswers(fields.selections.answer);
     const embedding = element("gateway-embedding");
     embedding.addEventListener("change", () => {
+      showOllamaSetup();
       if (embedding.value !== localEmbedding || gatewaySettings.configured || element("settings-key").value.trim()) return;
       element("gateway-answer").value = "";
       element("gateway-rerank").value = "";
@@ -732,6 +797,7 @@ function renderSettings() {
     element("settings-url").value = setup.destination;
     element("settings-model").value = setup.model;
   }
+  showOllamaSetup();
 }
 
 element("settings-open").addEventListener("click", async () => {
@@ -742,6 +808,8 @@ element("settings-open").addEventListener("click", async () => {
   element("settings-remove").hidden = true;
   element("settings-key").value = "";
   gatewayAdvanced.open = false;
+  ollamaPanel.hidden = true;
+  ++ollamaRequest;
   setSettingsBusy(true);
   settingsDialog.showModal();
   const loading = new AbortController();
