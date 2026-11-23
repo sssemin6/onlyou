@@ -10,3 +10,4 @@ __pycache__/
 .mailsearch/
 api-settings.dat
 api-settings-*.tmp
+/gateway-defaults.json
