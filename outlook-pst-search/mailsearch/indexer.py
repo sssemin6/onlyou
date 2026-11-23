@@ -354,7 +354,7 @@ class Indexer:
         self.state(source, "attachments")
         self.index_attachments(root, temp, source, version, event, extras=extras)
         issue = None
-        if self.ai is not None and self.ai.embedding_model:
+        if self.ai is not None and self.ai.embedding_index:
             self.state(source, "embeddings")
             issue = self.index_embeddings(source, version, event)
         self.check(event)
@@ -504,7 +504,7 @@ class Indexer:
                 batch = pending.fetchmany(128)
 
     def index_embeddings(self, source, version, event):
-        model = self.ai.embedding_model
+        model = self.ai.embedding_index
         last = 0
         while True:
             self.check(event)
