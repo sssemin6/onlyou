@@ -155,16 +155,21 @@
             <option value="external">기타 답변 API</option>
           </select>
           <div id="settings-gateway" class="settings-fields">
-            <label for="gateway-url">사내 HTTPS 주소</label>
-            <input id="gateway-url" type="url" maxlength="512" spellcheck="false" placeholder="https://gateway.example.invalid">
-            <label for="gateway-answer-models">답변 모델 ID</label>
-            <input id="gateway-answer-models" maxlength="3000" spellcheck="false" aria-describedby="gateway-models-help">
-            <p id="gateway-models-help">모델 ID가 여러 개면 쉼표로 구분하세요.</p>
-            <label for="gateway-ca-file">CA 인증서 경로 (선택)</label>
-            <input id="gateway-ca-file" maxlength="2048" spellcheck="false" placeholder="C:\certs\company-ca.pem">
-            <label class="settings-checkbox"><input type="checkbox" id="gateway-test-unverified"> 연결 테스트에서만 인증서 검증 생략</label>
             <div id="settings-roles" class="settings-fields"></div>
             <p>로컬 BGE-M3는 Ollama 설치가 필요합니다. 사내 API 임베딩과 재정렬에는 텍스트가 전송됩니다.</p>
+            <details id="gateway-advanced" class="settings-advanced">
+              <summary>고급 설정</summary>
+              <div class="settings-fields">
+                <label for="gateway-url">사내 HTTPS 주소</label>
+                <input id="gateway-url" type="url" maxlength="512" spellcheck="false" placeholder="https://gateway.example.invalid">
+                <label for="gateway-answer-models">답변 모델 ID</label>
+                <input id="gateway-answer-models" maxlength="3000" spellcheck="false" aria-describedby="gateway-models-help">
+                <p id="gateway-models-help">모델 ID가 여러 개면 쉼표로 구분하세요.</p>
+                <label for="gateway-ca-file">CA 인증서 경로 (선택)</label>
+                <input id="gateway-ca-file" maxlength="2048" spellcheck="false" placeholder="C:\certs\company-ca.pem">
+                <label class="settings-checkbox"><input type="checkbox" id="gateway-test-unverified"> 연결 테스트에서만 인증서 검증 생략</label>
+              </div>
+            </details>
           </div>
           <div id="settings-generic" class="settings-fields" hidden>
             <label for="settings-url">API 주소</label>
