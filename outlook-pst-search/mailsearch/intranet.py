@@ -1,27 +1,33 @@
-"""HD AIC text model roles and reranking calls."""
+"""Configured gateway text model roles and reranking calls."""
 import http.client
+import os
 
-from .embedding import EmbeddingAPI, HDRequestError, HOST, MODEL
+from .answer import MODEL_NAME
+from .embedding import EmbeddingAPI, GatewayRequestError, MODEL
 from .external import ExternalAI, ExternalRequestError
 
 LOCAL_EMBEDDING = "ollama:" + MODEL
-CHAT_URL = f"https://{HOST}/v1/chat/completions"
+CHAT_PATH = "/v1/chat/completions"
 MODELS = {
-    "answer": {"qwen3-8-27b": "Qwen3.8-27B", "deepseek-v4-1-flash-1017": "DeepSeek-V4.1-Flash-1017"},
-    "embedding": {LOCAL_EMBEDDING: "로컬 Ollama · BGE-M3", MODEL: "사내 HD AIC API · BGE-M3"},
+    "embedding": {LOCAL_EMBEDDING: "로컬 Ollama · BGE-M3", MODEL: "사내 API · BGE-M3"},
     "rerank": {"bge-reranker-v2-m3": "BGE-Reranker-v2-M3"},
 }
-DEFAULTS = {role: "" for role in MODELS}
-DEFAULTS.update(answer="qwen3-8-27b", embedding=MODEL)
+
+
+def available_models():
+    names = os.environ.get("MAILSEARCH_GATEWAY_ANSWER_MODELS", "").split(",")
+    answers = {name: name for value in names if MODEL_NAME.fullmatch(name := value.strip())}
+    return {"answer": answers, **MODELS}
 
 
 def validate_selections(selections):
-    if not isinstance(selections, dict) or set(selections) != set(MODELS):
-        raise ValueError("hd_models")
-    for role, options in MODELS.items():
+    models = available_models()
+    if not isinstance(selections, dict) or set(selections) != set(models):
+        raise ValueError("gateway_models")
+    for role, options in models.items():
         model = selections[role]
         if not isinstance(model, str) or (model and model not in options):
-            raise ValueError("hd_models")
+            raise ValueError("gateway_models")
 
 
 class IntranetAI(EmbeddingAPI):
@@ -30,7 +36,7 @@ class IntranetAI(EmbeddingAPI):
         validate_selections(selections)
         self.models = dict(selections)
         self.model = MODEL if selections["embedding"] == MODEL else ""
-        self.answer_client = ExternalAI(CHAT_URL, selections["answer"], key, intranet=True) if selections["answer"] else None
+        self.answer_client = ExternalAI(self.origin + CHAT_PATH, selections["answer"], key, intranet=True) if selections["answer"] else None
 
     @classmethod
     def from_settings(cls, key, selections, current):
@@ -72,7 +78,7 @@ class IntranetAI(EmbeddingAPI):
             try:
                 probes[role]()
                 checks[role] = {"ok": True}
-            except (HDRequestError, ExternalRequestError) as exc:
+            except (GatewayRequestError, ExternalRequestError) as exc:
                 checks[role] = {"ok": False, "http_status": exc.status}
             except (OSError, ValueError, KeyError, IndexError, TypeError, http.client.HTTPException):
                 checks[role] = {"ok": False}
