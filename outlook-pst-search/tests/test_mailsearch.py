@@ -15,6 +15,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from mailsearch.answer import LocalAI, delivery_date_answer, validate
+from mailsearch.embedding import ENDPOINT as EMBEDDING_ENDPOINT, EmbeddingAPI
 from mailsearch.external import ExternalAI, Excerpt, Reviews, pcf_batches
 from mailsearch.extract import convert_legacy, extract_attachment
 from mailsearch.indexer import Indexer
@@ -280,26 +281,54 @@ class Integration(unittest.TestCase):
         self.assertTrue(self.call("/api/search", {"query": "폴더 안 PST에서", "filters": {}})[1]["results"])
         self.assertTrue(self.call("/api/search", {"query": "직접 추가한", "filters": {}})[1]["results"])
 
-    def test_bundled_model_restore_joins_parts(self):
-        from mailsearch.bundled import prepare
-        source = Path(self.workspace.name) / "bundle"
-        (source / "blobs").mkdir(parents=True)
-        (source / "parts").mkdir(parents=True)
-        (source / "blobs" / ("sha256-" + "0" * 64)).write_bytes(b"{}")
-        payload = b"model-weights" * 1000
-        name = "sha256-" + hashlib.sha256(payload).hexdigest()
-        half = len(payload) // 2
-        (source / "parts" / f"{name}.part00").write_bytes(payload[:half])
-        (source / "parts" / f"{name}.part01").write_bytes(payload[half:])
-        (source / "manifest.json").write_text("{}")
-        root = Path(self.workspace.name) / "models"
-        self.assertEqual(prepare(root, source), root)
-        self.assertEqual(hashlib.sha256((root / "blobs" / name).read_bytes()).hexdigest(), name[7:])
-        self.assertTrue((root / "manifests" / "registry.ollama.ai" / "library" / "bge-m3" / "latest").is_file())
-        self.assertEqual(prepare(root, source), root)  # already restored, no work
-        (source / "parts" / f"{name}.part01").write_bytes(b"broken")
-        with self.assertRaises(RuntimeError):
-            prepare(Path(self.workspace.name) / "models2", source)
+    def test_hd_aic_indexes_existing_archive_and_searches_with_the_same_backend(self):
+        source = self.import_mail()
+        with self.store.connection() as conn:
+            conn.execute("UPDATE vectors SET model='bge-m3' WHERE model='embed'")
+            conn.execute("UPDATE vector_buckets SET model='bge-m3' WHERE model='embed'")
+        self.ai.embedding_model = ""
+        self.ai.embedding_api = EmbeddingAPI("test-key")
+
+        def respond(_method, _path, body, _headers):
+            payload = json.loads(body)
+            self.assertEqual(payload["model"], "bge-m3")
+            supplied = payload["input"]
+            values = [supplied] if isinstance(supplied, str) else supplied
+            response.read.return_value = json.dumps({"data": [
+                {"index": index, "embedding": [1.0, 0.05, 0.12]}
+                for index in reversed(range(len(values)))
+            ]}).encode()
+
+        with patch("mailsearch.embedding.http.client.HTTPSConnection") as https:
+            connection = https.return_value
+            response = connection.getresponse.return_value
+            response.status = 200
+            connection.request.side_effect = respond
+            self.assertEqual(self.call("/api/source-action", {"source": source, "action": "refresh"})[0], 202)
+            self.assertIsNone(await_source(self.store, source, {"ready"})["issue"])
+            with self.store.connection() as conn:
+                models = {row[0] for row in conn.execute("SELECT DISTINCT model FROM vectors")}
+                self.assertEqual(models, {"bge-m3", self.ai.embedding_index})
+            batch = json.loads(connection.request.call_args_list[0].args[2])["input"]
+            self.assertTrue(any("A-17" in passage for passage in batch))
+            status, data = self.call("/api/search", {"query": "의미 검색 테스트", "filters": {"source": source}})
+            self.assertEqual(status, 200)
+            self.assertTrue(any("similarity" in result for result in data["results"]))
+            method, path, body, headers = connection.request.call_args.args
+            self.assertEqual((method, path), ("POST", "/v1/embeddings"))
+            self.assertEqual(json.loads(body), {"model": "bge-m3", "input": "의미 검색 테스트"})
+            self.assertEqual(headers["Authorization"], "Bearer test-key")
+            https.assert_called_with("api.model.hd-aic.com", timeout=6)
+
+            response.status = 401
+            status, data = self.call("/api/search", {"query": "A-17"})
+            self.assertEqual(status, 200)
+            self.assertTrue(data["results"])
+            self.assertTrue(all("similarity" not in item for item in data["results"]))
+            status, data = self.call("/api/sources")
+            self.assertEqual(status, 200)
+            self.assertEqual(data["embedding_endpoint"], EMBEDDING_ENDPOINT)
+            self.assertNotIn("test-key", json.dumps(data))
 
     def test_ping_route_requires_session(self):
         self.assertEqual(self.call("/api/ping", token=False)[0], 403)
@@ -948,6 +977,21 @@ class Integration(unittest.TestCase):
         self.assertEqual(indexed["failed"], 0)
         self.assertEqual(hashlib.sha256(path.read_bytes()).digest(), original_digest)
         self.assertTrue(self.call("/api/search", {"query": "", "filters": {}})[1]["results"])
+
+
+class EmbeddingTransport(unittest.TestCase):
+    def test_batch_response_is_ordered_and_requires_unique_indices(self):
+        api = EmbeddingAPI("test-key")
+        with patch("mailsearch.embedding.http.client.HTTPSConnection") as https:
+            response = https.return_value.getresponse.return_value
+            response.status = 200
+            entries = [{"index": 1, "embedding": [0., 1.]}, {"index": 0, "embedding": [1., 0.]}]
+            response.read.return_value = json.dumps({"data": entries}).encode()
+            self.assertEqual(api.embed(["first", "second"], timeout=10), [[1., 0.], [0., 1.]])
+            entries[1]["index"] = 1
+            response.read.return_value = json.dumps({"data": entries}).encode()
+            with self.assertRaises(ValueError):
+                api.embed(["first", "second"], timeout=10)
 
 
 class ExternalTransport(unittest.TestCase):
