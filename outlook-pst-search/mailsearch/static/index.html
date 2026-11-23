@@ -143,20 +143,31 @@
   <dialog id="settings-dialog" class="settings-dialog" aria-labelledby="settings-title">
     <form id="settings-form" autocomplete="off">
       <header class="viewer-header">
-        <h2 id="settings-title">AI 답변 API 설정</h2>
+        <h2 id="settings-title">AI 모델 설정</h2>
         <button type="button" class="square" id="settings-close" aria-label="API 설정 닫기">×</button>
       </header>
       <div class="viewer-content">
         <p class="settings-summary" id="settings-current">설정을 불러오는 중입니다.</p>
         <div class="settings-fields">
-          <label for="settings-url">API 주소</label>
-          <input id="settings-url" type="url" maxlength="512" required spellcheck="false" aria-describedby="settings-endpoint-help">
-          <p id="settings-endpoint-help">/chat/completions 또는 /messages로 끝나는 전체 HTTPS 주소를 입력하세요.</p>
-          <label for="settings-model">모델명</label>
-          <input id="settings-model" maxlength="150" required spellcheck="false">
+          <label for="settings-provider">API 연결</label>
+          <select id="settings-provider">
+            <option value="intranet">HD AIC · 사내 API</option>
+            <option value="external">기타 답변 API</option>
+          </select>
+          <div id="settings-hd" class="settings-fields">
+            <div id="settings-roles" class="settings-fields"></div>
+            <p>임베딩·재정렬을 켜면 색인 텍스트와 검색어 또는 후보 발췌를 HD AIC로 보냅니다.</p>
+          </div>
+          <div id="settings-generic" class="settings-fields" hidden>
+            <label for="settings-url">API 주소</label>
+            <input id="settings-url" type="url" maxlength="512" spellcheck="false" aria-describedby="settings-endpoint-help">
+            <p id="settings-endpoint-help">/chat/completions 또는 /messages로 끝나는 전체 HTTPS 주소를 입력하세요.</p>
+            <label for="settings-model">모델명</label>
+            <input id="settings-model" maxlength="150" spellcheck="false">
+          </div>
           <label for="settings-key">API 키</label>
           <input id="settings-key" type="password" maxlength="2048" autocomplete="off" spellcheck="false" aria-describedby="settings-key-help">
-          <p id="settings-key-help">GUI에 입력한 키는 앱을 종료할 때 지워집니다.</p>
+          <p id="settings-key-help">키는 이 실행에서만 사용합니다. HD AIC는 선택한 모델에 같은 키를 사용합니다.</p>
         </div>
         <p id="settings-status" class="form-message" role="status"></p>
       </div>
