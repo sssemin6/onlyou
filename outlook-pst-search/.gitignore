@@ -8,3 +8,5 @@ __pycache__/
 *.bundle
 *.zip
 .mailsearch/
+api-settings.dat
+api-settings-*.tmp
