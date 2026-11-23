@@ -41,6 +41,9 @@ const issueNames = {
   interrupted: "중단된 색인입니다.",
   embedding_unavailable: "의미 색인을 완료하지 못했습니다. 키워드 검색은 사용 가능하며, 연결을 확인한 뒤 보관함을 갱신할 수 있습니다.",
   pcf_input_too_large: "선택한 COMMENT이 현재 입력 한도를 초과합니다.",
+  hd_indexing: "색인 중에는 모델 설정을 유지합니다. 색인이 끝나거나 일시정지한 뒤 적용하세요.",
+  hd_models: "용도별 모델 선택을 확인하세요.",
+  embedding_api_key: "사내 API 키에 공백이 있는지 확인하세요.",
   external_disabled: "상단의 API 설정에서 답변에 사용할 AI를 연결해 주세요.",
   external_url: "HTTPS 주소를 확인하세요. 주소는 /chat/completions 또는 /messages로 끝나야 합니다.",
   external_model: "제공자에서 안내한 모델명을 입력하세요.",
@@ -592,18 +595,59 @@ function settingsMessage(message) {
   element("settings-status").textContent = message;
 }
 
+const hdRoles = {
+  answer: ["근거 답변", "사용 안 함"], embedding: ["의미 검색 임베딩", "사내 임베딩 사용 안 함"],
+  rerank: ["검색 후보 재정렬", "사용 안 함"],
+};
+let hdSettings;
+let genericSettings;
+const settingsProvider = element("settings-provider");
+
 function setSettingsBusy(busy) {
-  for (const control of settingsForm.querySelectorAll("input, button")) {
+  for (const control of settingsForm.querySelectorAll("input, button, select")) {
     if (control.id !== "settings-close") control.disabled = busy;
   }
 }
 
-function renderSettings(configured) {
-  element("settings-current").textContent = configured
-    ? "이 실행에 적용됨 · " + configured.model
-    : "외부 API 연결 전";
-  element("settings-remove").hidden = !configured;
-  element("settings-key").placeholder = configured ? "같은 주소에서 키를 유지하려면 비워 두세요" : "";
+function renderSettings() {
+  const hd = settingsProvider.value === "intranet";
+  element("settings-generic").hidden = hd;
+  element("settings-hd").hidden = !hd;
+  element("settings-url").required = !hd;
+  element("settings-model").required = !hd;
+  element("settings-key").value = "";
+  if (hd) {
+    if (!hdSettings) return;
+    const subject = new URL(hdSettings.destination).host;
+    element("settings-current").textContent = hdSettings.configured
+      ? subject + (hdSettings.active_answer ? " · 답변 제공자 사용 중" : " · 키 등록됨")
+      : subject + " · 사내 API 키를 입력하세요.";
+    element("settings-remove").hidden = !hdSettings.configured;
+    element("settings-key").placeholder = hdSettings.configured ? "등록된 사내 키를 쓰려면 비워 두세요" : "";
+    const roles = element("settings-roles");
+    roles.replaceChildren();
+    for (const [role, [label, disabled]] of Object.entries(hdRoles)) {
+      const field = node("select");
+      field.id = "hd-" + role;
+      const title = node("label", label);
+      title.htmlFor = field.id;
+      field.add(new Option(disabled, ""));
+      for (const [id, name] of Object.entries(hdSettings.models[role])) {
+        field.add(new Option(name, id));
+      }
+      field.value = hdSettings.selections[role];
+      roles.append(title, field);
+    }
+  } else {
+    if (!genericSettings) return;
+    const configured = genericSettings.configured;
+    const setup = configured || genericSettings.defaults;
+    element("settings-current").textContent = configured ? "답변 API 연결됨 · " + configured.model : "답변 API 연결 전";
+    element("settings-remove").hidden = !configured;
+    element("settings-key").placeholder = configured ? "같은 주소에서 키를 유지하려면 비워 두세요" : "";
+    element("settings-url").value = setup.destination;
+    element("settings-model").value = setup.model;
+  }
 }
 
 element("settings-open").addEventListener("click", async () => {
@@ -612,23 +656,25 @@ element("settings-open").addEventListener("click", async () => {
   settingsMessage("");
   element("settings-current").textContent = "설정을 불러오는 중입니다.";
   element("settings-remove").hidden = true;
-  element("settings-url").value = "";
-  element("settings-model").value = "";
   element("settings-key").value = "";
   setSettingsBusy(true);
   settingsDialog.showModal();
   try {
-    const data = await call("/api/external/settings");
+    const [internal, external] = await Promise.all([call("/api/intranet/settings"), call("/api/external/settings")]);
     if (version !== settingsRequest || !settingsDialog.open) return;
-    const setup = data.configured || data.defaults;
-    element("settings-url").value = setup.destination;
-    element("settings-model").value = setup.model;
-    renderSettings(data.configured);
+    hdSettings = internal;
+    genericSettings = external;
+    settingsProvider.value = external.configured && !internal.configured ? "external" : "intranet";
+    renderSettings();
     setSettingsBusy(false);
     element("settings-key").focus();
   } catch (error) {
     if (version === settingsRequest && settingsDialog.open) settingsMessage(error.message);
   }
+});
+settingsProvider.addEventListener("change", () => {
+  renderSettings();
+  settingsMessage("");
 });
 element("settings-close").addEventListener("click", () => settingsDialog.close());
 settingsDialog.addEventListener("close", () => {
@@ -641,34 +687,37 @@ settingsDialog.addEventListener("close", () => {
 async function changeSettings(action) {
   if (action !== "disconnect" && !settingsForm.reportValidity()) return;
   const version = settingsRequest;
-  const payload = action === "disconnect" ? { action } : {
-    action,
-    destination: element("settings-url").value.trim(),
-    model: element("settings-model").value.trim(),
-    key: element("settings-key").value.trim(),
-  };
+  const hd = settingsProvider.value === "intranet";
+  const route = hd ? "/api/intranet/settings" : "/api/external/settings";
+  const payload = { action };
+  if (action !== "disconnect") {
+    payload.key = element("settings-key").value.trim();
+    if (hd) {
+      payload.selections = Object.fromEntries(Object.keys(hdRoles).map((role) => [role, element("hd-" + role).value]));
+    } else {
+      payload.destination = element("settings-url").value.trim();
+      payload.model = element("settings-model").value.trim();
+    }
+  }
   setSettingsBusy(true);
   if (action !== "test") clearSearch();
-  settingsMessage(action === "test" ? "테스트 문구로 연결을 확인하는 중입니다." : "");
+  settingsMessage(action === "test" ? "선택한 모델의 연결을 확인하는 중입니다." : "");
   try {
-    const data = await call("/api/external/settings", payload);
-    if (action !== "test") {
-      showSources().catch(() => {});
-    }
+    const data = await call(route, payload);
+    if (action !== "test") showSources().catch(() => {});
     if (version !== settingsRequest || !settingsDialog.open) return;
     if (action === "test") {
-      settingsMessage("연결 테스트에 성공했습니다. 적용을 누르면 사용할 수 있습니다.");
+      const checks = hd ? Object.entries(data.checks).map(([role, result]) =>
+        hdRoles[role][0] + (result.ok ? " 성공" : " 실패" + (result.http_status ? " (HTTP " + result.http_status + ")" : ""))) : [];
+      settingsMessage(hd ? (checks.join(" · ") || "테스트할 모델을 선택하세요.") : "연결 테스트에 성공했습니다.");
       return;
     }
-    element("settings-key").value = "";
-    renderSettings(data.configured);
-    if (data.configured) {
-      element("settings-url").value = data.configured.destination;
-      element("settings-model").value = data.configured.model;
-    }
-    settingsMessage(data.configured
-      ? "설정을 적용했습니다. 검색 화면의 답변 제공자에서 외부 API를 선택할 수 있습니다."
-      : "외부 API 연결을 해제했습니다.");
+    if (hd) hdSettings = data;
+    else genericSettings = { ...genericSettings, configured: data.configured };
+    renderSettings();
+    settingsMessage(action === "disconnect" ? "연결을 해제했습니다."
+      : hd ? "설정을 적용했습니다. 임베딩 설정을 바꿨다면 보관함을 갱신하세요."
+      : "설정을 적용했습니다. 검색 화면에서 답변 API를 선택할 수 있습니다.");
   } catch (error) {
     if (version === settingsRequest && settingsDialog.open) settingsMessage(error.message);
   } finally {
