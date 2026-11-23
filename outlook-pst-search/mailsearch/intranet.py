@@ -3,7 +3,7 @@ import http.client
 import os
 
 from .answer import MODEL_NAME
-from .embedding import EmbeddingAPI, GatewayRequestError, MODEL
+from .embedding import EmbeddingAPI, GatewayRequestError, MODEL, gateway_origin
 from .external import ExternalAI, ExternalRequestError
 
 LOCAL_EMBEDDING = "ollama:" + MODEL
@@ -14,14 +14,14 @@ MODELS = {
 }
 
 
-def available_models():
-    names = os.environ.get("MAILSEARCH_GATEWAY_ANSWER_MODELS", "").split(",")
+def available_models(answer_models=None):
+    names = (os.environ.get("MAILSEARCH_GATEWAY_ANSWER_MODELS", "") if answer_models is None else answer_models).split(",")
     answers = {name: name for value in names if MODEL_NAME.fullmatch(name := value.strip())}
     return {"answer": answers, **MODELS}
 
 
-def validate_selections(selections):
-    models = available_models()
+def validate_selections(selections, answer_models=None):
+    models = available_models(answer_models)
     if not isinstance(selections, dict) or set(selections) != set(models):
         raise ValueError("gateway_models")
     for role, options in models.items():
@@ -31,21 +31,26 @@ def validate_selections(selections):
 
 
 class IntranetAI(EmbeddingAPI):
-    def __init__(self, key, selections):
-        super().__init__(key)
-        validate_selections(selections)
+    def __init__(self, key, selections, *, origin=None, answer_models=None, tls=None):
+        super().__init__(key, origin=origin, tls=tls)
+        validate_selections(selections, answer_models)
         self.models = dict(selections)
         self.model = MODEL if selections["embedding"] == MODEL else ""
-        self.answer_client = ExternalAI(self.origin + CHAT_PATH, selections["answer"], key, intranet=True) if selections["answer"] else None
+        self.answer_client = None
+        if selections["answer"]:
+            self.answer_client = ExternalAI(self.origin + CHAT_PATH, selections["answer"], key,
+                                            intranet=True, gateway=self.origin, tls=tls)
 
     @classmethod
-    def from_settings(cls, key, selections, current):
-        validate_selections(selections)
-        if not key and current is None:
+    def from_settings(cls, key, selections, current, *, origin=None, answer_models=None, tls=None):
+        validate_selections(selections, answer_models)
+        if not key and current and current.origin == gateway_origin(origin):
+            key = current._key
+        if not key:
             if selections["answer"] or selections["rerank"] or selections["embedding"] == MODEL:
                 raise ValueError("external_key_required")
             return None
-        return cls(key or current._key, selections)
+        return cls(key, selections, origin=origin, answer_models=answer_models, tls=tls)
 
     def rerank(self, query, documents, timeout=6):
         data = self.request("/v1/rerank", {
