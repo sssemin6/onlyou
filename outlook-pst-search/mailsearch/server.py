@@ -22,12 +22,13 @@ from urllib.parse import urlsplit
 
 from .answer import (PCF_INSTRUCTIONS, LocalAI, map_citations, pcf_candidates, pcf_retrieval, pcf_word, delivery_date_answer,
                      evidence_for, merge_rows, public_row, validate)
-from .embedding import MODEL as BGE_MODEL, gateway_origin, logger as gateway_logger
+from .api_settings import ApiSettings
+from .embedding import CA_FILE_ENV, GatewayTLSOptions, MODEL as BGE_MODEL, gateway_origin, logger as gateway_logger
 from .external import DEFAULT_MODEL, DEFAULT_URL, MAX_EXCERPTS, MAX_INTERNAL_EXCERPTS, MAX_PCF_CELLS, ExternalAI, ExternalRequestError, Reviews, pcf_batches, pcf_input_fits
 from .extract import MAX_ATTACHMENT
 from .filesystem import local_path
 from .indexer import ImportIssue, Indexer
-from .intranet import CHAT_PATH, LOCAL_EMBEDDING, IntranetAI, available_models
+from .intranet import CHAT_PATH, LOCAL_EMBEDDING, IntranetAI, available_models, validate_selections
 from .pcf import PCF_CELL
 from .store import Store, normalized, pack_vector, query_words, quoted_plan
 
@@ -67,10 +68,21 @@ class SessionLock:
 class App(ThreadingHTTPServer):
     daemon_threads = True
 
-    def __init__(self, port, store, indexer, ai, external=None):
+    def __init__(self, port, store, indexer, ai, external=None, *, api_settings=None):
         super().__init__(("127.0.0.1", port), Handler)
         self.store, self.indexer, self.ai = store, indexer, ai
         self.external = external
+        self.generic_answer = external
+        self.gateway_fields = {
+            "gateway_url": gateway_origin(),
+            "answer_models": os.environ.get("MAILSEARCH_GATEWAY_ANSWER_MODELS", ""),
+            "ca_file": os.environ.get(CA_FILE_ENV, ""),
+        }
+        self.api_settings = api_settings
+        self.api_profiles = api_settings.load() if api_settings else {}
+        for profile in ("gateway", "external"):
+            if not isinstance(self.api_profiles.get(profile), dict):
+                self.api_profiles.pop(profile, None)
         self.embedding_selection = None
         self.reviews = Reviews()
         self.outbound = threading.BoundedSemaphore(1)
@@ -78,6 +90,82 @@ class App(ThreadingHTTPServer):
         self.generation = threading.BoundedSemaphore(1)
         self.origin = f"http://127.0.0.1:{self.server_port}"
         self.last_seen = 0.0
+
+        self.restore_api_settings()
+
+    @property
+    def persistent_keys(self):
+        return bool(self.api_settings and self.api_settings.secure)
+
+    def generic_provider(self):
+        external = self.external
+        return external if external and not external.intranet else self.generic_answer
+
+    def remember_api(self, name, profile, answer):
+        selected = ("gateway" if answer.intranet else "external") if answer else ""
+        profiles = {**self.api_profiles, name: profile, "answer_provider": selected}
+        if self.api_settings:
+            self.api_settings.save(profiles)
+        self.api_profiles = profiles
+
+    def restore_api_settings(self):
+        external = self.api_profiles.get("external")
+        if isinstance(external, dict):
+            previous = self.generic_answer
+            self.generic_answer = None
+            if external:
+                try:
+                    self.generic_answer = ExternalAI.from_settings(
+                        external["destination"], external["model"], external.get("key", ""), previous,
+                    )
+                except (ValueError, TypeError, KeyError):
+                    gateway_logger.warning("Could not restore saved external API configuration")
+        gateway_answer = None
+        gateway = self.api_profiles.get("gateway")
+        if isinstance(gateway, dict):
+            try:
+                fields = gateway_fields(gateway, self.gateway_fields)
+                selections = gateway["selections"]
+                validate_selections(selections, fields["answer_models"])
+                current = self.ai.embedding_api
+                try:
+                    client = IntranetAI.from_settings(
+                        gateway.get("key", ""), selections, current, origin=fields["gateway_url"],
+                        answer_models=fields["answer_models"], tls=GatewayTLSOptions(fields["ca_file"]),
+                    )
+                except ValueError:
+                    client = None
+                    gateway_logger.warning("Could not restore saved gateway credentials")
+                local = BGE_MODEL if selections["embedding"] == LOCAL_EMBEDDING else ""
+                self.ai.configure_embedding(local, client)
+                self.embedding_selection = selections["embedding"]
+                self.gateway_fields = fields
+                gateway_answer = client.answer_client if client else None
+            except (ValueError, TypeError, KeyError):
+                self.api_profiles.pop("gateway", None)
+                gateway_logger.warning("Could not restore saved gateway configuration")
+        if "answer_provider" in self.api_profiles:
+            preferred = self.api_profiles["answer_provider"]
+            self.external = self.generic_answer if preferred == "external" else gateway_answer if preferred == "gateway" else None
+
+
+def gateway_fields(payload, defaults):
+    limits = {"gateway_url": 512, "answer_models": 3000, "ca_file": 2048}
+    fields = {}
+    for name, limit in limits.items():
+        value = payload.get(name, defaults.get(name, ""))
+        if not isinstance(value, str) or len(value) > limit or any(ord(c) < 32 for c in value):
+            raise ValueError("gateway_settings")
+        fields[name] = value.strip()
+    origin = gateway_origin(fields["gateway_url"])
+    if fields["gateway_url"] and not origin:
+        raise ValueError("gateway_url")
+    fields["gateway_url"] = origin
+    models = available_models(fields["answer_models"])["answer"]
+    if any(name.strip() and name.strip() not in models for name in fields["answer_models"].split(",")):
+        raise ValueError("gateway_models")
+    fields["answer_models"] = ",".join(models)
+    return fields
 
 
 SNIPPET_SPLIT = re.compile(r"(?<=[.!?])\s+|\n+")
@@ -216,10 +304,12 @@ class Handler(BaseHTTPRequestHandler):
         elif route.path == "/api/intranet/settings":
             self.send_json(200, self.intranet_settings())
         elif route.path == "/api/external/settings":
-            external = self.server.external
+            external = self.server.generic_provider()
+            saved = self.server.api_profiles.get("external") or {}
             self.send_json(200, {
-                "configured": external.public if external and not external.intranet else None,
-                "defaults": {"destination": DEFAULT_URL, "model": DEFAULT_MODEL},
+                "configured": external.public if external else None,
+                "defaults": {"destination": saved.get("destination", DEFAULT_URL), "model": saved.get("model", DEFAULT_MODEL)},
+                "persistent_keys": self.server.persistent_keys,
             })
         elif re.fullmatch(r"/api/evidence/\d{1,16}", route.path):
             row = self.server.store.open_passage(int(route.path.rsplit("/", 1)[-1]))
@@ -592,19 +682,21 @@ class Handler(BaseHTTPRequestHandler):
     def intranet_settings(self):
         local, current = self.server.ai.embedding_config
         configured = isinstance(current, IntranetAI)
-        models = available_models()
-        origin = gateway_origin()
+        fields = self.server.gateway_fields
+        models = available_models(fields["answer_models"])
+        origin = fields["gateway_url"]
         defaults = {"answer": next(iter(models["answer"]), ""), "rerank": "", "embedding": BGE_MODEL if origin else ""}
-        selections = dict(current.models if configured else defaults)
-        if not configured and self.server.embedding_selection is not None:
+        saved = self.server.api_profiles.get("gateway", {}).get("selections")
+        selections = dict(current.models if configured else saved if saved else defaults)
+        if not configured and not saved and self.server.embedding_selection is not None:
             selections.update(answer="", rerank="", embedding=self.server.embedding_selection)
         if local.split(":")[0] == BGE_MODEL and not (current and current.index_key):
             selections["embedding"] = LOCAL_EMBEDDING
             if not configured:
                 selections["answer"] = ""
         return {
-            "destination": origin + CHAT_PATH if origin else "", "models": models,
-            "configured": configured,
+            **fields, "destination": origin + CHAT_PATH if origin else "", "models": models,
+            "configured": configured, "persistent_keys": self.server.persistent_keys,
             "selections": selections,
             "active_answer": configured and current.answer_client is not None and self.server.external is current.answer_client,
         }
@@ -623,13 +715,23 @@ class Handler(BaseHTTPRequestHandler):
                 current = None
             candidate = None
             local_model = server.ai.embedding_model
+            fields = server.gateway_fields
+            selections = {"answer": "", "rerank": "", "embedding": LOCAL_EMBEDDING if local_model == BGE_MODEL else ""}
             if action != "disconnect":
                 key = payload.get("key", "")
                 if not isinstance(key, str):
                     raise ValueError("embedding_api_key")
                 try:
                     selections = payload.get("selections")
-                    candidate = IntranetAI.from_settings(key.strip(), selections, current)
+                    fields = gateway_fields(payload, fields)
+                    skip_verify = payload.get("test_unverified", False)
+                    if type(skip_verify) is not bool or (skip_verify and action != "test"):
+                        raise ValueError("gateway_settings")
+                    tls = GatewayTLSOptions("", verify=False) if skip_verify else GatewayTLSOptions(fields["ca_file"])
+                    candidate = IntranetAI.from_settings(
+                        key.strip(), selections, current, origin=fields["gateway_url"],
+                        answer_models=fields["answer_models"], tls=tls,
+                    )
                     local_model = BGE_MODEL if selections["embedding"] == LOCAL_EMBEDDING else ""
                 except ValueError as exc:
                     self.send_json(400, {"error": str(exc)})
@@ -649,12 +751,21 @@ class Handler(BaseHTTPRequestHandler):
                 if server.indexer.events:
                     self.send_json(409, {"error": "gateway_indexing"})
                     return
+                answer = server.external
+                if candidate and candidate.answer_client:
+                    answer = candidate.answer_client
+                elif current and answer is current.answer_client:
+                    answer = server.generic_answer
+                try:
+                    server.remember_api("gateway", {**fields, "selections": selections,
+                                                   "key": candidate._key if candidate else ""}, answer)
+                except (OSError, ValueError):
+                    self.send_json(500, {"error": "api_settings_save_failed"})
+                    return
+                server.gateway_fields = fields
                 server.ai.configure_embedding(local_model, candidate)
                 server.embedding_selection = LOCAL_EMBEDDING if local_model == BGE_MODEL else ""
-                if candidate and candidate.answer_client:
-                    server.external = candidate.answer_client
-                elif current and server.external is current.answer_client:
-                    server.external = None
+                server.external = answer
                 server.reviews.clear()
             self.send_json(200, self.intranet_settings())
         finally:
@@ -669,13 +780,17 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(409, {"error": "external_busy"})
             return
         try:
-            current = server.external
-            if current and current.intranet:
-                current = None
+            current = server.generic_provider()
             if action == "disconnect":
-                if current:
-                    server.external = None
-                    server.reviews.clear()
+                answer = None if server.external is current else server.external
+                try:
+                    server.remember_api("external", {}, answer)
+                except (OSError, ValueError):
+                    self.send_json(500, {"error": "api_settings_save_failed"})
+                    return
+                server.external = answer
+                server.generic_answer = None
+                server.reviews.clear()
                 self.send_json(200, {"configured": None})
                 return
             url, model, key = (payload.get(name, "") for name in ("destination", "model", "key"))
@@ -687,7 +802,12 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(400, {"error": str(exc)})
                 return
             if action == "apply":
-                server.external = external
+                try:
+                    server.remember_api("external", {**external.public, "key": external._key}, external)
+                except (OSError, ValueError):
+                    self.send_json(500, {"error": "api_settings_save_failed"})
+                    return
+                server.generic_answer = server.external = external
                 server.reviews.clear()
                 self.send_json(200, {"configured": external.public})
                 return
@@ -805,7 +925,7 @@ def main(argv=None):
         with SessionLock(root), gateway_diagnostics(root):
             store = Store(root)
             indexer = Indexer(store, args.readpst, args.pdftotext, ai)
-            with App(args.port, store, indexer, ai, external) as app:
+            with App(args.port, store, indexer, ai, external, api_settings=ApiSettings(root)) as app:
                 indexer.wake()
                 print(app.origin, flush=True)
                 if not args.no_browser:
