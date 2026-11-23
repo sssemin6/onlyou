@@ -1,3 +1,11 @@
+@font-face {
+  font-family: "Onlyou Display";
+  src: url("/fonts/onlyou-display.ttf") format("truetype");
+  font-style: normal;
+  font-weight: 45 930;
+  font-display: swap;
+}
+
 :root {
   color-scheme: light;
   --ink: #2c251f;
@@ -15,6 +23,7 @@
   --edge: 1.5px solid var(--ink);
   --shadow: 3px 4px 0 var(--ink);
   --sans: "Instrument Sans", "Malgun Gothic", "Apple SD Gothic Neo", "Noto Sans CJK KR", system-ui, sans-serif;
+  --display: "Onlyou Display", var(--sans);
   --serif: "Noto Serif CJK KR", "Noto Serif KR", "Batang", "AppleMyungjo", Georgia, serif;
   font: 15px/1.6 var(--sans);
 }
@@ -174,18 +183,40 @@ svg { width: 21px; height: 21px; flex: none; stroke: currentColor; stroke-width:
 
 main { grid-area: 1 / 2; min-width: 0; }
 .hero {
-  padding: 24px clamp(18px, 3.2vw, 44px);
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: clamp(10px, 2.5vw, 34px);
+  padding: 22px clamp(18px, 3.2vw, 44px);
   border: var(--edge);
-  border-radius: var(--radius);
-  background: var(--blush) radial-gradient(#9b5a342a .6px, transparent .8px) 0 0 / 8px 8px;
+  border-radius: 16px;
+  background: linear-gradient(110deg, #fff1dd 0%, #fae1cc 62%, #f4d1bf 100%);
   box-shadow: var(--shadow);
+  font-family: var(--display);
 }
 .hero h1 {
-  margin: 0;
-  font: 800 clamp(1.8rem, 4vw, 2.65rem)/1.2 var(--serif);
-  letter-spacing: -.065em;
+  font-size: clamp(1.85rem, 3.3vw, 2.9rem);
+  font-weight: 770;
+  line-height: 1.15;
+  letter-spacing: -.042em;
+  word-break: keep-all;
+  overflow-wrap: anywhere;
+  text-wrap: balance;
 }
-.hero p { margin-top: 7px; color: #5a4134; font-size: .9rem; }
+.hero p {
+  margin-top: 9px;
+  color: #654938;
+  font-size: 1rem;
+  font-weight: 470;
+  line-height: 1.55;
+  word-break: keep-all;
+  text-wrap: pretty;
+}
+.hero-art {
+  width: clamp(108px, 14vw, 171px);
+  height: auto;
+  color: #4a352a;
+}
 
 .tabs { display: flex; flex-wrap: wrap; gap: 7px; margin-top: 22px; }
 .tab {
@@ -362,8 +393,10 @@ mark { color: var(--ink); background: #f2cf84; }
 @media (max-width: 530px) {
   .masthead-inner { min-height: 64px; padding-inline: 15px; }
   .layout { padding-inline: 14px; gap: 24px; }
-  .hero { padding: 15px 16px; }
-  .hero p { font-size: .84rem; }
+  .hero { padding: 17px 15px; }
+  .hero h1 { font-size: clamp(1.4rem, 5.2vw, 1.8rem); }
+  .hero p { font-size: .88rem; }
+  .hero-art { width: clamp(63px, 21vw, 108px); }
   .tab { padding-inline: 14px; }
   .search-form { padding: 14px; margin-top: 19px; }
   .search-line { grid-template-columns: .8fr 1.2fr; gap: 8px; }
