@@ -34,8 +34,12 @@ from .pcf import PCF_CELL
 from .store import Store, normalized, pack_vector, query_words, quoted_plan
 
 STATIC = Path(__file__).with_name("static")
-FILES = {"/": ("index.html", "text/html; charset=utf-8"), "/style.css": ("style.css", "text/css; charset=utf-8"),
-         "/app.js": ("app.js", "text/javascript; charset=utf-8")}
+FILES = {
+    "/": ("index.html", "text/html; charset=utf-8"),
+    "/style.css": ("style.css", "text/css; charset=utf-8"),
+    "/app.js": ("app.js", "text/javascript; charset=utf-8"),
+    "/fonts/onlyou-display.ttf": ("fonts/onlyou-display.ttf", "font/ttf"),
+}
 MAX_REQUEST = 16 * 1024
 
 
