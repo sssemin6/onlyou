@@ -18,7 +18,7 @@ from mailsearch.answer import LocalAI, delivery_date_answer, validate
 from mailsearch.embedding import ENDPOINT as EMBEDDING_ENDPOINT, EmbeddingAPI
 from mailsearch.external import ExternalAI, Excerpt, Reviews, pcf_batches
 from mailsearch.extract import convert_legacy, extract_attachment
-from mailsearch.intranet import CHAT_URL, DEFAULTS as HD_DEFAULTS
+from mailsearch.intranet import CHAT_URL, DEFAULTS as HD_DEFAULTS, LOCAL_EMBEDDING
 from mailsearch.indexer import Indexer
 from mailsearch.server import App
 from mailsearch.store import Store
@@ -40,7 +40,7 @@ class ModelFixture(BaseHTTPRequestHandler):
         pass
 
     def do_GET(self):
-        self.send_message({"models": [{"name": "test:latest"}, {"name": "embed:latest"}]})
+        self.send_message({"models": [{"name": "test:latest"}, {"name": "embed:latest"}, {"name": "bge-m3:latest"}]})
 
     def do_POST(self):
         payload = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
@@ -358,8 +358,7 @@ class Integration(unittest.TestCase):
         with self.store.connection() as conn:
             conn.execute("UPDATE vectors SET model='bge-m3' WHERE model='embed'")
             conn.execute("UPDATE vector_buckets SET model='bge-m3' WHERE model='embed'")
-        self.ai.embedding_model = ""
-        self.ai.embedding_api = EmbeddingAPI("test-key")
+        self.ai.configure_embedding("", EmbeddingAPI("test-key"))
 
         def respond(_method, _path, body, _headers):
             payload = json.loads(body)
@@ -401,6 +400,63 @@ class Integration(unittest.TestCase):
             self.assertEqual(status, 200)
             self.assertEqual(data["embedding_endpoint"], EMBEDDING_ENDPOINT)
             self.assertNotIn("test-key", json.dumps(data))
+
+    def test_settings_switch_bge_m3_between_local_and_api_indexes(self):
+        route = "/api/intranet/settings"
+        roles = {"answer": "", "rerank": "", "embedding": LOCAL_EMBEDDING}
+        source = self.import_mail()
+        refresh = {"source": source, "action": "refresh"}
+        query = {"query": "의미 검색 테스트", "filters": {"source": source}}
+        with (patch("mailsearch.embedding.http.client.HTTPSConnection") as https,
+              patch.object(self.ai, "call", wraps=self.ai.call) as local_call):
+            status, test = self.call(route, {"action": "test", "selections": roles})
+            self.assertEqual((status, test), (200, {"checks": {"embedding": {"ok": True}}}))
+            self.assertEqual(self.ai.embedding_index, "embed")
+            status, result = self.call(route, {"action": "apply", "selections": roles})
+            self.assertEqual(status, 200)
+            self.assertEqual(result["selections"], roles)
+            self.assertFalse(result["configured"])
+            self.assertEqual(self.call("/api/source-action", refresh)[0], 202)
+            self.assertIsNone(await_source(self.store, source, {"ready"})["issue"])
+            self.assertTrue(any("similarity" in row for row in self.call("/api/search", query)[1]["results"]))
+            self.assertEqual(local_call.call_args.args[:2], ("/api/embed", {
+                "model": "bge-m3:latest", "input": [query["query"]], "truncate": True,
+            }))
+            https.assert_not_called()
+
+            api_roles = {**roles, "embedding": "bge-m3"}
+            self.assertEqual(self.call(route, {"action": "apply", "selections": api_roles})[0], 400)
+            self.assertEqual(self.call(route, {"action": "apply", "selections": api_roles, "key": "test-key"})[0], 200)
+            self.assertEqual(self.call("/api/sources")[1]["embedding_endpoint"], EMBEDDING_ENDPOINT)
+            local_call.reset_mock()
+            connection = https.return_value
+            response = connection.getresponse.return_value
+            response.status = 200
+
+            def answer_embeddings(_method, _path, body, _headers):
+                value = json.loads(body)
+                self.assertEqual(value["model"], "bge-m3")
+                count = len(value["input"]) if isinstance(value["input"], list) else 1
+                response.read.return_value = json.dumps({"data": [
+                    {"index": idx, "embedding": [1.0, 0.05, 0.12]} for idx in range(count)
+                ]}).encode()
+
+            connection.request.side_effect = answer_embeddings
+            self.assertFalse(any("similarity" in row for row in self.call("/api/search", query)[1]["results"]))
+            self.assertEqual(self.call("/api/source-action", refresh)[0], 202)
+            self.assertIsNone(await_source(self.store, source, {"ready"})["issue"])
+            self.assertTrue(any("similarity" in row for row in self.call("/api/search", query)[1]["results"]))
+            local_call.assert_not_called()
+            with self.store.connection() as conn:
+                indexes = {row[0] for row in conn.execute("SELECT DISTINCT model FROM vectors")}
+            self.assertTrue({"bge-m3", EMBEDDING_ENDPOINT + "#bge-m3"}.issubset(indexes))
+
+            self.assertEqual(self.call(route, {"action": "apply", "selections": roles})[0], 200)
+            https.reset_mock()
+            self.assertTrue(any("similarity" in row for row in self.call("/api/search", query)[1]["results"]))
+            https.assert_not_called()
+            self.assertEqual(self.call(route, {"action": "disconnect"})[0], 200)
+            self.assertEqual(self.call(route)[1]["selections"], roles)
 
     def test_ping_route_requires_session(self):
         self.assertEqual(self.call("/api/ping", token=False)[0], 403)
@@ -717,7 +773,7 @@ class Integration(unittest.TestCase):
                 self.assertNotIn(str(self.mail), wire.call_args.args[1])
 
     def test_internal_review_finds_decision_at_end_of_linked_reply(self):
-        self.ai.embedding_model = ""
+        self.ai.configure_embedding("", None)
         folder = self.mail / "chain"
         folder.mkdir()
         marker = "계약 갱신 대상을 전 지점으로 확정했습니다."
