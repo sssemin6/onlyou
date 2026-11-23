@@ -451,8 +451,7 @@ mark { color: var(--ink); background: #f2cf84; }
   font-weight: 780;
 }
 .settings-advanced > .settings-fields { padding: 2px 10px 8px; }
-.gateway-preset-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 5px; }
-.gateway-preset-actions button { min-height: 34px; font-size: .8rem; }
+#gateway-defaults { justify-self: start; min-height: 34px; margin-bottom: 5px; font-size: .8rem; }
 .ollama-setup {
   padding: 8px 10px;
   margin-bottom: 7px;
