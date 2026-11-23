@@ -10,11 +10,13 @@ import threading
 import time
 import unittest
 import zipfile
+import zlib
 from unittest.mock import MagicMock, patch
 from email.message import EmailMessage
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+from mailsearch.api_settings import ApiSettings, user_dpapi
 from mailsearch.answer import LocalAI, delivery_date_answer, validate
 from mailsearch.embedding import EmbeddingAPI, GatewayRequestError, tls_context, warn_unverified
 from mailsearch.external import ExternalAI, Excerpt, Reviews, pcf_batches
@@ -203,6 +205,45 @@ class Integration(unittest.TestCase):
             request.assert_called_once()
             _, path, body, _ = request.call_args.args
             self.assertEqual((path, json.loads(body)["model"]), ("/v1/chat/completions", "answer-model-b"))
+
+    def test_dashboard_saves_gateway_settings_and_restores_the_key(self):
+        route = "/api/intranet/settings"
+        self.app.api_settings = ApiSettings(self.store.root)
+        profile = {
+            "gateway_url": "https://configured.example.invalid/v1",
+            "answer_models": "dashboard-model-a, dashboard-model-b",
+            "ca_file": "/local/company-ca.pem",
+            "key": "dashboard-fixture-key",
+            "selections": {"answer": "dashboard-model-b", "embedding": "bge-m3", "rerank": ""},
+        }
+        def protected(data, *, decrypt=False):
+            return zlib.decompress(data) if decrypt else zlib.compress(data)
+
+        with (patch.object(ApiSettings, "secure", True),
+              patch("mailsearch.api_settings.user_dpapi", side_effect=protected),
+              patch.dict(os.environ, {"MAILSEARCH_GATEWAY_URL": "", "MAILSEARCH_GATEWAY_ANSWER_MODELS": ""})):
+            status, saved = self.call(route, {"action": "apply", **profile})
+            self.assertEqual(status, 200)
+            self.assertNotIn(profile["key"], json.dumps(saved))
+            self.assertNotIn(profile["key"].encode(), self.app.api_settings.path.read_bytes())
+            self.assertTrue(saved["persistent_keys"])
+            self.assertEqual(saved["gateway_url"], "https://configured.example.invalid")
+            self.assertEqual(saved["selections"], profile["selections"])
+            self.assertEqual(self.ai.embedding_index, "https://configured.example.invalid/v1/embeddings#bge-m3")
+            self.assertEqual(self.app.external.tls.ca_file, profile["ca_file"])
+            self.assertTrue(self.app.external.tls.verify)
+            new_origin = {**profile, "key": "", "gateway_url": "https://changed.example.invalid"}
+            self.assertEqual(self.call(route, {"action": "apply", **new_origin})[1]["error"], "external_key_required")
+            self.assertEqual(self.call(route, {"action": "apply", **profile, "test_unverified": True})[0], 400)
+
+            restored_ai = LocalAI("test")
+            with App(0, self.store, self.indexer, restored_ai, api_settings=ApiSettings(self.store.root)) as restored:
+                self.assertEqual(restored.external.model, "dashboard-model-b")
+                self.assertEqual(restored.external._key, profile["key"])
+                self.assertTrue(restored_ai.embedding_api.tls.verify)
+                self.assertEqual(restored.gateway_fields["answer_models"], "dashboard-model-a,dashboard-model-b")
+            self.assertEqual(self.call(route, {"action": "disconnect"})[0], 200)
+            self.assertFalse(self.app.api_settings.load()["gateway"]["key"])
 
     def test_external_settings_are_session_scoped_and_do_not_echo_key(self):
         route = "/api/external/settings"
@@ -1135,6 +1176,22 @@ class EmbeddingTransport(unittest.TestCase):
             response.read.return_value = json.dumps({"data": entries}).encode()
             with self.assertRaises(ValueError):
                 api.embed(["first", "second"], timeout=10)
+
+
+class ApiSettingsPersistence(unittest.TestCase):
+    def test_platform_without_dpapi_does_not_write_key(self):
+        with tempfile.TemporaryDirectory() as directory, patch.object(ApiSettings, "secure", False):
+            settings = ApiSettings(Path(directory))
+            settings.save({"external": {"destination": "https://test.example.invalid", "key": "fixture-key"}})
+            self.assertEqual(settings.load(), {"external": {"destination": "https://test.example.invalid"}})
+            self.assertNotIn(b"fixture-key", settings.path.read_bytes())
+
+    @unittest.skipUnless(sys.platform == "win32", "Windows DPAPI is required")
+    def test_windows_dpapi_protects_and_restores_current_user_data(self):
+        secret = b"temporary-test-credential"
+        encrypted = user_dpapi(secret)
+        self.assertNotIn(secret, encrypted)
+        self.assertEqual(user_dpapi(encrypted, decrypt=True), secret)
 
 
 class GatewayTLS(unittest.TestCase):
