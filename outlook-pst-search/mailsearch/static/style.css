@@ -395,7 +395,7 @@ mark { color: var(--ink); background: #f2cf84; }
 }
 .settings-fields { display: grid; gap: 5px; }
 .settings-fields label { font-size: .84rem; font-weight: 780; }
-.settings-fields input {
+.settings-fields input, .settings-fields select {
   width: 100%;
   min-width: 0;
   min-height: 38px;
@@ -405,6 +405,7 @@ mark { color: var(--ink); background: #f2cf84; }
   border-radius: 6px;
   background: var(--paper);
 }
+.settings-fields [hidden] { display: none; }
 .settings-fields p, #settings-test-help { color: var(--muted); font-size: .78rem; }
 .settings-fields p { margin: -4px 0 7px; }
 .settings-actions {
