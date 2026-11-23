@@ -406,6 +406,8 @@ mark { color: var(--ink); background: #f2cf84; }
   background: var(--paper);
 }
 .settings-fields [hidden] { display: none; }
+.settings-checkbox { display: flex; align-items: center; gap: .5rem; }
+.settings-fields .settings-checkbox input { width: auto; min-height: auto; margin: 0; }
 .settings-fields p, #settings-test-help { color: var(--muted); font-size: .78rem; }
 .settings-fields p { margin: -4px 0 7px; }
 .settings-actions {
