@@ -11,3 +11,4 @@ __pycache__/
 api-settings.dat
 api-settings-*.tmp
 /gateway-defaults.json
+/gateway-defaults.seed.json
