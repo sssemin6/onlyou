@@ -19,14 +19,14 @@ from urllib.parse import urlsplit
 
 from .answer import (PCF_INSTRUCTIONS, LocalAI, map_citations, pcf_candidates, pcf_retrieval, pcf_word, delivery_date_answer,
                      evidence_for, merge_rows, public_row, validate)
-from .embedding import ENDPOINT as EMBEDDING_ENDPOINT
+from .embedding import ENDPOINT as EMBEDDING_ENDPOINT, MODEL as BGE_MODEL
 from .external import DEFAULT_MODEL, DEFAULT_URL, MAX_EXCERPTS, MAX_INTERNAL_EXCERPTS, MAX_PCF_CELLS, ExternalAI, ExternalRequestError, Reviews, pcf_batches, pcf_input_fits
 from .extract import MAX_ATTACHMENT
 from .filesystem import local_path
 from .indexer import ImportIssue, Indexer
-from .intranet import CHAT_URL, DEFAULTS as HD_DEFAULTS, MODELS as HD_MODELS, IntranetAI
+from .intranet import CHAT_URL, DEFAULTS as HD_DEFAULTS, MODELS as HD_MODELS, IntranetAI, LOCAL_EMBEDDING
 from .pcf import PCF_CELL
-from .store import Store, normalized, query_words, quoted_plan
+from .store import Store, normalized, pack_vector, query_words, quoted_plan
 
 STATIC = Path(__file__).with_name("static")
 FILES = {"/": ("index.html", "text/html; charset=utf-8"), "/style.css": ("style.css", "text/css; charset=utf-8"),
@@ -68,6 +68,7 @@ class App(ThreadingHTTPServer):
         super().__init__(("127.0.0.1", port), Handler)
         self.store, self.indexer, self.ai = store, indexer, ai
         self.external = external
+        self.embedding_selection = None
         self.reviews = Reviews()
         self.outbound = threading.BoundedSemaphore(1)
         self.token = secrets.token_urlsafe(32)
@@ -586,12 +587,19 @@ class Handler(BaseHTTPRequestHandler):
 
 
     def intranet_settings(self):
-        current = self.server.ai.embedding_api
+        local, current = self.server.ai.embedding_config
         configured = isinstance(current, IntranetAI)
+        selections = dict(current.models if configured else HD_DEFAULTS)
+        if not configured and self.server.embedding_selection is not None:
+            selections.update(answer="", rerank="", embedding=self.server.embedding_selection)
+        if local.split(":")[0] == BGE_MODEL and not (current and current.index_key):
+            selections["embedding"] = LOCAL_EMBEDDING
+            if not configured:
+                selections["answer"] = ""
         return {
             "destination": CHAT_URL, "models": HD_MODELS,
             "configured": configured,
-            "selections": current.models if configured else HD_DEFAULTS,
+            "selections": selections,
             "active_answer": configured and current.answer_client is not None and self.server.external is current.answer_client,
         }
 
@@ -608,23 +616,35 @@ class Handler(BaseHTTPRequestHandler):
             if not isinstance(current, IntranetAI):
                 current = None
             candidate = None
+            local_model = server.ai.embedding_model
             if action != "disconnect":
                 key = payload.get("key", "")
                 if not isinstance(key, str):
                     raise ValueError("embedding_api_key")
                 try:
-                    candidate = IntranetAI.from_settings(key.strip(), payload.get("selections"), current)
+                    selections = payload.get("selections")
+                    candidate = IntranetAI.from_settings(key.strip(), selections, current)
+                    local_model = BGE_MODEL if selections["embedding"] == LOCAL_EMBEDDING else ""
                 except ValueError as exc:
                     self.send_json(400, {"error": str(exc)})
                     return
             if action == "test":
-                self.send_json(200, {"checks": candidate.test_models()})
+                checks = candidate.test_models() if candidate else {}
+                if local_model:
+                    try:
+                        vectors = server.ai.embed_local(local_model, ["Hello"], 8)
+                        pack_vector(vectors[0])
+                        checks["embedding"] = {"ok": True}
+                    except (OSError, ValueError, RuntimeError, KeyError, IndexError, TypeError, http.client.HTTPException):
+                        checks["embedding"] = {"ok": False}
+                self.send_json(200, {"checks": checks})
                 return
             with server.indexer.lock:
                 if server.indexer.events:
                     self.send_json(409, {"error": "hd_indexing"})
                     return
-                server.ai.embedding_api = candidate
+                server.ai.configure_embedding(local_model, candidate)
+                server.embedding_selection = LOCAL_EMBEDDING if local_model == BGE_MODEL else ""
                 if candidate and candidate.answer_client:
                     server.external = candidate.answer_client
                 elif current and server.external is current.answer_client:
@@ -748,7 +768,9 @@ def main(argv=None):
         try:
             models = dict.fromkeys(HD_MODELS, "")
             if not args.embedding_model:
-                models["embedding"] = HD_DEFAULTS["embedding"]
+                models["embedding"] = BGE_MODEL
+            elif args.embedding_model.split(":")[0] == BGE_MODEL:
+                models["embedding"] = LOCAL_EMBEDDING
             embedding_api = IntranetAI(embedding_key, models)
         except ValueError:
             print("Embedding API disabled: check the LITELLM_API_KEY environment variable.", file=sys.stderr)
