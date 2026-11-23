@@ -43,7 +43,9 @@ const issueNames = {
   pcf_input_too_large: "선택한 COMMENT이 현재 입력 한도를 초과합니다.",
   gateway_indexing: "색인 중에는 모델 설정을 유지합니다. 색인이 끝나거나 일시정지한 뒤 적용하세요.",
   gateway_models: "용도별 모델 선택을 확인하세요.",
-  gateway_url: "앱을 시작하기 전에 MAILSEARCH_GATEWAY_URL에 사내 HTTPS 주소를 설정하세요.",
+  gateway_url: "설정 창에서 올바른 사내 HTTPS 주소를 입력하세요.",
+  gateway_settings: "사내 API 주소와 인증서 경로를 확인하세요.",
+  api_settings_save_failed: "설정을 저장하지 못했습니다. 앱 데이터 폴더에 쓸 수 있는지 확인하세요.",
   embedding_api_key: "사내 API 키에 공백이 있는지 확인하세요.",
   external_disabled: "상단의 API 설정에서 답변에 사용할 AI를 연결해 주세요.",
   external_url: "HTTPS 주소를 확인하세요. 주소는 /chat/completions 또는 /messages로 끝나야 합니다.",
@@ -606,10 +608,24 @@ let genericSettings;
 const settingsProvider = element("settings-provider");
 
 function setSettingsBusy(busy) {
+  const inactive = settingsProvider.value === "intranet" ? "settings-generic" : "settings-gateway";
   for (const control of settingsForm.querySelectorAll("input, button, select")) {
-    if (control.id !== "settings-close") control.disabled = busy;
+    if (control.id !== "settings-close") control.disabled = busy || element(inactive).contains(control);
   }
 }
+
+function setGatewayAnswers(selected) {
+  const answer = element("gateway-answer");
+  const names = new Set(element("gateway-answer-models").value.split(",").map(value => value.trim()).filter(Boolean));
+  answer.replaceChildren(new Option("사용 안 함", ""));
+  for (const name of names) answer.add(new Option(name, name));
+  answer.value = names.has(selected) ? selected : "";
+}
+
+element("gateway-answer-models").addEventListener("input", () => {
+  const answer = element("gateway-answer");
+  if (answer) setGatewayAnswers(answer.value);
+});
 
 function renderSettings() {
   const gateway = settingsProvider.value === "intranet";
@@ -618,12 +634,20 @@ function renderSettings() {
   element("settings-url").required = !gateway;
   element("settings-model").required = !gateway;
   element("settings-key").value = "";
+  const settings = gateway ? gatewaySettings : genericSettings;
+  element("settings-key-help").textContent = settings?.persistent_keys
+    ? "적용하면 키를 현재 Windows 사용자 계정으로 암호화해 저장합니다. 연결 해제로 삭제할 수 있습니다."
+    : "이 환경에서는 키를 앱이 실행되는 동안 사용합니다.";
   if (gateway) {
     if (!gatewaySettings) return;
+    element("gateway-url").value = gatewaySettings.gateway_url;
+    element("gateway-answer-models").value = gatewaySettings.answer_models;
+    element("gateway-ca-file").value = gatewaySettings.ca_file;
+    element("gateway-test-unverified").checked = false;
     const subject = gatewaySettings.destination ? new URL(gatewaySettings.destination).host : "";
     element("settings-current").textContent = gatewaySettings.configured
       ? subject + (gatewaySettings.active_answer ? " · 답변 제공자 사용 중" : " · 키 등록됨")
-      : (subject ? "사내 API를 선택한 기능에만 키가 필요합니다." : "사내 API를 사용하려면 실행 환경에 주소를 설정하세요.");
+      : (subject ? "사내 API를 선택한 기능에만 키가 필요합니다." : "사내 API를 사용하려면 아래에 HTTPS 주소를 입력하세요.");
     element("settings-remove").hidden = !gatewaySettings.configured;
     element("settings-key").placeholder = gatewaySettings.configured ? "등록된 사내 키를 쓰려면 비워 두세요" : "";
     const roles = element("settings-roles");
@@ -640,6 +664,7 @@ function renderSettings() {
       field.value = gatewaySettings.selections[role];
       roles.append(title, field);
     }
+    setGatewayAnswers(gatewaySettings.selections.answer);
     const embedding = element("gateway-embedding");
     embedding.addEventListener("change", () => {
       if (embedding.value !== localEmbedding || gatewaySettings.configured || element("settings-key").value.trim()) return;
@@ -695,6 +720,7 @@ element("settings-open").addEventListener("click", async () => {
 });
 settingsProvider.addEventListener("change", () => {
   renderSettings();
+  setSettingsBusy(false);
   settingsMessage("");
 });
 element("settings-close").addEventListener("click", () => settingsDialog.close());
@@ -714,6 +740,10 @@ async function changeSettings(action) {
   if (action !== "disconnect") {
     payload.key = element("settings-key").value.trim();
     if (gateway) {
+      payload.gateway_url = element("gateway-url").value.trim();
+      payload.answer_models = element("gateway-answer-models").value.trim();
+      payload.ca_file = element("gateway-ca-file").value.trim();
+      payload.test_unverified = action === "test" && element("gateway-test-unverified").checked;
       payload.selections = Object.fromEntries(Object.keys(gatewayRoles).map((role) => [role, element("gateway-" + role).value]));
     } else {
       payload.destination = element("settings-url").value.trim();
@@ -737,7 +767,7 @@ async function changeSettings(action) {
     if (gateway) gatewaySettings = data;
     else genericSettings = { ...genericSettings, configured: data.configured };
     renderSettings();
-    settingsMessage(action === "disconnect" ? "연결을 해제했습니다."
+    settingsMessage(action === "disconnect" ? "연결을 해제하고 저장된 키를 지웠습니다."
       : gateway ? "설정을 적용했습니다. 임베딩 설정을 바꿨다면 보관함을 갱신하세요."
       : "설정을 적용했습니다. 검색 화면에서 답변 API를 선택할 수 있습니다.");
   } catch (error) {
