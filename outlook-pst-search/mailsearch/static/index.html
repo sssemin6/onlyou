@@ -156,7 +156,15 @@
           </select>
           <div id="settings-gateway" class="settings-fields">
             <div id="settings-roles" class="settings-fields"></div>
-            <p>로컬 BGE-M3는 Ollama 설치가 필요합니다. 사내 API 임베딩과 재정렬에는 텍스트가 전송됩니다.</p>
+            <div id="ollama-setup" class="ollama-setup" hidden>
+              <p id="ollama-setup-status" role="status"></p>
+              <div class="ollama-setup-actions">
+                <button type="button" id="ollama-install" class="button" aria-describedby="ollama-install-help" hidden>설치</button>
+                <button type="button" id="ollama-check" class="text-button" hidden>다시 확인</button>
+              </div>
+              <p id="ollama-install-help" hidden>설치에는 인터넷 연결이 필요합니다. BGE-M3 다운로드는 약 1.2GB입니다.</p>
+            </div>
+            <p>사내 API 임베딩과 재정렬에는 텍스트가 전송됩니다.</p>
             <details id="gateway-advanced" class="settings-advanced">
               <summary>고급 설정</summary>
               <div class="settings-fields">
