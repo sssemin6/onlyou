@@ -19,7 +19,7 @@ from urllib.parse import urlsplit
 
 from .answer import (PCF_INSTRUCTIONS, LocalAI, map_citations, pcf_candidates, pcf_retrieval, pcf_word, delivery_date_answer,
                      evidence_for, merge_rows, public_row, validate)
-from .bundled import prepare as prepare_bundled
+from .embedding import ENDPOINT as EMBEDDING_ENDPOINT, MODEL as EMBEDDING_MODEL, EmbeddingAPI
 from .external import DEFAULT_MODEL, DEFAULT_URL, MAX_EXCERPTS, MAX_INTERNAL_EXCERPTS, MAX_PCF_CELLS, ExternalAI, ExternalRequestError, Reviews, pcf_batches, pcf_input_fits
 from .extract import MAX_ATTACHMENT
 from .filesystem import local_path
@@ -198,7 +198,9 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(200, {
                 "sources": [{**row, "available": row["id"] in ids,
                              "updates": self.server.indexer.pending_updates(row)} for row in sources],
-                "model": self.server.ai.model, "embedding": self.server.ai.embedding_model,
+                "model": self.server.ai.model,
+                "embedding": EMBEDDING_MODEL if self.server.ai.embedding_api else self.server.ai.embedding_model,
+                "embedding_endpoint": EMBEDDING_ENDPOINT if self.server.ai.embedding_api else None,
                 "external": external.public if external else None,
             })
         elif route.path == "/api/ping":
@@ -274,9 +276,9 @@ class Handler(BaseHTTPRequestHandler):
                 rows = store.exact_search(plan, filters)
             else:
                 rows = store.lexical(query, filters, limit=180)
-                if query and ai.embedding_model:
+                if query and ai.embedding_index:
                     try:
-                        nearby = store.semantic(ai.embed([query], timeout=6)[0], ai.embedding_model, filters)
+                        nearby = store.semantic(ai.embed([query], timeout=6)[0], ai.embedding_index, filters)
                         rows = merge_rows(rows, nearby, limit=60)
                     except (OSError, ValueError, RuntimeError, KeyError, IndexError, TypeError, http.client.HTTPException):
                         pass
@@ -678,14 +680,18 @@ def main(argv=None):
         print("External API disabled: check MAILSEARCH_EXTERNAL_MODEL, MAILSEARCH_EXTERNAL_URL and MAILSEARCH_EXTERNAL_API_KEY.", file=sys.stderr)
     finally:
         os.environ.pop("MAILSEARCH_EXTERNAL_API_KEY", None)
+    embedding_key = os.environ.pop("LITELLM_API_KEY", "")
+    embedding_api = None
+    if embedding_key and not args.embedding_model:
+        try:
+            embedding_api = EmbeddingAPI(embedding_key)
+        except ValueError:
+            print("Embedding API disabled: check the LITELLM_API_KEY environment variable.", file=sys.stderr)
+    del embedding_key
     try:
         root = local_path(args.data)
         root.mkdir(mode=0o700, parents=True, exist_ok=True)
-        models_dir = None
-        if args.embedding_model and args.embedding_model.split(":")[0] == "bge-m3":
-            # The repository ships the model split into parts; join it once on first run.
-            models_dir = prepare_bundled(root / "ollama-models")
-        ai = LocalAI(args.model, args.embedding_model, args.ollama_port, models_dir=models_dir)
+        ai = LocalAI(args.model, args.embedding_model, args.ollama_port, embedding_api=embedding_api)
         with SessionLock(root):
             store = Store(root)
             indexer = Indexer(store, args.readpst, args.pdftotext, ai)
