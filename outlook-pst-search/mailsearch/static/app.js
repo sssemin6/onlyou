@@ -41,8 +41,9 @@ const issueNames = {
   interrupted: "중단된 색인입니다.",
   embedding_unavailable: "의미 색인을 완료하지 못했습니다. 키워드 검색은 사용 가능하며, 연결을 확인한 뒤 보관함을 갱신할 수 있습니다.",
   pcf_input_too_large: "선택한 COMMENT이 현재 입력 한도를 초과합니다.",
-  hd_indexing: "색인 중에는 모델 설정을 유지합니다. 색인이 끝나거나 일시정지한 뒤 적용하세요.",
-  hd_models: "용도별 모델 선택을 확인하세요.",
+  gateway_indexing: "색인 중에는 모델 설정을 유지합니다. 색인이 끝나거나 일시정지한 뒤 적용하세요.",
+  gateway_models: "용도별 모델 선택을 확인하세요.",
+  gateway_url: "앱을 시작하기 전에 MAILSEARCH_GATEWAY_URL에 사내 HTTPS 주소를 설정하세요.",
   embedding_api_key: "사내 API 키에 공백이 있는지 확인하세요.",
   external_disabled: "상단의 API 설정에서 답변에 사용할 AI를 연결해 주세요.",
   external_url: "HTTPS 주소를 확인하세요. 주소는 /chat/completions 또는 /messages로 끝나야 합니다.",
@@ -254,7 +255,7 @@ async function showSources() {
   const modelStatus = element("model-status");
   modelStatus.parentElement.dataset.configured = Boolean(data.embedding);
   if (data.embedding_endpoint) {
-    modelStatus.textContent = "HD AIC 의미 검색 · " + data.embedding;
+    modelStatus.textContent = "사내 API 의미 검색 · " + data.embedding;
     modelStatus.title = data.embedding_endpoint;
   } else {
     modelStatus.textContent = data.embedding ? "로컬 의미 검색 · " + data.embedding : "로컬 키워드 검색";
@@ -595,12 +596,12 @@ function settingsMessage(message) {
   element("settings-status").textContent = message;
 }
 
-const hdRoles = {
+const gatewayRoles = {
   answer: ["근거 답변", "사용 안 함"], embedding: ["임베딩 실행 위치", "임베딩 사용 안 함"],
   rerank: ["검색 후보 재정렬", "사용 안 함"],
 };
 const localEmbedding = "ollama:bge-m3";
-let hdSettings;
+let gatewaySettings;
 let genericSettings;
 const settingsProvider = element("settings-provider");
 
@@ -611,39 +612,39 @@ function setSettingsBusy(busy) {
 }
 
 function renderSettings() {
-  const hd = settingsProvider.value === "intranet";
+  const gateway = settingsProvider.value === "intranet";
   element("settings-generic").hidden = hd;
-  element("settings-hd").hidden = !hd;
-  element("settings-url").required = !hd;
-  element("settings-model").required = !hd;
+  element("settings-gateway").hidden = !gateway;
+  element("settings-url").required = !gateway;
+  element("settings-model").required = !gateway;
   element("settings-key").value = "";
-  if (hd) {
-    if (!hdSettings) return;
-    const subject = new URL(hdSettings.destination).host;
-    element("settings-current").textContent = hdSettings.configured
-      ? subject + (hdSettings.active_answer ? " · 답변 제공자 사용 중" : " · 키 등록됨")
-      : "사내 API를 선택한 기능에만 키가 필요합니다.";
-    element("settings-remove").hidden = !hdSettings.configured;
-    element("settings-key").placeholder = hdSettings.configured ? "등록된 사내 키를 쓰려면 비워 두세요" : "";
+  if (gateway) {
+    if (!gatewaySettings) return;
+    const subject = gatewaySettings.destination ? new URL(gatewaySettings.destination).host : "";
+    element("settings-current").textContent = gatewaySettings.configured
+      ? subject + (gatewaySettings.active_answer ? " · 답변 제공자 사용 중" : " · 키 등록됨")
+      : (subject ? "사내 API를 선택한 기능에만 키가 필요합니다." : "사내 API를 사용하려면 실행 환경에 주소를 설정하세요.");
+    element("settings-remove").hidden = !gatewaySettings.configured;
+    element("settings-key").placeholder = gatewaySettings.configured ? "등록된 사내 키를 쓰려면 비워 두세요" : "";
     const roles = element("settings-roles");
     roles.replaceChildren();
-    for (const [role, [label, disabled]] of Object.entries(hdRoles)) {
+    for (const [role, [label, disabled]] of Object.entries(gatewayRoles)) {
       const field = node("select");
-      field.id = "hd-" + role;
+      field.id = "gateway-" + role;
       const title = node("label", label);
       title.htmlFor = field.id;
       field.add(new Option(disabled, ""));
-      for (const [id, name] of Object.entries(hdSettings.models[role])) {
+      for (const [id, name] of Object.entries(gatewaySettings.models[role])) {
         field.add(new Option(name, id));
       }
-      field.value = hdSettings.selections[role];
+      field.value = gatewaySettings.selections[role];
       roles.append(title, field);
     }
-    const embedding = element("hd-embedding");
+    const embedding = element("gateway-embedding");
     embedding.addEventListener("change", () => {
-      if (embedding.value !== localEmbedding || hdSettings.configured || element("settings-key").value.trim()) return;
-      element("hd-answer").value = "";
-      element("hd-rerank").value = "";
+      if (embedding.value !== localEmbedding || gatewaySettings.configured || element("settings-key").value.trim()) return;
+      element("gateway-answer").value = "";
+      element("gateway-rerank").value = "";
     });
   } else {
     if (!genericSettings) return;
@@ -669,7 +670,7 @@ element("settings-open").addEventListener("click", async () => {
   try {
     const [internal, external] = await Promise.all([call("/api/intranet/settings"), call("/api/external/settings")]);
     if (version !== settingsRequest || !settingsDialog.open) return;
-    hdSettings = internal;
+    gatewaySettings = internal;
     genericSettings = external;
     settingsProvider.value = external.configured && !internal.configured && internal.selections.embedding !== localEmbedding
       ? "external" : "intranet";
@@ -695,13 +696,13 @@ settingsDialog.addEventListener("close", () => {
 async function changeSettings(action) {
   if (action !== "disconnect" && !settingsForm.reportValidity()) return;
   const version = settingsRequest;
-  const hd = settingsProvider.value === "intranet";
-  const route = hd ? "/api/intranet/settings" : "/api/external/settings";
+  const gateway = settingsProvider.value === "intranet";
+  const route = gateway ? "/api/intranet/settings" : "/api/external/settings";
   const payload = { action };
   if (action !== "disconnect") {
     payload.key = element("settings-key").value.trim();
-    if (hd) {
-      payload.selections = Object.fromEntries(Object.keys(hdRoles).map((role) => [role, element("hd-" + role).value]));
+    if (gateway) {
+      payload.selections = Object.fromEntries(Object.keys(gatewayRoles).map((role) => [role, element("gateway-" + role).value]));
     } else {
       payload.destination = element("settings-url").value.trim();
       payload.model = element("settings-model").value.trim();
@@ -715,17 +716,17 @@ async function changeSettings(action) {
     if (action !== "test") showSources().catch(() => {});
     if (version !== settingsRequest || !settingsDialog.open) return;
     if (action === "test") {
-      const checks = hd ? Object.entries(data.checks).map(([role, result]) =>
-        hdRoles[role][0] + (result.ok ? " 성공" : " 실패" + (result.http_status ? " (HTTP " + result.http_status + ")" : "")
+      const checks = gateway ? Object.entries(data.checks).map(([role, result]) =>
+        gatewayRoles[role][0] + (result.ok ? " 성공" : " 실패" + (result.http_status ? " (HTTP " + result.http_status + ")" : "")
           + (role === "embedding" && payload.selections.embedding === localEmbedding ? " (Ollama의 bge-m3 설치를 확인하세요)" : ""))) : [];
-      settingsMessage(hd ? (checks.join(" · ") || "테스트할 모델을 선택하세요.") : "연결 테스트에 성공했습니다.");
+      settingsMessage(gateway ? (checks.join(" · ") || "테스트할 모델을 선택하세요.") : "연결 테스트에 성공했습니다.");
       return;
     }
-    if (hd) hdSettings = data;
+    if (gateway) gatewaySettings = data;
     else genericSettings = { ...genericSettings, configured: data.configured };
     renderSettings();
     settingsMessage(action === "disconnect" ? "연결을 해제했습니다."
-      : hd ? "설정을 적용했습니다. 임베딩 설정을 바꿨다면 보관함을 갱신하세요."
+      : gateway ? "설정을 적용했습니다. 임베딩 설정을 바꿨다면 보관함을 갱신하세요."
       : "설정을 적용했습니다. 검색 화면에서 답변 API를 선택할 수 있습니다.");
   } catch (error) {
     if (version === settingsRequest && settingsDialog.open) settingsMessage(error.message);
