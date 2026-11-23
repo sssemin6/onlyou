@@ -5,12 +5,13 @@ import http.client
 import os
 import shutil
 import sqlite3
+import stat
 import subprocess
 import threading
 from pathlib import Path
 
 from .extract import CREATE_FLAGS, DOCUMENT_SUFFIXES, extract_attachment, extract_document, parse_mail
-from .filesystem import local_path, stable_input
+from .filesystem import source_path, stable_input
 from .pcf import WORD_SUFFIXES
 from .store import buckets, document_kind, document_identity, now, pack_vector, read_signature, sections, vector_array
 
@@ -54,19 +55,38 @@ class Indexer:
         self.spool.mkdir(mode=0o700, exist_ok=True)
 
     def register(self, path):
-        try:
-            path = local_path(path, strict=True)
-        except (OSError, RuntimeError, ValueError) as exc:
-            raise ImportIssue("source_path") from exc
-        if path == self.store.root or path.is_relative_to(self.store.root) or self.store.root.is_relative_to(path):
+        if not isinstance(path, (str, os.PathLike)):
             raise ImportIssue("source_path")
-        if path.is_dir():
-            kind = "eml_dir"
-        elif path.is_file() and path.suffix.lower() in {".pst", ".eml"} | DOCUMENT_SUFFIXES:
-            suffix = path.suffix.lower()
-            kind = "pst" if suffix == ".pst" else ("eml" if suffix == ".eml" else "doc")
-        else:
-            raise ImportIssue("source_format")
+        path = str(path).strip()
+        if path.startswith('"') and path.endswith('"'):
+            path = path[1:-1]
+        if not path:
+            raise ImportIssue("source_path")
+        try:
+            path = source_path(path)
+            if path == self.store.root or path.is_relative_to(self.store.root) or self.store.root.is_relative_to(path):
+                raise ImportIssue("source_path")
+            mode = path.stat().st_mode
+            if stat.S_ISDIR(mode):
+                with os.scandir(path):
+                    pass
+                kind = "eml_dir"
+            elif stat.S_ISREG(mode) and path.suffix.lower() in {".pst", ".eml"} | DOCUMENT_SUFFIXES:
+                with path.open("rb"):
+                    pass
+                suffix = path.suffix.lower()
+                kind = "pst" if suffix == ".pst" else ("eml" if suffix == ".eml" else "doc")
+            else:
+                raise ImportIssue("source_format")
+        except OSError as exc:
+            winerror = getattr(exc, "winerror", None)
+            if winerror in {32, 33} and Path(path).suffix.casefold() == ".pst":
+                raise ImportIssue("pst_in_use") from exc
+            if isinstance(exc, PermissionError) or winerror in {65, 86, 1326}:
+                raise ImportIssue("source_access") from exc
+            raise ImportIssue("source_path") from exc
+        except (RuntimeError, ValueError) as exc:
+            raise ImportIssue("source_path") from exc
         with self.lock:
             with self.store.connection() as conn:
                 cursor = conn.execute("INSERT OR IGNORE INTO sources(path,kind) VALUES(?,?)", (str(path), kind))
