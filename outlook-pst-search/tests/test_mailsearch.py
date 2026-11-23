@@ -14,13 +14,14 @@ import zlib
 from unittest.mock import MagicMock, patch
 from email.message import EmailMessage
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 from mailsearch.api_settings import ApiSettings, user_dpapi
 from mailsearch.answer import LocalAI, delivery_date_answer, validate
 from mailsearch.embedding import EmbeddingAPI, GatewayRequestError, tls_context, warn_unverified
 from mailsearch.external import ExternalAI, Excerpt, Reviews, pcf_batches
 from mailsearch.extract import convert_legacy, extract_attachment
+from mailsearch.filesystem import DRIVE_REMOTE, is_unc_share, local_path, source_path
 from mailsearch.intranet import CHAT_PATH, IntranetAI, LOCAL_EMBEDDING
 from mailsearch.indexer import Indexer
 from mailsearch.ollama_setup import (InstallCommandError, install_ollama, package_progress,
@@ -662,6 +663,34 @@ class Integration(unittest.TestCase):
         evidence = self.call(f"/api/evidence/{found[0]['passage']}")[1]
         self.assertIn("±0.05", evidence["text"])
 
+    def test_shared_folder_can_be_registered_and_its_document_opened(self):
+        shared = Path(self.workspace.name) / "shared team"
+        shared.mkdir()
+        original = shared / "회의록.txt"
+        text = "공유 폴더의 회의에서 일정 확정."
+        original.write_text(text, encoding="utf-8")
+        with patch("mailsearch.filesystem.windows_drive_type", return_value=DRIVE_REMOTE):
+            status, payload = self.call("/api/sources", {"path": f' "{shared}" '})
+            self.assertEqual(status, 202)
+            source = payload["source"]
+            row = await_source(self.store, source, {"ready", "error", "empty"})
+            self.assertEqual((row["state"], row["done"]), ("ready", 1))
+            results = self.call("/api/search", {"query": '"일정 확정"', "filters": {"source": source}})[1]["results"]
+            self.assertEqual(len(results), 1)
+            status, evidence = self.call(f"/api/evidence/{results[0]['passage']}")
+            self.assertEqual(status, 200)
+            self.assertIn(text, evidence["text"])
+            self.assertEqual(original.read_text(encoding="utf-8"), text)
+            with self.assertRaises(OSError):
+                local_path(shared)
+
+    def test_registration_explains_missing_path_and_read_permission(self):
+        route = "/api/sources"
+        path = str(Path(self.workspace.name) / "missing")
+        self.assertEqual(self.call(route, {"path": path}), (409, {"error": "source_path"}))
+        with patch("mailsearch.indexer.source_path", side_effect=PermissionError):
+            self.assertEqual(self.call(route, {"path": path}), (409, {"error": "source_access"}))
+
     def mixed_corpus(self):
         """A mixed corpus: one mail plus three documents."""
         folder = Path(self.workspace.name) / "design"
@@ -823,7 +852,8 @@ class Integration(unittest.TestCase):
                                     "MAILSEARCH_PCF_INPUT_BYTES": "12000"}):
             preview = self.call("/api/pcf/preview", payload)[1]
             self.assertEqual((preview["pcf_coverage"]["expected"], len(preview["excerpts"])), (6, 6))
-            with patch.object(self.app.external, "complete") as complete:
+            with (patch.object(self.app.external, "complete") as complete,
+                  patch("mailsearch.filesystem.windows_drive_type", return_value=DRIVE_REMOTE)):
                 quote = "Not closed. Please revise the method."
                 complete.return_value = {"status": "answered", "unknowns": [], "claims": [
                     {"text": "선주는 방법 수정을 요청했습니다.", "citations": [{"source": 5, "quote": quote}]},
@@ -1261,6 +1291,22 @@ class Integration(unittest.TestCase):
         self.assertEqual(indexed["failed"], 0)
         self.assertEqual(hashlib.sha256(path.read_bytes()).digest(), original_digest)
         self.assertTrue(self.call("/api/search", {"query": "", "filters": {}})[1]["results"])
+
+
+class SourcePaths(unittest.TestCase):
+    def test_unc_share_is_recognized_even_when_drive_type_is_unknown(self):
+        for root in (r"\\server\team\archive", r"\\?\UNC\server\team\archive"):
+            path = PureWindowsPath(root)
+            self.assertTrue(is_unc_share(path.drive))
+            fake = MagicMock()
+            fake.expanduser.return_value.resolve.return_value = path
+            with (patch("mailsearch.filesystem.Path", return_value=fake),
+                  patch("mailsearch.filesystem.windows_drive_type", return_value=1)):
+                self.assertEqual(source_path(root), path)
+                with self.assertRaises(OSError):
+                    local_path(root)
+        self.assertFalse(is_unc_share(r"\\.\PhysicalDrive0"))
+        self.assertFalse(is_unc_share("Z:"))
 
 
 @patch.dict(os.environ, GATEWAY_ENV)
