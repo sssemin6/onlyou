@@ -596,9 +596,10 @@ function settingsMessage(message) {
 }
 
 const hdRoles = {
-  answer: ["근거 답변", "사용 안 함"], embedding: ["의미 검색 임베딩", "사내 임베딩 사용 안 함"],
+  answer: ["근거 답변", "사용 안 함"], embedding: ["임베딩 실행 위치", "임베딩 사용 안 함"],
   rerank: ["검색 후보 재정렬", "사용 안 함"],
 };
+const localEmbedding = "ollama:bge-m3";
 let hdSettings;
 let genericSettings;
 const settingsProvider = element("settings-provider");
@@ -621,7 +622,7 @@ function renderSettings() {
     const subject = new URL(hdSettings.destination).host;
     element("settings-current").textContent = hdSettings.configured
       ? subject + (hdSettings.active_answer ? " · 답변 제공자 사용 중" : " · 키 등록됨")
-      : subject + " · 사내 API 키를 입력하세요.";
+      : "사내 API를 선택한 기능에만 키가 필요합니다.";
     element("settings-remove").hidden = !hdSettings.configured;
     element("settings-key").placeholder = hdSettings.configured ? "등록된 사내 키를 쓰려면 비워 두세요" : "";
     const roles = element("settings-roles");
@@ -638,6 +639,12 @@ function renderSettings() {
       field.value = hdSettings.selections[role];
       roles.append(title, field);
     }
+    const embedding = element("hd-embedding");
+    embedding.addEventListener("change", () => {
+      if (embedding.value !== localEmbedding || hdSettings.configured || element("settings-key").value.trim()) return;
+      element("hd-answer").value = "";
+      element("hd-rerank").value = "";
+    });
   } else {
     if (!genericSettings) return;
     const configured = genericSettings.configured;
@@ -664,7 +671,8 @@ element("settings-open").addEventListener("click", async () => {
     if (version !== settingsRequest || !settingsDialog.open) return;
     hdSettings = internal;
     genericSettings = external;
-    settingsProvider.value = external.configured && !internal.configured ? "external" : "intranet";
+    settingsProvider.value = external.configured && !internal.configured && internal.selections.embedding !== localEmbedding
+      ? "external" : "intranet";
     renderSettings();
     setSettingsBusy(false);
     element("settings-key").focus();
@@ -708,7 +716,8 @@ async function changeSettings(action) {
     if (version !== settingsRequest || !settingsDialog.open) return;
     if (action === "test") {
       const checks = hd ? Object.entries(data.checks).map(([role, result]) =>
-        hdRoles[role][0] + (result.ok ? " 성공" : " 실패" + (result.http_status ? " (HTTP " + result.http_status + ")" : ""))) : [];
+        hdRoles[role][0] + (result.ok ? " 성공" : " 실패" + (result.http_status ? " (HTTP " + result.http_status + ")" : "")
+          + (role === "embedding" && payload.selections.embedding === localEmbedding ? " (Ollama의 bge-m3 설치를 확인하세요)" : ""))) : [];
       settingsMessage(hd ? (checks.join(" · ") || "테스트할 모델을 선택하세요.") : "연결 테스트에 성공했습니다.");
       return;
     }
