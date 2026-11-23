@@ -268,6 +268,54 @@ class Integration(unittest.TestCase):
             "rerank": {"ok": False, "reason": "invalid_response"},
         })
 
+    def test_ollama_setup_checks_before_any_download_and_installs_on_request(self):
+        route = "/api/ollama/setup"
+        self.assertEqual(self.call(route, token=False)[0], 403)
+        self.assertEqual(self.call(route, {"action": "install"}, token=False)[0], 403)
+        self.assertEqual(self.call(route, {"action": "other"})[0], 400)
+
+        def await_setup():
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline:
+                _, state = self.call(route)
+                if state["phase"] == "idle":
+                    return state
+                time.sleep(.02)
+            self.fail("Ollama setup did not finish")
+
+        with (patch.object(self.ai, "ensure_server", side_effect=OSError("ollama_not_found")) as ensure_server,
+              patch.object(self.ai, "ensure_model") as ensure_model,
+              patch.object(self.ai, "call") as model_call,
+              patch("mailsearch.ollama_setup.ollama_binary", return_value=None) as binary,
+              patch("mailsearch.ollama_setup.winget_binary", return_value="fixture-winget"),
+              patch("mailsearch.ollama_setup.install_ollama") as install):
+            self.assertEqual(self.call(route, {"action": "check"})[0], 202)
+            self.assertEqual(await_setup(), {"phase": "idle", "installed": False, "running": False,
+                                            "model_present": None, "can_install": True, "error": ""})
+            ensure_server.assert_called_once_with()
+            install.assert_not_called()
+            model_call.assert_not_called()
+
+            def installed(_winget):
+                binary.return_value = "fixture-ollama"
+                ensure_server.side_effect = None
+
+            install.side_effect = installed
+            ensure_model.side_effect = [RuntimeError("local_model_missing"), "bge-m3:latest"]
+            model_call.return_value = {"status": "success"}
+            self.assertEqual(self.call(route, {"action": "install"})[0], 202)
+            self.assertEqual(await_setup(), {"phase": "idle", "installed": True, "running": True,
+                                            "model_present": True, "can_install": False, "error": ""})
+            install.assert_called_once_with("fixture-winget")
+            model_call.assert_called_once_with("/api/pull", {"model": "bge-m3", "stream": False}, timeout=1800)
+
+            ensure_model.side_effect = RuntimeError("local_model_missing")
+            self.assertEqual(self.call(route, {"action": "check"})[0], 202)
+            self.assertEqual(await_setup(), {"phase": "idle", "installed": True, "running": True,
+                                            "model_present": False, "can_install": True, "error": ""})
+            install.assert_called_once()
+            model_call.assert_called_once()
+
     def test_external_settings_are_session_scoped_and_do_not_echo_key(self):
         route = "/api/external/settings"
         status, initial = self.call(route)
@@ -1205,9 +1253,11 @@ class ApiSettingsPersistence(unittest.TestCase):
     def test_preset_supplies_only_defaults_for_its_gateway(self):
         with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, GATEWAY_ENV, clear=True):
             preset = Path(directory) / "gateway-defaults.json"
-            fields = {"gateway_url": "https://preset.example.invalid", "answer_models": "fixture-a, fixture-b"}
+            fields = {"gateway_url": "https://preset.example.invalid", "answer_models": "fixture-a, fixture-b",
+                      "test_unverified": True}
             preset.write_text(json.dumps(fields), encoding="utf-8-sig")
             self.assertEqual(gateway_defaults(preset)["gateway_url"], GATEWAY_ORIGIN)
+            self.assertFalse(gateway_defaults(preset)["test_unverified"])
             with patch.dict(os.environ, {"MAILSEARCH_GATEWAY_URL": "", "MAILSEARCH_GATEWAY_ANSWER_MODELS": ""}):
                 self.assertEqual(gateway_defaults(preset), {**fields, "answer_models": "fixture-a,fixture-b", "ca_file": ""})
                 preset.write_text(json.dumps({**fields, "key": "fixture-credential"}), encoding="utf-8")
