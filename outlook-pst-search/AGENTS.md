@@ -14,7 +14,7 @@ Outlook PST 보관 메일을 로컬에서 색인해 검색하고, 원문 인용�
 py -3 -m unittest discover -s tests          # 전체 테스트(변경 후 반드시 통과 확인)
 ```
 
-서버 인자: `--port`(기본 8765), `--readpst`, `--pdftotext`, `--model`(로컬 생성), `--embedding-model`, `--ollama-port`(기본 11435). 외부 AI는 `MAILSEARCH_EXTERNAL_URL/MODEL/API_KEY` 환경 변수 또는 GUI API 설정. HD AIC는 GUI에서 공유 키와 용도별 모델을 설정하며, `LITELLM_API_KEY`로 시작할 때는 임베딩을 켠다. `--embedding-model`을 명시하면 PC에 설치한 Ollama 모델을 사용한다.
+서버 인자: `--port`(기본 8765), `--readpst`, `--pdftotext`, `--model`(로컬 생성), `--embedding-model`, `--ollama-port`(기본 11435). 외부 AI는 `MAILSEARCH_EXTERNAL_URL/MODEL/API_KEY` 환경 변수 또는 GUI API 설정. GUI에서 BGE-M3 임베딩 실행 위치를 로컬 Ollama와 HD AIC 중 선택한다. HD AIC는 공유 키와 용도별 모델을 설정하며, `LITELLM_API_KEY`로 시작할 때는 임베딩을 켠다. `--embedding-model`을 명시하면 PC에 설치한 Ollama 모델을 사용한다.
 
 **종료 동작**: 페이지가 2.5초마다 `/api/ping`을 보내고 `main()`의 `watch_page` 스레드가 12초 이상 무응답이면 서버를 종료한다(탭을 모두 닫으면 앱이 죽는다. 새로고침은 끊기지 않게 임계값이 넉넉하다). `--no-browser`로 실행하면 이 감시가 켜지지 않는다.
 
