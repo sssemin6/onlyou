@@ -151,12 +151,12 @@
         <div class="settings-fields">
           <label for="settings-provider">API 연결</label>
           <select id="settings-provider">
-            <option value="intranet">임베딩 · HD AIC 모델</option>
+            <option value="intranet">임베딩 · 사내 API 모델</option>
             <option value="external">기타 답변 API</option>
           </select>
-          <div id="settings-hd" class="settings-fields">
+          <div id="settings-gateway" class="settings-fields">
             <div id="settings-roles" class="settings-fields"></div>
-            <p>로컬 BGE-M3는 Ollama 설치가 필요합니다. HD AIC로 임베딩하거나 재정렬할 때는 텍스트를 사내 API로 보냅니다.</p>
+            <p>로컬 BGE-M3는 Ollama 설치가 필요합니다. 사내 API 임베딩과 재정렬에는 텍스트가 전송됩니다.</p>
           </div>
           <div id="settings-generic" class="settings-fields" hidden>
             <label for="settings-url">API 주소</label>
@@ -167,7 +167,7 @@
           </div>
           <label for="settings-key">API 키</label>
           <input id="settings-key" type="password" maxlength="2048" autocomplete="off" spellcheck="false" aria-describedby="settings-key-help">
-          <p id="settings-key-help">사내 API에만 키가 필요합니다. HD AIC는 선택한 모델에 같은 키를 사용하며 앱을 종료하면 입력한 키가 지워집니다.</p>
+          <p id="settings-key-help">사내 API에만 키가 필요합니다. 사내 모델은 같은 키를 사용하며 앱을 종료하면 입력한 키가 지워집니다.</p>
         </div>
         <p id="settings-status" class="form-message" role="status"></p>
       </div>
