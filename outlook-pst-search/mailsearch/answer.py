@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
 from functools import partial
 
@@ -113,7 +114,8 @@ class LocalAI:
             return provider.index_key, provider.embed
         return local_model, partial(self.embed_local, local_model)
 
-    def call(self, path, data=None, timeout=None):
+    @contextmanager
+    def response(self, path, data=None, timeout=None):
         # HTTPConnection uses a fixed IP. It does not follow redirects or environment proxies.
         connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=timeout or self.timeout)
         try:
@@ -122,12 +124,16 @@ class LocalAI:
             response = connection.getresponse()
             if response.status != 200:
                 raise RuntimeError("local_model_http")
+            yield response
+        finally:
+            connection.close()
+
+    def call(self, path, data=None, timeout=None):
+        with self.response(path, data, timeout) as response:
             result = response.read(MAX_HTTP_BODY + 1)
             if len(result) > MAX_HTTP_BODY:
                 raise ValueError("model_response_size")
             return json.loads(result)
-        finally:
-            connection.close()
 
     def ensure_server(self):
         """Start a hidden Ollama server on demand; only ours to stop."""
