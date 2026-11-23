@@ -7,8 +7,8 @@ Outlook 메일·업무 문서·선주 교신문(PCF)을 업무 PC에서 색인�
 ## Windows에서 실행
 
 1. GitHub에서 **Code → Download ZIP**으로 내려받고 압축을 풉니다. 사내망에서 GitHub에 접속할 수 없으면 내려받은 소스와 필요한 의존성을 사내 반입 방식으로 옮깁니다.
-2. **setup-windows.cmd**를 한 번 실행합니다. 파이썬(없으면 winget으로 설치)과 의미 검색용 Ollama(선택)를 확인·설치하고, Ollama의 PC 시작 자동 실행을 꺼 줍니다. readpst와 bge-m3 임베딩 모델은 저장소에 이미 포함되어 있습니다.
-3. **start.vbs**를 두 번 클릭하면 창 없이 실행되고 브라우저에서 앱이 열립니다. Ollama는 임베딩이 필요한 순간에만 백그라운드로 시작합니다. 콘솔 로그가 필요하면 `start-windows.cmd`를 직접 실행합니다.
+2. **setup-windows.cmd**를 한 번 실행합니다. 파이썬(없으면 winget으로 설치)과 저장소에 포함된 PST 변환 도구 readpst를 확인합니다.
+3. **start.vbs**를 두 번 클릭하면 창 없이 실행되고 브라우저에서 앱이 열립니다. 콘솔 로그가 필요하면 `start-windows.cmd`를 직접 실행합니다.
 4. 열린 브라우저에서 **자료 추가**를 누른 뒤, Outlook을 닫고 로컬 디스크에 보관한 PST 경로를 등록합니다. 여러 파일은 한 번씩 등록하거나 PST를 모아 둔 폴더를 등록합니다. 폴더를 등록하면 그 안의 .eml 메일, 모든 PST, 문서 파일(PDF·DOCX·XLSX·TXT)을 함께 가져오며, 빈 PST나 읽을 수 없는 PST는 건너뛰고 누락으로 표시합니다. 문서 파일 하나만 따로 등록할 수도 있습니다. Outlook이 사용하는 데이터 파일 대신 닫혀 있는 PST 사본을 등록하면 파일 교체·갱신 시점을 제어하기 쉽습니다.
 5. 브라우저에서 앱 탭을 모두 닫으면 앱도 종료됩니다(마지막 탭을 닫은 뒤 최대 10여 초 걸릴 수 있습니다). 콘솔로 실행한 경우 **Ctrl+C**로 종료합니다. 진행 중이던 색인은 다음 실행에서 **재개**할 수 있습니다.
 
@@ -20,34 +20,32 @@ Outlook 메일·업무 문서·선주 교신문(PCF)을 업무 PC에서 색인�
 
 Linux에서도 SQLite 3.42 이상을 사용하는 Python이 필요합니다. `pst-utils`와 `poppler-utils`를 설치한 뒤 `python3 -m mailsearch`로 실행합니다. 파이썬 앱 자체는 표준 라이브러리만 사용합니다.
 
-### 로컬 AI 켜기
+### HD AIC 임베딩으로 의미 검색 켜기
 
-임베딩 모델과 생성 모델은 모두 선택 사항입니다. 연결하지 않아도 일반 검색과 외부 API 답변을 쓸 수 있고, 임베딩 모델을 연결하면 질문의 의미로 메일을 찾는 의미 검색이 추가됩니다.
-
-폐쇄망 반입 전에 사내에서 선택한 [Ollama](https://docs.ollama.com/) 설치 프로그램과 모델 파일을 준비해 둡니다. 생성 모델 예시는 `qwen3:4b`, 다국어 임베딩 모델 예시는 `bge-m3`입니다. 정확도와 지연은 장비에서 확인합니다. 네트워크가 허용되는 준비 환경에서 모델을 받아 모델 저장소를 반입하거나, 반입한 GGUF를 Ollama 로컬 모델로 등록할 수 있습니다. 예시 이름은 실제 설치된 로컬 모델과 일치해야 합니다.
-
-PowerShell에서 로컬 추론 서버를 실행합니다. Ollama가 이미 실행 중이라면 아래 별도 포트로 시작합니다.
+사내에서 받은 LiteLLM API 키로 `https://api.model.hd-aic.com/v1/embeddings`의 `bge-m3` 모델을 사용합니다. PowerShell에서 다음과 같이 키를 입력하고 앱을 실행합니다.
 
 ```powershell
-$env:OLLAMA_NO_CLOUD = "1"
-$env:OLLAMA_MAX_LOADED_MODELS = "1"
-$env:OLLAMA_HOST = "127.0.0.1:11435"
-ollama serve
+$secret = Read-Host "LiteLLM API 키" -AsSecureString
+$env:LITELLM_API_KEY = [System.Net.NetworkCredential]::new("", $secret).Password
+try {
+    .\start-windows.cmd
+} finally {
+    Remove-Item Env:LITELLM_API_KEY -ErrorAction SilentlyContinue
+    Remove-Variable secret -ErrorAction SilentlyContinue
+}
 ```
 
-다른 PowerShell에서 앱을 실행합니다.
+- 켜면 **보관함 색인 시** 제목·첨부명·텍스트 조각을, **의미 검색 시** 검색어를 HD AIC로 보냅니다. 색인과 벡터는 업무 PC에 저장합니다. 답변을 생성하는 **API 설정**은 별도로 사용합니다.
+- 이전에 등록한 보관함은 **갱신**을 눌러 HD AIC용 벡터를 생성합니다. 로컬 bge-m3로 생성한 벡터와 HD AIC 벡터는 따로 저장합니다. 기존 키워드 검색은 갱신 중에도 가능합니다.
+- 키를 설정하지 않거나 연결에 실패하면 키워드 검색을 사용할 수 있습니다. 색인 중 연결에 실패한 보관함은 연결을 복구한 뒤 **갱신**을 누릅니다.
+
+### 로컬 AI 사용하기
+
+이미 PC에 설치한 [Ollama](https://docs.ollama.com/) 모델을 쓰려면 `--model`에 로컬 답변 모델명을 지정합니다. 로컬 의미 검색은 설치한 임베딩 모델을 `--embedding-model`로 지정하면 HD AIC 대신 사용합니다. 앱이 시작한 Ollama는 앱을 종료할 때 함께 종료됩니다.
 
 ```powershell
-.\start-windows.cmd --model qwen3:4b --embedding-model bge-m3 --readpst "C:\msys64\mingw64\bin\readpst.exe"
+.\start-windows.cmd --model qwen3:4b --embedding-model bge-m3
 ```
-
-설정 이전에 등록한 보관함은 **갱신**으로 의미 검색 색인을 생성합니다. 재색인 중 기존 버전으로 검색할 수 있습니다. 앱은 루프백 Ollama 포트에만 연결하고 해당 서버 목록에 있는 모델만 사용합니다. Ollama의 클라우드 기능과 외부 통신은 폐쇄망 방화벽 정책으로도 차단해 주세요.
-
-### 임베딩 모델 포함과 Ollama 실행 방식
-
-- bge-m3 모델(약 1.1GB)은 GitHub 파일 크기 제한 때문에 95MB 조각(`vendor\ollama-model\bge-m3\parts`)으로 저장소에 들어 있습니다. 앱을 처음 실행하면 데이터 폴더(`%LOCALAPPDATA%\OutlookMailSearch\ollama-models`)에서 조각을 합치고 SHA-256으로 검증합니다. 한 번 합치면 이후 실행에서는 건너뜁니다.
-- setup-windows.cmd가 Ollama의 시작 프로그램 등록을 해제합니다. Ollama는 PC 부팅 때가 아니라 앱에서 임베딩이 필요한 순간(첫 검색 또는 AI 질문)에만 백그라운드로 시작하고, 앱이 끝나면 함께 종료됩니다. 첫 회는 모델을 읽는 데 수 초 걸립니다.
-- 폐쇄망 등 수동 환경에서는 기존처럼 임의의 Ollama 저장소에 `bge-m3`가 있어도 같은 방식으로 동작합니다. 다른 임베딩 모델을 직접 받아 쓰려면 `--embedding-model`에 해당 모델명을 지정합니다.
 
 ### 외부 AI API 연결
 
@@ -56,7 +54,7 @@ ollama serve
 1. 앱을 실행하고 우측 상단의 **API 설정**을 엽니다. OpenAI 주소와 예시 모델 `gpt-4.1-mini`가 미리 입력됩니다.
 2. API 키를 입력합니다. 다른 제공자는 해당 제공자의 전체 HTTPS 요청 주소와 모델명을 입력합니다.
 3. **연결 테스트**로 키·주소·모델을 확인할 수 있습니다. 테스트는 정해진 문구만 보내며 메일이나 검색어를 사용하지 않습니다.
-4. **적용**하면 근거 검토 화면에 답변 API 주소와 모델이 표시됩니다. 질문과 발췌문은 **선택한 근거로 답변**을 누른 뒤 전송합니다. 의미 검색은 PC의 로컬 모델이 담당합니다.
+4. **적용**하면 근거 검토 화면에 답변 API 주소와 모델이 표시됩니다. 질문과 발췌문은 **선택한 근거로 답변**을 누른 뒤 전송합니다. 의미 검색은 위의 임베딩 설정을 사용합니다.
 
 GUI에서 입력한 설정과 키는 앱 실행 중에 유지됩니다. 브라우저 새로고침 후에도 사용할 수 있으며, 앱을 종료하면 지워집니다. **연결 해제**로 실행 중인 연결도 즉시 지울 수 있습니다.
 
@@ -141,7 +139,7 @@ py -3 tools/demo.py ".\demo-mail"
 python -m unittest discover -s tests -v
 ```
 
-테스트는 합성 메일과 Ollama 응답을 흉내 낸 로컬 서버로 수행합니다. `MAILSEARCH_TEST_PST`와 `MAILSEARCH_TEST_READPST`를 지정하면 별도 PST 실물 테스트도 실행합니다. PRD의 50GB 검색 지연·정확도 합격 기준은 대표 Windows 장비, 실제 로컬 모델, 승인된 사내 시험 자료로 측정해야 합니다.
+테스트는 합성 메일과 Ollama·HD AIC 모의 응답으로 수행합니다. `MAILSEARCH_TEST_PST`와 `MAILSEARCH_TEST_READPST`를 지정하면 별도 PST 실물 테스트도 실행합니다. PRD의 50GB 검색 지연·정확도 합격 기준은 대표 Windows 장비, 실제 로컬 모델, 승인된 사내 시험 자료로 측정해야 합니다.
 
 검색 속도는 `python -m tools.benchmark --count 50000`으로 합성 데이터에서 재현할 수 있습니다. 보관함 필터의 의미 검색은 `python -m tools.benchmark --semantic-scope --count 28000 --repetitions 20`으로 재현합니다. 벡터 후보가 겹치도록 만든 합성 자료에서 두 보관함 각각의 상위 20건 반환 수와 예열 후 P95를 출력합니다. 이 시험은 검색 DB의 응답을 측정합니다. PST 추출, 화면 표시, AI 추론 시간은 별도입니다.
 
