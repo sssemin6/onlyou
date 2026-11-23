@@ -3,6 +3,7 @@ import http.client
 import io
 import json
 import os
+import ssl
 import sys
 import tempfile
 import threading
@@ -15,14 +16,25 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from mailsearch.answer import LocalAI, delivery_date_answer, validate
-from mailsearch.embedding import ENDPOINT as EMBEDDING_ENDPOINT, EmbeddingAPI
+from mailsearch.embedding import EmbeddingAPI, GatewayRequestError, tls_context, warn_unverified
 from mailsearch.external import ExternalAI, Excerpt, Reviews, pcf_batches
 from mailsearch.extract import convert_legacy, extract_attachment
-from mailsearch.intranet import CHAT_URL, DEFAULTS as HD_DEFAULTS, LOCAL_EMBEDDING
+from mailsearch.intranet import CHAT_PATH, IntranetAI, LOCAL_EMBEDDING
 from mailsearch.indexer import Indexer
-from mailsearch.server import App
+from mailsearch.server import App, gateway_diagnostics
 from mailsearch.store import Store
 from tools.demo import generate
+
+
+GATEWAY_ORIGIN = "https://gateway.example.invalid"
+CHAT_URL = GATEWAY_ORIGIN + CHAT_PATH
+EMBEDDING_ENDPOINT = GATEWAY_ORIGIN + "/v1/embeddings"
+GATEWAY_ENV = {
+    "MAILSEARCH_GATEWAY_URL": GATEWAY_ORIGIN,
+    "MAILSEARCH_GATEWAY_ANSWER_MODELS": "answer-model-a,answer-model-b",
+    "MAILSEARCH_GATEWAY_TLS_VERIFY": "1",
+    "MAILSEARCH_GATEWAY_CA_FILE": "",
+}
 
 
 def await_source(store, source, states, timeout=20):
@@ -82,6 +94,7 @@ class Integration(unittest.TestCase):
         cls.fixture_thread.join()
 
     def setUp(self):
+        self.enterContext(patch.dict(os.environ, GATEWAY_ENV))
         self.workspace = tempfile.TemporaryDirectory()
         self.addCleanup(self.workspace.cleanup)
         root = Path(self.workspace.name)
@@ -120,9 +133,9 @@ class Integration(unittest.TestCase):
         self.assertEqual((row["done"], row["omitted"]), (4, 1))
         return source
 
-    def test_hd_settings_probes_use_one_key_and_review_the_chosen_answer_model(self):
+    def test_gateway_settings_probes_use_one_key_and_review_the_chosen_answer_model(self):
         source = self.import_mail()
-        selections = {**HD_DEFAULTS, "rerank": "bge-reranker-v2-m3"}
+        selections = {"answer": "answer-model-a", "embedding": "bge-m3", "rerank": "bge-reranker-v2-m3"}
         private = "synthetic-session-key"
         self.assertEqual(self.call("/api/intranet/settings", token=False)[0], 403)
         self.assertEqual(self.call("/api/intranet/settings", {"action": "apply", "key": private,
@@ -147,7 +160,7 @@ class Integration(unittest.TestCase):
                                          for i in range(data["top_n"])]}
                 else:
                     self.assertEqual(path, "/v1/chat/completions")
-                    self.assertEqual(model, "qwen3-8-27b")
+                    self.assertEqual(model, "answer-model-a")
                     content = '```json\n{"ok": true}\n```'
                     value = {"choices": [{"message": {"content": content}, "finish_reason": "stop"}]}
                 response.read.return_value = json.dumps(value).encode()
@@ -165,13 +178,13 @@ class Integration(unittest.TestCase):
             query = {"query": "A-17 납기", "filters": {"source": source}}
             status, preview = self.call("/api/external/preview", query)
             self.assertEqual(status, 200)
-            self.assertEqual((preview["destination"], preview["model"]), (CHAT_URL, "qwen3-8-27b"))
+            self.assertEqual((preview["destination"], preview["model"]), (CHAT_URL, "answer-model-a"))
             self.assertTrue(preview["excerpts"])
             self.assertIn("/v1/rerank", [args.args[1] for args in request.call_args_list])
             self.assertNotIn("/v1/chat/completions", [args.args[1] for args in request.call_args_list])
             request.reset_mock()
             status, _ = self.call("/api/intranet/settings", {"action": "apply", "selections": {
-                **selections, "answer": "deepseek-v4-1-flash-1017"}})
+                **selections, "answer": "answer-model-b"}})
             self.assertEqual(status, 200)
             status, _ = self.call("/api/external/send", {"review": preview["review"],
                                                       "excerpts": [preview["excerpts"][0]["id"]]})
@@ -179,7 +192,7 @@ class Integration(unittest.TestCase):
             request.assert_not_called()
             status, new_review = self.call("/api/external/preview", query)
             self.assertEqual(status, 200)
-            self.assertEqual(new_review["model"], "deepseek-v4-1-flash-1017")
+            self.assertEqual(new_review["model"], "answer-model-b")
             request.reset_mock(side_effect=True)
             response.read.return_value = json.dumps({"choices": [{"message": {
                 "content": '{"status":"insufficient","claims":[]}'
@@ -189,7 +202,7 @@ class Integration(unittest.TestCase):
             self.assertEqual((status, answer["status"]), (200, "insufficient"))
             request.assert_called_once()
             _, path, body, _ = request.call_args.args
-            self.assertEqual((path, json.loads(body)["model"]), ("/v1/chat/completions", "deepseek-v4-1-flash-1017"))
+            self.assertEqual((path, json.loads(body)["model"]), ("/v1/chat/completions", "answer-model-b"))
 
     def test_external_settings_are_session_scoped_and_do_not_echo_key(self):
         route = "/api/external/settings"
@@ -353,7 +366,7 @@ class Integration(unittest.TestCase):
         self.assertTrue(self.call("/api/search", {"query": "폴더 안 PST에서", "filters": {}})[1]["results"])
         self.assertTrue(self.call("/api/search", {"query": "직접 추가한", "filters": {}})[1]["results"])
 
-    def test_hd_aic_indexes_existing_archive_and_searches_with_the_same_backend(self):
+    def test_gateway_indexes_existing_archive_and_searches_with_the_same_backend(self):
         source = self.import_mail()
         with self.store.connection() as conn:
             conn.execute("UPDATE vectors SET model='bge-m3' WHERE model='embed'")
@@ -389,7 +402,8 @@ class Integration(unittest.TestCase):
             self.assertEqual((method, path), ("POST", "/v1/embeddings"))
             self.assertEqual(json.loads(body), {"model": "bge-m3", "input": "의미 검색 테스트"})
             self.assertEqual(headers["Authorization"], "Bearer test-key")
-            https.assert_called_with("api.model.hd-aic.com", timeout=6)
+            self.assertEqual(https.call_args.args, ("gateway.example.invalid", 443))
+            self.assertEqual(https.call_args.kwargs["timeout"], 6)
 
             response.status = 401
             status, data = self.call("/api/search", {"query": "A-17"})
@@ -1107,6 +1121,7 @@ class Integration(unittest.TestCase):
         self.assertTrue(self.call("/api/search", {"query": "", "filters": {}})[1]["results"])
 
 
+@patch.dict(os.environ, GATEWAY_ENV)
 class EmbeddingTransport(unittest.TestCase):
     def test_batch_response_is_ordered_and_requires_unique_indices(self):
         api = EmbeddingAPI("test-key")
@@ -1120,6 +1135,82 @@ class EmbeddingTransport(unittest.TestCase):
             response.read.return_value = json.dumps({"data": entries}).encode()
             with self.assertRaises(ValueError):
                 api.embed(["first", "second"], timeout=10)
+
+
+class GatewayTLS(unittest.TestCase):
+    roles = {"answer": "answer-model-a", "embedding": "bge-m3", "rerank": "bge-reranker-v2-m3"}
+    chat_response = json.dumps({"choices": [{"message": {"content": '{"ok":true}'}}]}).encode()
+
+    def setUp(self):
+        self.enterContext(patch.dict(os.environ, GATEWAY_ENV))
+        tls_context.cache_clear()
+        warn_unverified.cache_clear()
+        self.addCleanup(tls_context.cache_clear)
+        self.addCleanup(warn_unverified.cache_clear)
+        self.client = IntranetAI("test-key", self.roles)
+
+    def test_three_roles_share_verified_ca_context(self):
+        trusted_context = ssl.create_default_context()
+        with (patch.dict(os.environ, {"MAILSEARCH_GATEWAY_CA_FILE": "test-company-ca.pem"}),
+              patch("mailsearch.embedding.ssl.create_default_context", return_value=trusted_context) as make,
+              patch.object(trusted_context, "load_verify_locations") as load_ca,
+              patch("mailsearch.embedding.http.client.HTTPSConnection") as https):
+            response = https.return_value.getresponse.return_value
+            response.status = 200
+            response.read.side_effect = [
+                self.chat_response,
+                b'{"data":[{"index":0,"embedding":[1.0,0.0]}]}',
+                b'{"results":[{"index":0,"relevance_score":1.0},{"index":1,"relevance_score":0.5}]}',
+            ]
+            self.assertEqual(self.client.test_models(), dict.fromkeys(self.roles, {"ok": True}))
+            self.assertEqual([call.args[1] for call in https.return_value.request.call_args_list],
+                             [CHAT_PATH, "/v1/embeddings", "/v1/rerank"])
+            self.assertTrue(all(call.kwargs["context"] is trusted_context for call in https.call_args_list))
+            self.assertEqual(trusted_context.verify_mode, ssl.CERT_REQUIRED)
+            self.assertTrue(trusted_context.check_hostname)
+            load_ca.assert_called_once_with(cafile="test-company-ca.pem")
+            make.assert_called_once()
+
+    def test_tls_and_http_errors_log_diagnostics_without_sensitive_data(self):
+        with (tempfile.TemporaryDirectory() as directory, gateway_diagnostics(Path(directory)),
+              patch("mailsearch.embedding.http.client.HTTPSConnection") as https):
+            connection = https.return_value
+            error = ssl.SSLCertVerificationError()
+            error.verify_code, error.verify_message = 19, "self-signed certificate in certificate chain"
+            connection.request.side_effect = error
+            with self.assertRaises(ssl.SSLCertVerificationError):
+                self.client.embed(["private-mail-text"], timeout=3)
+            self.assertEqual(https.call_args.kwargs["context"].verify_mode, ssl.CERT_REQUIRED)
+            connection.request.side_effect = None
+            connection.getresponse.return_value.status = 403
+            connection.getresponse.return_value.reason = "test-key private-mail-text"
+            with self.assertRaises(GatewayRequestError):
+                self.client.rerank("private-mail-text", ["doc"])
+            log = (Path(directory) / "api-connection.log").read_text(encoding="utf-8")
+            self.assertIn("SSLCertVerificationError (code=19) self-signed certificate in certificate chain", log)
+            self.assertIn("/v1/rerank: HTTP 403 Forbidden", log)
+            self.assertNotIn("private-mail-text", log)
+            self.assertNotIn("test-key", log)
+
+    def test_unverified_mode_requires_opt_in_and_is_gateway_only(self):
+        with (patch.dict(os.environ, {"MAILSEARCH_GATEWAY_TLS_VERIFY": "0"}),
+              patch("mailsearch.embedding.http.client.HTTPSConnection") as https,
+              self.assertLogs("mailsearch.gateway", level="WARNING") as log):
+            response = https.return_value.getresponse.return_value
+            response.status = 200
+            response.read.return_value = self.chat_response
+            self.client.answer_client.test()
+            context = https.call_args.kwargs["context"]
+            self.assertEqual(context.verify_mode, ssl.CERT_NONE)
+            self.assertFalse(context.check_hostname)
+            self.assertIn("test only", log.output[0])
+            ExternalAI("https://other.example.invalid/v1/chat/completions", "answer-model-a", "test-key").test()
+            https.assert_called_with("other.example.invalid", 443, timeout=15)
+            with patch.dict(os.environ, {"MAILSEARCH_GATEWAY_CA_FILE": "company-ca.pem"}):
+                https.reset_mock()
+                with self.assertRaises(ValueError):
+                    self.client.answer_client.test()
+                https.assert_not_called()
 
 
 class ExternalTransport(unittest.TestCase):
