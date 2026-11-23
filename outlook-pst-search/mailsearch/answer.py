@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import time
 from pathlib import Path
+from functools import partial
 
 from .extract import CREATE_FLAGS
 from .pcf import PCF_CELL, WORD_SUFFIXES, comment_number
@@ -84,18 +85,31 @@ class LocalAI:
             if name and (not MODEL_NAME.fullmatch(name) or "cloud" in name.casefold() or name.startswith("http")):
                 raise ValueError("Use an installed local model name.")
         self.model = model
-        self.embedding_model = embedding_model
         self.port = port
         self.timeout = timeout
-        self.embedding_api = embedding_api
+        self.configure_embedding(embedding_model, embedding_api)
         self.server = None
+
+    def configure_embedding(self, local_model, provider):
+        self.embedding_config = local_model, provider
+
+    @property
+    def embedding_model(self):
+        return self.embedding_config[0]
+
+    @property
+    def embedding_api(self):
+        return self.embedding_config[1]
 
     @property
     def embedding_index(self):
-        provider = self.embedding_api
+        return self.embedding_backend()[0]
+
+    def embedding_backend(self):
+        local_model, provider = self.embedding_config
         if provider and provider.index_key:
-            return provider.index_key
-        return self.embedding_model
+            return provider.index_key, provider.embed
+        return local_model, partial(self.embed_local, local_model)
 
     def call(self, path, data=None, timeout=None):
         # HTTPConnection uses a fixed IP. It does not follow redirects or environment proxies.
@@ -160,23 +174,19 @@ class LocalAI:
         raise RuntimeError("local_model_missing")
 
     def embed(self, texts, timeout=8):
-        provider = self.embedding_api
-        if provider and provider.index_key:
-            return provider.embed(texts, timeout)
-        return self.embed_local(texts, timeout)
+        _, embed = self.embedding_backend()
+        return embed(texts, timeout)
 
-    def embed_local(self, texts, timeout):
+    def embed_local(self, model, texts, timeout=8):
         self.ensure_server()
-        model = self.ensure_model(self.embedding_model)
+        model = self.ensure_model(model)
         values = self.call("/api/embed", {"model": model, "input": texts, "truncate": True}, timeout)
         return values["embeddings"]
 
     def semantic_search(self, store, query, filters):
-        provider = self.embedding_api
-        if provider and provider.index_key:
-            return store.semantic(provider.embed([query], 6)[0], provider.index_key, filters)
-        if self.embedding_model:
-            return store.semantic(self.embed_local([query], 6)[0], self.embedding_model, filters)
+        index, embed = self.embedding_backend()
+        if index:
+            return store.semantic(embed([query], 6)[0], index, filters)
         return []
 
     def rerank_candidates(self, query, rows):
