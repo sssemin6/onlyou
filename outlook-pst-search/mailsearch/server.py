@@ -68,16 +68,12 @@ class SessionLock:
 class App(ThreadingHTTPServer):
     daemon_threads = True
 
-    def __init__(self, port, store, indexer, ai, external=None, *, api_settings=None):
+    def __init__(self, port, store, indexer, ai, external=None, *, api_settings=None, gateway_preset=None):
         super().__init__(("127.0.0.1", port), Handler)
         self.store, self.indexer, self.ai = store, indexer, ai
         self.external = external
         self.generic_answer = external
-        self.gateway_fields = {
-            "gateway_url": gateway_origin(),
-            "answer_models": os.environ.get("MAILSEARCH_GATEWAY_ANSWER_MODELS", ""),
-            "ca_file": os.environ.get(CA_FILE_ENV, ""),
-        }
+        self.gateway_fields = gateway_defaults(gateway_preset)
         self.api_settings = api_settings
         self.api_profiles = api_settings.load() if api_settings else {}
         for profile in ("gateway", "external"):
@@ -166,6 +162,31 @@ def gateway_fields(payload, defaults):
         raise ValueError("gateway_models")
     fields["answer_models"] = ",".join(models)
     return fields
+
+
+def gateway_defaults(preset_path):
+    defaults = {
+        "gateway_url": gateway_origin(),
+        "answer_models": os.environ.get("MAILSEARCH_GATEWAY_ANSWER_MODELS", ""),
+        "ca_file": os.environ.get(CA_FILE_ENV, ""),
+    }
+    if preset_path is None:
+        return defaults
+    try:
+        with preset_path.open(encoding="utf-8-sig") as file:
+            raw = file.read(MAX_REQUEST + 1)
+        preset = json.loads(raw) if len(raw) <= MAX_REQUEST else None
+        if not isinstance(preset, dict) or preset.keys() - defaults.keys():
+            raise ValueError("gateway_preset")
+        fields = gateway_fields(preset, {})
+    except FileNotFoundError:
+        return defaults
+    except (OSError, ValueError):
+        gateway_logger.warning("Could not read gateway-defaults.json")
+        return defaults
+    if defaults["gateway_url"] and defaults["gateway_url"] != fields["gateway_url"]:
+        return defaults
+    return {name: value or fields[name] for name, value in defaults.items()}
 
 
 SNIPPET_SPLIT = re.compile(r"(?<=[.!?])\s+|\n+")
@@ -743,8 +764,13 @@ class Handler(BaseHTTPRequestHandler):
                         vectors = server.ai.embed_local(local_model, ["Hello"], 8)
                         pack_vector(vectors[0])
                         checks["embedding"] = {"ok": True}
-                    except (OSError, ValueError, RuntimeError, KeyError, IndexError, TypeError, http.client.HTTPException):
-                        checks["embedding"] = {"ok": False}
+                    except (OSError, ValueError, RuntimeError, KeyError, IndexError, TypeError, http.client.HTTPException) as exc:
+                        known = {"ollama_not_found", "ollama_not_started", "local_model_missing", "local_model_http"}
+                        reason = str(exc)
+                        if reason not in known:
+                            reason = "timeout" if isinstance(exc, TimeoutError) else (
+                                "local_connection" if isinstance(exc, OSError) else "invalid_response")
+                        checks["embedding"] = {"ok": False, "reason": reason}
                 self.send_json(200, {"checks": checks})
                 return
             with server.indexer.lock:
@@ -925,7 +951,8 @@ def main(argv=None):
         with SessionLock(root), gateway_diagnostics(root):
             store = Store(root)
             indexer = Indexer(store, args.readpst, args.pdftotext, ai)
-            with App(args.port, store, indexer, ai, external, api_settings=ApiSettings(root)) as app:
+            preset = Path(__file__).resolve().parent.parent / "gateway-defaults.json"
+            with App(args.port, store, indexer, ai, external, api_settings=ApiSettings(root), gateway_preset=preset) as app:
                 indexer.wake()
                 print(app.origin, flush=True)
                 if not args.no_browser:
