@@ -9,7 +9,7 @@ import time
 from dataclasses import dataclass
 from urllib.parse import urlsplit
 
-from .embedding import HOST as HD_HOST
+from .embedding import GatewayRequestError, gateway_origin, request_gateway_json
 from .store import query_words
 from .answer import ANSWER_INSTRUCTIONS, MODEL_NAME, map_citations
 
@@ -70,8 +70,10 @@ class ExternalAI:
         self.port = port if port is not None else 443
         self.path = endpoint.path
         self.anthropic = endpoint.path.endswith("/messages")
-        self.intranet = intranet and self.host == HD_HOST and self.port == 443 and self.path == "/v1/chat/completions"
         self.model = model
+        origin = gateway_origin()
+        self.gateway = origin if origin and self.public["destination"] == origin + "/v1/chat/completions" else ""
+        self.intranet = intranet and bool(self.gateway)
         self._key = key
         self.review_generation = object()
 
@@ -159,7 +161,25 @@ class ExternalAI:
                     token_limit = max(token_limit, 8192 if self.model.startswith("deepseek-") else 4096)
                 options["max_tokens"] = token_limit
             headers = {"Authorization": f"Bearer {self._key}", "Content-Type": "application/json"}
-        # HTTPSConnection uses normal certificate verification and follows neither redirects nor proxies.
+        if self.gateway:
+            try:
+                payload = request_gateway_json(self.gateway, self.path, options, headers, timeout=timeout, max_bytes=MAX_RESPONSE)
+            except GatewayRequestError as exc:
+                raise ExternalRequestError(exc.status) from exc
+        else:
+            payload = self.request_json(options, headers, timeout)
+        if self.anthropic:
+            text = "".join(block.get("text", "") for block in payload["content"] if isinstance(block, dict))
+        else:
+            text = payload["choices"][0]["message"]["content"]
+        if self.intranet and isinstance(text, str):
+            fenced = re.fullmatch(r"\s*```(?:json)?\s*(.*?)\s*```\s*", text, re.S | re.I)
+            if fenced:
+                text = fenced[1]
+        return json.loads(text)
+
+    def request_json(self, options, headers, timeout):
+        # For other HTTPS providers, use the standard certificate verification policy.
         connection = http.client.HTTPSConnection(self.host, self.port, timeout=timeout)
         try:
             connection.request(
@@ -171,18 +191,10 @@ class ExternalAI:
             raw = response.read(MAX_RESPONSE + 1)
             if len(raw) > MAX_RESPONSE:
                 raise ValueError("external_response_size")
-            payload = json.loads(raw)
-            if self.anthropic:
-                text = "".join(block.get("text", "") for block in payload["content"] if isinstance(block, dict))
-            else:
-                text = payload["choices"][0]["message"]["content"]
-            if self.intranet and isinstance(text, str):
-                fenced = re.fullmatch(r"\s*```(?:json)?\s*(.*?)\s*```\s*", text, re.S | re.I)
-                if fenced:
-                    text = fenced[1]
-            return json.loads(text)
+            return json.loads(raw)
         finally:
             connection.close()
+
 
 
 @dataclass(frozen=True)
