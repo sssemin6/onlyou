@@ -406,6 +406,18 @@ mark { color: var(--ink); background: #f2cf84; }
   background: var(--paper);
 }
 .settings-fields [hidden] { display: none; }
+.settings-advanced {
+  margin-bottom: 8px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+}
+.settings-advanced summary {
+  padding: 8px 10px;
+  cursor: pointer;
+  font-size: .84rem;
+  font-weight: 780;
+}
+.settings-advanced > .settings-fields { padding: 2px 10px 8px; }
 .settings-checkbox { display: flex; align-items: center; gap: .5rem; }
 .settings-fields .settings-checkbox input { width: auto; min-height: auto; margin: 0; }
 .settings-fields p, #settings-test-help { color: var(--muted); font-size: .78rem; }
