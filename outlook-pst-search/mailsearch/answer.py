@@ -9,7 +9,6 @@ import subprocess
 import time
 from pathlib import Path
 
-from .embedding import ENDPOINT as EMBEDDING_ENDPOINT, MODEL as EMBEDDING_MODEL
 from .extract import CREATE_FLAGS
 from .pcf import PCF_CELL, WORD_SUFFIXES, comment_number
 from .store import normalized, query_words, topic_key
@@ -93,8 +92,9 @@ class LocalAI:
 
     @property
     def embedding_index(self):
-        if self.embedding_api:
-            return f"{EMBEDDING_ENDPOINT}#{EMBEDDING_MODEL}"
+        provider = self.embedding_api
+        if provider and provider.index_key:
+            return provider.index_key
         return self.embedding_model
 
     def call(self, path, data=None, timeout=None):
@@ -160,12 +160,36 @@ class LocalAI:
         raise RuntimeError("local_model_missing")
 
     def embed(self, texts, timeout=8):
-        if self.embedding_api:
-            return self.embedding_api.embed(texts, timeout)
+        provider = self.embedding_api
+        if provider and provider.index_key:
+            return provider.embed(texts, timeout)
+        return self.embed_local(texts, timeout)
+
+    def embed_local(self, texts, timeout):
         self.ensure_server()
         model = self.ensure_model(self.embedding_model)
         values = self.call("/api/embed", {"model": model, "input": texts, "truncate": True}, timeout)
         return values["embeddings"]
+
+    def semantic_search(self, store, query, filters):
+        provider = self.embedding_api
+        if provider and provider.index_key:
+            return store.semantic(provider.embed([query], 6)[0], provider.index_key, filters)
+        if self.embedding_model:
+            return store.semantic(self.embed_local([query], 6)[0], self.embedding_model, filters)
+        return []
+
+    def rerank_candidates(self, query, rows):
+        provider = self.embedding_api
+        if not getattr(provider, "models", {}).get("rerank") or len(rows) < 2:
+            return rows
+        batch = rows[:24]
+        documents = [f"{row['subject'][:160]}\n{row['text'][:1100]}" for row in batch]
+        try:
+            order = provider.rerank(query, documents)
+        except (OSError, ValueError, RuntimeError, http.client.HTTPException):
+            return rows
+        return [batch[index] for index in order] + rows[len(batch):]
 
     def answer(self, question, evidence, context):
         self.ensure_server()
@@ -268,11 +292,13 @@ def evidence_for(store, ai, question, filters, context, semantic=True, limit=9, 
     mode = "keyword"
     if semantic and ai.embedding_index:
         try:
-            semantic_rows = store.semantic(ai.embed([search_text], timeout=6)[0], ai.embedding_index, filters)
+            semantic_rows = ai.semantic_search(store, search_text, filters)
             mode = "hybrid" if semantic_rows else "keyword"
         except (OSError, ValueError, RuntimeError, KeyError, IndexError, TypeError, http.client.HTTPException):
             mode = "keyword_only"
-    seeds = merge_rows(lexical, semantic_rows, limit=max(18, limit))
+    seeds = merge_rows(lexical, semantic_rows, limit=max(24, limit))
+    if semantic:
+        seeds = ai.rerank_candidates(search_text, seeds)
     chosen = []
     counts = {}
     for row in seeds:
