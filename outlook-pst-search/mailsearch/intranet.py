@@ -1,36 +1,44 @@
 """HD AIC text model roles and reranking calls."""
 import http.client
 
-from .embedding import EmbeddingAPI, HDRequestError, HOST
+from .embedding import EmbeddingAPI, HDRequestError, HOST, MODEL
 from .external import ExternalAI, ExternalRequestError
 
+LOCAL_EMBEDDING = "ollama:" + MODEL
 CHAT_URL = f"https://{HOST}/v1/chat/completions"
 MODELS = {
     "answer": {"qwen3-8-27b": "Qwen3.8-27B", "deepseek-v4-1-flash-1017": "DeepSeek-V4.1-Flash-1017"},
-    "embedding": {"bge-m3": "BGE-M3"},
+    "embedding": {LOCAL_EMBEDDING: "로컬 Ollama · BGE-M3", MODEL: "사내 HD AIC API · BGE-M3"},
     "rerank": {"bge-reranker-v2-m3": "BGE-Reranker-v2-M3"},
 }
 DEFAULTS = {role: "" for role in MODELS}
-DEFAULTS.update(answer="qwen3-8-27b", embedding="bge-m3")
+DEFAULTS.update(answer="qwen3-8-27b", embedding=MODEL)
+
+
+def validate_selections(selections):
+    if not isinstance(selections, dict) or set(selections) != set(MODELS):
+        raise ValueError("hd_models")
+    for role, options in MODELS.items():
+        model = selections[role]
+        if not isinstance(model, str) or (model and model not in options):
+            raise ValueError("hd_models")
 
 
 class IntranetAI(EmbeddingAPI):
     def __init__(self, key, selections):
         super().__init__(key)
-        if not isinstance(selections, dict) or set(selections) != set(MODELS):
-            raise ValueError("hd_models")
-        for role, options in MODELS.items():
-            model = selections[role]
-            if not isinstance(model, str) or (model and model not in options):
-                raise ValueError("hd_models")
+        validate_selections(selections)
         self.models = dict(selections)
-        self.model = selections["embedding"]
+        self.model = MODEL if selections["embedding"] == MODEL else ""
         self.answer_client = ExternalAI(CHAT_URL, selections["answer"], key, intranet=True) if selections["answer"] else None
 
     @classmethod
     def from_settings(cls, key, selections, current):
+        validate_selections(selections)
         if not key and current is None:
-            raise ValueError("external_key_required")
+            if selections["answer"] or selections["rerank"] or selections["embedding"] == MODEL:
+                raise ValueError("external_key_required")
+            return None
         return cls(key or current._key, selections)
 
     def rerank(self, query, documents, timeout=6):
@@ -59,7 +67,7 @@ class IntranetAI(EmbeddingAPI):
         }
         checks = {}
         for role, model in self.models.items():
-            if not model:
+            if not model or role == "embedding" and not self.index_key:
                 continue
             try:
                 probes[role]()
