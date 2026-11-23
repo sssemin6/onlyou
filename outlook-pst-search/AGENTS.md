@@ -14,7 +14,7 @@ Outlook PST 보관 메일을 로컬에서 색인해 검색하고, 원문 인용�
 py -3 -m unittest discover -s tests          # 전체 테스트(변경 후 반드시 통과 확인)
 ```
 
-서버 인자: `--port`(기본 8765), `--readpst`, `--pdftotext`, `--model`(로컬 생성), `--embedding-model`, `--ollama-port`(기본 11435). 외부 AI는 `MAILSEARCH_EXTERNAL_URL/MODEL/API_KEY` 환경 변수 또는 GUI API 설정. 임베딩 모델 bge-m3는 저장소에 분할 포함되어 첫 실행 때 `%LOCALAPPDATA%`에 복원되며, Ollama는 임베딩이 필요한 순간에만 시작해 앱 종료 때 함께 종료된다.
+서버 인자: `--port`(기본 8765), `--readpst`, `--pdftotext`, `--model`(로컬 생성), `--embedding-model`, `--ollama-port`(기본 11435). 외부 AI는 `MAILSEARCH_EXTERNAL_URL/MODEL/API_KEY` 환경 변수 또는 GUI API 설정. `LITELLM_API_KEY`를 설정하면 HD AIC의 bge-m3로 색인·검색용 벡터를 만든다. `--embedding-model`을 명시하면 PC에 설치한 Ollama 모델을 사용한다.
 
 **종료 동작**: 페이지가 2.5초마다 `/api/ping`을 보내고 `main()`의 `watch_page` 스레드가 12초 이상 무응답이면 서버를 종료한다(탭을 모두 닫으면 앱이 죽는다. 새로고침은 끊기지 않게 임계값이 넉넉하다). `--no-browser`로 실행하면 이 감시가 켜지지 않는다.
 
@@ -26,16 +26,16 @@ py -3 -m unittest discover -s tests          # 전체 테스트(변경 후 반�
 | `mailsearch/indexer.py` | 백그라운드 가져오기(단일 워커 스레드), readpst 실행, 버전 원자 스왑, 증분 갱신 |
 | `mailsearch/store.py` | SQLite 스키마(sources/mails/passages/terms/vectors/pst_files), 키워드·의미·정확 검색 |
 | `mailsearch/answer.py` | 루프백 Ollama 연결(생성·임베딩, 필요 시 `ensure_server`가 백그라운드 시작), 근거 검색 `evidence_for`, 답변 검증 `validate` |
-| `mailsearch/bundled.py` | 저장소에 분할 포함된 bge-m3를 첫 실행 때 결합·검증 |
+| `mailsearch/embedding.py` | HD AIC HTTPS 임베딩 API 요청·응답 검증 |
 | `mailsearch/external.py` | 외부 AI 전송(OpenAI 호환 + Anthropic Messages 호환), 발췌문 리뷰 토큰 |
 | `mailsearch/extract.py` | EML 파싱, 문서 텍스트 추출(PDF/DOCX/XLSX/TXT, 구형 DOC/XLS는 LibreOffice 읽기 전용 변환) |
 | `mailsearch/static/` | UI(`index.html`/`app.js`/`style.css`) |
 | `vendor/readpst-win64/` | MSYS2 libpst 0.6.76 휴대용 번들(Windows, DLL 의존성 포함) |
-| `setup-windows.ps1` | 첫 실행 환경 구성(파이썬 확인/설치, 번들 readpst, 선택 Ollama+bge-m3) |
+| `setup-windows.ps1` | 첫 실행 환경 구성(파이썬 확인/설치, 번들 readpst 확인) |
 
 ## 데이터 모델·색인 흐름
 
-PST --readpst--> EML 스풀 --> `parse_mail` --> `mails`/`passages`/`terms`(FTS5) --> `vectors`(임베딩, 모델명이 키). 문서 폴더·파일(PDF·DOCX·XLSX·TXT, PRD-02)은 `extract_document`가 위치(페이지·본문·시트!셀)를 보존해 같은 테이블에 색인한다. `sources.active`가 현재 검색 대상 버전이다. 갱신은 새 `pending` 버전을 완성한 뒤 스왑하고 이전 버전 행을 삭제한다(중단 시 이전 색인 유지).
+PST --readpst--> EML 스풀 --> `parse_mail` --> `mails`/`passages`/`terms`(FTS5) --> `vectors`(임베딩, 모델 또는 API 주소와 모델이 키). 문서 폴더·파일(PDF·DOCX·XLSX·TXT, PRD-02)은 `extract_document`가 위치(페이지·본문·시트!셀)를 보존해 같은 테이블에 색인한다. `sources.active`가 현재 검색 대상 버전이다. 갱신은 새 `pending` 버전을 완성한 뒤 스왑하고 이전 버전 행을 삭제한다(중단 시 이전 색인 유지).
 
 **증분 갱신**: `pst_files` 테이블의 PST별 서명(크기·mtime)이 같으면 재추출 없이 이전 버전 행을 접두사로 복사(`carry_prefix`). 바뀐 PST도 메일 `fingerprint`(message_id·제목·본문 등 해시)가 같으면 색인·첨부·임베딩 행을 통째로 복사(`adopt_mail`)하고 새 메일만 처리한다.
 
@@ -50,7 +50,7 @@ PST --readpst--> EML 스풀 --> `parse_mail` --> `mails`/`passages`/`terms`(FTS5
 ## 불변식 — 변경 시 반드시 유지
 
 1. 웹 서버는 127.0.0.1 전용. `/api/*`는 `X-Mail-Session` 토큰 필요, Origin/Host 검증 유지.
-2. 기본 답변 API는 검토한 발췌문(≤5개·각 800자)과 질문만 전송한다. 일반 메일·문서는 운영자가 설정한 `MAILSEARCH_INTERNAL_URL`과 일치할 때 검토한 발췌문과 표시된 메타데이터를 설정된 바이트 예산 내에서 보낸다. 구조화 Word PCF는 운영자가 설정한 `MAILSEARCH_PCF_INTERNAL_URL`과 정확히 일치하는 HTTPS 주소에서만 검토한 셀과 필요한 구조 정보를 별도 입력 예산으로 보낸다. API 키는 어떤 응답에도 반환하지 않는다.
+2. 기본 답변 API는 검토한 발췌문(≤5개·각 800자)과 질문만 전송한다. 일반 메일·문서는 운영자가 설정한 `MAILSEARCH_INTERNAL_URL`과 일치할 때 검토한 발췌문과 표시된 메타데이터를 설정된 바이트 예산 내에서 보낸다. 구조화 Word PCF는 운영자가 설정한 `MAILSEARCH_PCF_INTERNAL_URL`과 정확히 일치하는 HTTPS 주소에서만 검토한 셀과 필요한 구조 정보를 별도 입력 예산으로 보낸다. HD AIC 임베딩은 환경에 키를 설정했을 때만 사용하며 색인 시 제목·첨부명·텍스트, 의미 검색 시 검색어를 고정 HTTPS 주소로 전송한다. API 키는 어떤 응답에도 반환하지 않는다.
 3. 표준 라이브러리만 사용. readpst/pdftotext는 서브프로세스로만 호출.
 4. API 키를 소스·저장소·로그에 기록 금지. 환경 변수 또는 실행 중 GUI 세션에서만.
 5. 색인 원자성: 검색 가능 상태는 항상 직전 완성 버전을 유지한다.
