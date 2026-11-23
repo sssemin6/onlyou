@@ -74,15 +74,19 @@ class ApiSettings:
             data = user_dpapi(data)
         if len(data) > MAX_SETTINGS_BYTES:
             raise ValueError("settings_size")
+        write_api_settings(self.path, data)
+
+
+def write_api_settings(path, data):
+    pending = None
+    try:
+        with tempfile.NamedTemporaryFile(dir=path.parent, prefix="api-settings-", suffix=".tmp", delete=False) as file:
+            pending = file.name
+            file.write(data)
+            file.flush()
+            os.fsync(file.fileno())
+        os.replace(pending, path)
         pending = None
-        try:
-            with tempfile.NamedTemporaryFile(dir=self.path.parent, prefix="api-settings-", suffix=".tmp", delete=False) as file:
-                pending = file.name
-                file.write(data)
-                file.flush()
-                os.fsync(file.fileno())
-            os.replace(pending, self.path)
-            pending = None
-        finally:
-            if pending is not None:
-                os.unlink(pending)
+    finally:
+        if pending is not None:
+            os.unlink(pending)
