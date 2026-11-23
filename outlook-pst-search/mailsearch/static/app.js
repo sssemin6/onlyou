@@ -45,6 +45,9 @@ const issueNames = {
   gateway_models: "용도별 모델 선택을 확인하세요.",
   gateway_url: "설정 창에서 올바른 사내 HTTPS 주소를 입력하세요.",
   gateway_settings: "사내 API 주소와 인증서 경로를 확인하세요.",
+  gateway_preset_missing: "저장된 프리셋이 없습니다. 기본값 적용을 눌러 gateway-defaults.json을 선택하세요.",
+  gateway_preset_invalid: "프리셋의 HTTPS 주소, 모델 ID와 인증서 설정을 확인하세요.",
+  gateway_preset_io: "앱 폴더의 gateway-defaults.json 파일을 읽거나 쓸 수 없습니다.",
   api_settings_save_failed: "설정을 저장하지 못했습니다. 앱 데이터 폴더에 쓸 수 있는지 확인하세요.",
   embedding_api_key: "사내 API 키에 공백이 있는지 확인하세요.",
   external_disabled: "상단의 API 설정에서 답변에 사용할 AI를 연결해 주세요.",
@@ -655,7 +658,12 @@ function renderOllamaSetup(state) {
   ];
   if (state.error) parts.push(ollamaErrors[state.error]);
   else if (state.installed === false && !state.can_install) parts.push("자동 프로그램 설치에는 Windows와 WinGet이 필요합니다.");
-  element("ollama-setup-status").textContent = busy ? ollamaPhases[state.phase] : parts.join(" · ");
+  const percent = Number.isInteger(state.progress) ? " " + state.progress + "%" : "";
+  element("ollama-setup-status").textContent = busy ? ollamaPhases[state.phase] + percent : parts.join(" · ");
+  const progress = element("ollama-setup-progress");
+  progress.hidden = state.phase !== "installing" && state.phase !== "downloading";
+  if (percent) progress.value = state.progress;
+  else progress.removeAttribute("value");
   element("ollama-install").hidden = busy || !state.can_install;
   element("ollama-install").textContent = state.installed ? "BGE-M3 다운로드" : "Ollama와 BGE-M3 설치";
   element("ollama-install-help").hidden = busy || !state.can_install;
@@ -713,6 +721,62 @@ element("gateway-answer-models").addEventListener("input", () => {
   if (answer) setGatewayAnswers(answer.value);
 });
 
+const presetFile = element("gateway-preset-file");
+
+async function applyGatewayDefaults(file) {
+  const version = settingsRequest;
+  const current = () => version === settingsRequest && settingsDialog.open;
+  setSettingsBusy(true);
+  try {
+    let payload = {};
+    if (file) {
+      if (file.size > 16 * 1024) throw new Error(issueNames.gateway_preset_invalid);
+      try {
+        payload = { preset: JSON.parse(await file.text()) };
+      } catch {
+        throw new Error(issueNames.gateway_preset_invalid);
+      }
+    }
+    const preset = await call("/api/intranet/defaults", payload, AbortSignal.timeout(10000));
+    if (!current()) return;
+    const fields = readSettingsFields(true);
+    const sameAddress = fields.gateway_url === preset.gateway_url;
+    const models = preset.answer_models.split(",");
+    fields.selections.answer = models.includes(fields.selections.answer) ? fields.selections.answer : models[0];
+    settingsDrafts.intranet = {
+      ...fields, ...preset, key: sameAddress ? fields.key : "",
+      ca_file: preset.ca_file || (sameAddress ? fields.ca_file : ""),
+    };
+    gatewaySettings.preset_available = true;
+    renderSettings();
+    settingsMessage("기본값을 입력했습니다. 저장할 때는 아래 적용 버튼을 누르세요.");
+  } catch (error) {
+    if (current()) {
+      if (error.message === issueNames.gateway_preset_missing) {
+        gatewaySettings.preset_available = false;
+        element("gateway-preset-import").hidden = true;
+      }
+      settingsMessage(error.message);
+    }
+  } finally {
+    if (current()) setSettingsBusy(false);
+  }
+}
+
+element("gateway-defaults").addEventListener("click", () => {
+  if (gatewaySettings.preset_available) applyGatewayDefaults();
+  else {
+    settingsMessage("gateway-defaults.json을 선택하면 앱 폴더에 저장되고 기본값이 채워집니다.");
+    presetFile.click();
+  }
+});
+element("gateway-preset-import").addEventListener("click", () => presetFile.click());
+presetFile.addEventListener("change", () => {
+  const file = presetFile.files[0];
+  presetFile.value = "";
+  if (file) applyGatewayDefaults(file);
+});
+
 function readSettingsFields(gateway) {
   const key = element("settings-key").value;
   if (!gateway) {
@@ -727,7 +791,7 @@ function readSettingsFields(gateway) {
 }
 
 settingsForm.addEventListener("input", (event) => {
-  if (event.target !== settingsProvider) {
+  if (event.target !== settingsProvider && event.target !== presetFile) {
     if (event.target.id === "gateway-url") element("gateway-test-unverified").checked = false;
     const provider = settingsProvider.value;
     settingsDrafts[provider] = readSettingsFields(provider === "intranet");
@@ -757,6 +821,7 @@ function renderSettings() {
     element("gateway-answer-models").value = fields.answer_models;
     element("gateway-ca-file").value = fields.ca_file;
     element("gateway-test-unverified").checked = fields.test_unverified ?? false;
+    element("gateway-preset-import").hidden = !gatewaySettings.preset_available;
     element("settings-current").textContent = gatewaySettings.configured
       ? (gatewaySettings.active_answer ? "사내 답변 모델 사용 중" : "사내 API 키 등록됨")
       : (fields.gateway_url ? "사내 API를 선택한 기능에만 키가 필요합니다."
