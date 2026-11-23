@@ -643,9 +643,9 @@ const ollamaPhases = {
 };
 const ollamaErrors = {
   ollama_not_started: "Ollama를 시작하지 못했습니다. 실행 상태를 확인하고 다시 시도하세요.",
-  ollama_install_failed: "Ollama 설치에 실패했습니다. WinGet과 인터넷 연결을 확인하세요.",
+  ollama_install_failed: "Ollama 설치에 실패했습니다. 앱 데이터 폴더의 api-connection.log에서 원인을 확인하세요.",
   ollama_model_check_failed: "BGE-M3 보유 여부를 확인하지 못했습니다. Ollama 상태를 확인하세요.",
-  ollama_model_download_failed: "BGE-M3 다운로드에 실패했습니다. 인터넷 연결과 디스크 공간을 확인하세요.",
+  ollama_model_download_failed: "BGE-M3 다운로드에 실패했습니다. 앱 데이터 폴더의 api-connection.log를 확인하세요.",
 };
 
 function renderOllamaSetup(state) {
@@ -657,7 +657,7 @@ function renderOllamaSetup(state) {
     "BGE-M3 " + status(state.model_present, "보유", "미보유"),
   ];
   if (state.error) parts.push(ollamaErrors[state.error]);
-  else if (state.installed === false && !state.can_install) parts.push("자동 프로그램 설치에는 Windows와 WinGet이 필요합니다.");
+  else if (state.installed === false && !state.can_install) parts.push("자동 설치에는 Windows와 WinGet 또는 시스템 curl.exe가 필요합니다.");
   const percent = Number.isInteger(state.progress) ? " " + state.progress + "%" : "";
   element("ollama-setup-status").textContent = busy ? ollamaPhases[state.phase] + percent : parts.join(" · ");
   const progress = element("ollama-setup-progress");
