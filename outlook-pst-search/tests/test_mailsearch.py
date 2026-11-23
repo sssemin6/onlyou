@@ -23,7 +23,7 @@ from mailsearch.external import ExternalAI, Excerpt, Reviews, pcf_batches
 from mailsearch.extract import convert_legacy, extract_attachment
 from mailsearch.intranet import CHAT_PATH, IntranetAI, LOCAL_EMBEDDING
 from mailsearch.indexer import Indexer
-from mailsearch.server import App, gateway_diagnostics
+from mailsearch.server import App, gateway_defaults, gateway_diagnostics
 from mailsearch.store import Store
 from tools.demo import generate
 
@@ -244,6 +244,29 @@ class Integration(unittest.TestCase):
                 self.assertEqual(restored.gateway_fields["answer_models"], "dashboard-model-a,dashboard-model-b")
             self.assertEqual(self.call(route, {"action": "disconnect"})[0], 200)
             self.assertFalse(self.app.api_settings.load()["gateway"]["key"])
+
+    def test_gateway_probes_distinguish_local_model_tls_http_and_response_errors(self):
+        route = "/api/intranet/settings"
+        roles = {"answer": "", "embedding": LOCAL_EMBEDDING, "rerank": "bge-reranker-v2-m3"}
+        payload = {"action": "test", "key": "test-key", "selections": roles}
+        with (patch.object(self.ai, "embed_local", side_effect=RuntimeError("local_model_missing")),
+              patch.object(IntranetAI, "rerank", side_effect=ssl.SSLCertVerificationError("untrusted fixture"))):
+            status, result = self.call(route, payload)
+        self.assertEqual(status, 200)
+        self.assertEqual(result["checks"], {
+            "embedding": {"ok": False, "reason": "local_model_missing"},
+            "rerank": {"ok": False, "reason": "tls_certificate"},
+        })
+
+        roles["embedding"] = "bge-m3"
+        with (patch.object(IntranetAI, "embed", side_effect=GatewayRequestError(403)),
+              patch.object(IntranetAI, "rerank", side_effect=ValueError("rerank_response"))):
+            status, result = self.call(route, payload)
+        self.assertEqual(status, 200)
+        self.assertEqual(result["checks"], {
+            "embedding": {"ok": False, "http_status": 403},
+            "rerank": {"ok": False, "reason": "invalid_response"},
+        })
 
     def test_external_settings_are_session_scoped_and_do_not_echo_key(self):
         route = "/api/external/settings"
@@ -1179,6 +1202,18 @@ class EmbeddingTransport(unittest.TestCase):
 
 
 class ApiSettingsPersistence(unittest.TestCase):
+    def test_preset_supplies_only_defaults_for_its_gateway(self):
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, GATEWAY_ENV, clear=True):
+            preset = Path(directory) / "gateway-defaults.json"
+            fields = {"gateway_url": "https://preset.example.invalid", "answer_models": "fixture-a, fixture-b"}
+            preset.write_text(json.dumps(fields), encoding="utf-8-sig")
+            self.assertEqual(gateway_defaults(preset)["gateway_url"], GATEWAY_ORIGIN)
+            with patch.dict(os.environ, {"MAILSEARCH_GATEWAY_URL": "", "MAILSEARCH_GATEWAY_ANSWER_MODELS": ""}):
+                self.assertEqual(gateway_defaults(preset), {**fields, "answer_models": "fixture-a,fixture-b", "ca_file": ""})
+                preset.write_text(json.dumps({**fields, "key": "fixture-credential"}), encoding="utf-8")
+                with self.assertLogs("mailsearch.gateway", level="WARNING"):
+                    self.assertEqual(gateway_defaults(preset)["gateway_url"], "")
+
     def test_platform_without_dpapi_does_not_write_key(self):
         with tempfile.TemporaryDirectory() as directory, patch.object(ApiSettings, "secure", False):
             settings = ApiSettings(Path(directory))
