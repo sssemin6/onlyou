@@ -26,7 +26,7 @@ from .api_settings import ApiSettings, write_api_settings
 from .embedding import CA_FILE_ENV, GatewayTLSOptions, MODEL as BGE_MODEL, gateway_origin, logger as gateway_logger
 from .external import DEFAULT_MODEL, DEFAULT_URL, MAX_EXCERPTS, MAX_INTERNAL_EXCERPTS, MAX_PCF_CELLS, ExternalAI, ExternalRequestError, Reviews, pcf_batches, pcf_input_fits
 from .extract import MAX_ATTACHMENT
-from .filesystem import local_path
+from .filesystem import local_path, source_path
 from .indexer import ImportIssue, Indexer
 from .intranet import CHAT_PATH, LOCAL_EMBEDDING, IntranetAI, available_models, validate_selections
 from .ollama_setup import OllamaSetup
@@ -583,7 +583,7 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 row = rows[0]
                 root = Path(row["path"])
-                original = local_path(root / row["item"] if root.is_dir() else root, strict=True)
+                original = source_path(root / row["item"] if root.is_dir() else root)
                 if original != root and not original.is_relative_to(root):
                     return {}
                 with original.open("rb") as handle:
