@@ -6,6 +6,7 @@ import os
 import re
 import shutil
 import subprocess
+import threading
 import time
 from pathlib import Path
 from functools import partial
@@ -89,6 +90,7 @@ class LocalAI:
         self.timeout = timeout
         self.configure_embedding(embedding_model, embedding_api)
         self.server = None
+        self.server_lock = threading.Lock()
 
     def configure_embedding(self, local_model, provider):
         self.embedding_config = local_model, provider
@@ -129,8 +131,12 @@ class LocalAI:
 
     def ensure_server(self):
         """Start a hidden Ollama server on demand; only ours to stop."""
+        with self.server_lock:
+            self._ensure_server()
+
+    def _ensure_server(self):
         try:
-            self.call("/api/tags", timeout=2)
+            self.ollama_models()
             return
         except OSError:
             pass
@@ -146,7 +152,7 @@ class LocalAI:
         deadline = time.monotonic() + 30
         while time.monotonic() < deadline:
             try:
-                self.call("/api/tags", timeout=2)
+                self.ollama_models()
                 return
             except OSError:
                 if self.server.poll() is not None:
@@ -155,17 +161,24 @@ class LocalAI:
         raise OSError("ollama_not_started")
 
     def shutdown(self):
-        if self.server is not None and self.server.poll() is None:
-            self.server.terminate()
-            try:
-                self.server.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                self.server.kill()
+        with self.server_lock:
+            if self.server is not None and self.server.poll() is None:
+                self.server.terminate()
+                try:
+                    self.server.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    self.server.kill()
+
+    def ollama_models(self):
+        data = self.call("/api/tags", timeout=2)
+        if not isinstance(data, dict) or not isinstance(data.get("models"), list):
+            raise ValueError("local_model_response")
+        return data["models"]
 
     def ensure_model(self, name):
-        # Server reports a model already installed on disk. Models are never pulled by this app.
+        # Inference uses installed models; setup can explicitly download BGE-M3.
         canonical = name if ":" in name.rsplit("/", 1)[-1] else name + ":latest"
-        for model in self.call("/api/tags", timeout=2).get("models", []):
+        for model in self.ollama_models():
             if model.get("name") == canonical:
                 description = self.call("/api/show", {"model": canonical}, timeout=3)
                 if any(description.get(field) for field in ("remote_model", "remote_host")):
