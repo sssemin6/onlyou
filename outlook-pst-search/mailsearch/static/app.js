@@ -599,13 +599,37 @@ function settingsMessage(message) {
 }
 
 const gatewayRoles = {
-  answer: ["근거 답변", "사용 안 함"], embedding: ["임베딩 실행 위치", "임베딩 사용 안 함"],
+  answer: ["답변 모델", "사용 안 함"], embedding: ["임베딩 실행 위치", "임베딩 사용 안 함"],
   rerank: ["검색 후보 재정렬", "사용 안 함"],
+};
+const gatewayCheckReasons = {
+  tls_certificate: "TLS 인증서를 신뢰할 수 없습니다. 고급 설정의 CA 인증서 경로를 확인하세요.",
+  missing_ca: "고급 설정의 CA 인증서 파일을 찾을 수 없습니다.",
+  tls_error: "TLS 연결 또는 CA 파일에 오류가 있습니다. 연결 로그를 확인하세요.",
+  dns: "사내 API 주소의 이름을 확인할 수 없습니다.",
+  timeout: "서버 응답 시간이 초과되었습니다.",
+  connection: "사내 API 서버에 연결하지 못했습니다.",
+  invalid_response: "서버 응답 형식이 예상과 다릅니다.",
+  ollama_not_found: "이 PC에서 Ollama를 찾을 수 없습니다.",
+  ollama_not_started: "로컬 Ollama 서버를 시작하지 못했습니다.",
+  local_model_missing: "Ollama에 로컬 bge-m3 모델이 없습니다.",
+  local_model_http: "Ollama가 오류를 반환했습니다.",
+  local_connection: "로컬 Ollama에 연결하지 못했습니다.",
+};
+const gatewayHttpReasons = {
+  400: "서버가 모델 또는 요청 형식을 거부했습니다.",
+  401: "API 키 인증이 실패했습니다.",
+  403: "API 키의 모델 사용 권한을 확인하세요.",
+  404: "모델 ID와 API 경로를 확인하세요.",
+  429: "요청 한도를 초과했습니다.",
 };
 const localEmbedding = "ollama:bge-m3";
 let gatewaySettings;
 let genericSettings;
+let lastSettingsProvider;
+const settingsDrafts = {};
 const settingsProvider = element("settings-provider");
+const gatewayAdvanced = element("gateway-advanced");
 
 function setSettingsBusy(busy) {
   const inactive = settingsProvider.value === "intranet" ? "settings-generic" : "settings-gateway";
@@ -627,27 +651,53 @@ element("gateway-answer-models").addEventListener("input", () => {
   if (answer) setGatewayAnswers(answer.value);
 });
 
+function readSettingsFields(gateway) {
+  const key = element("settings-key").value;
+  if (!gateway) {
+    return { key, destination: element("settings-url").value, model: element("settings-model").value };
+  }
+  return {
+    key, gateway_url: element("gateway-url").value,
+    answer_models: element("gateway-answer-models").value, ca_file: element("gateway-ca-file").value,
+    test_unverified: element("gateway-test-unverified").checked,
+    selections: Object.fromEntries(Object.keys(gatewayRoles).map(role => [role, element("gateway-" + role).value])),
+  };
+}
+
+settingsForm.addEventListener("input", (event) => {
+  if (event.target !== settingsProvider) {
+    const provider = settingsProvider.value;
+    settingsDrafts[provider] = readSettingsFields(provider === "intranet");
+  }
+});
+settingsForm.addEventListener("invalid", (event) => {
+  if (gatewayAdvanced.contains(event.target)) gatewayAdvanced.open = true;
+}, true);
+
 function renderSettings() {
-  const gateway = settingsProvider.value === "intranet";
+  const provider = settingsProvider.value;
+  const gateway = provider === "intranet";
+  const draft = settingsDrafts[provider];
   element("settings-generic").hidden = gateway;
   element("settings-gateway").hidden = !gateway;
   element("settings-url").required = !gateway;
   element("settings-model").required = !gateway;
-  element("settings-key").value = "";
+  element("settings-key").value = draft?.key ?? "";
   const settings = gateway ? gatewaySettings : genericSettings;
   element("settings-key-help").textContent = settings?.persistent_keys
     ? "적용하면 키를 현재 Windows 사용자 계정으로 암호화해 저장합니다. 연결 해제로 삭제할 수 있습니다."
     : "이 환경에서는 키를 앱이 실행되는 동안 사용합니다.";
   if (gateway) {
     if (!gatewaySettings) return;
-    element("gateway-url").value = gatewaySettings.gateway_url;
-    element("gateway-answer-models").value = gatewaySettings.answer_models;
-    element("gateway-ca-file").value = gatewaySettings.ca_file;
-    element("gateway-test-unverified").checked = false;
-    const subject = gatewaySettings.destination ? new URL(gatewaySettings.destination).host : "";
+    const fields = draft ?? gatewaySettings;
+    element("gateway-url").value = fields.gateway_url;
+    element("gateway-answer-models").value = fields.answer_models;
+    element("gateway-ca-file").value = fields.ca_file;
+    element("gateway-test-unverified").checked = fields.test_unverified ?? false;
     element("settings-current").textContent = gatewaySettings.configured
-      ? subject + (gatewaySettings.active_answer ? " · 답변 제공자 사용 중" : " · 키 등록됨")
-      : (subject ? "사내 API를 선택한 기능에만 키가 필요합니다." : "사내 API를 사용하려면 아래에 HTTPS 주소를 입력하세요.");
+      ? (gatewaySettings.active_answer ? "사내 답변 모델 사용 중" : "사내 API 키 등록됨")
+      : (fields.gateway_url ? "사내 API를 선택한 기능에만 키가 필요합니다."
+        : "사내 API를 사용하려면 고급 설정에 HTTPS 주소를 입력하세요.");
     element("settings-remove").hidden = !gatewaySettings.configured;
     element("settings-key").placeholder = gatewaySettings.configured ? "등록된 사내 키를 쓰려면 비워 두세요" : "";
     const roles = element("settings-roles");
@@ -661,20 +711,21 @@ function renderSettings() {
       for (const [id, name] of Object.entries(gatewaySettings.models[role])) {
         field.add(new Option(name, id));
       }
-      field.value = gatewaySettings.selections[role];
+      field.value = fields.selections[role];
       roles.append(title, field);
     }
-    setGatewayAnswers(gatewaySettings.selections.answer);
+    setGatewayAnswers(fields.selections.answer);
     const embedding = element("gateway-embedding");
     embedding.addEventListener("change", () => {
       if (embedding.value !== localEmbedding || gatewaySettings.configured || element("settings-key").value.trim()) return;
       element("gateway-answer").value = "";
       element("gateway-rerank").value = "";
+      settingsDrafts[provider] = readSettingsFields(gateway);
     });
   } else {
     if (!genericSettings) return;
     const configured = genericSettings.configured;
-    const setup = configured || genericSettings.defaults;
+    const setup = draft ?? (configured || genericSettings.defaults);
     element("settings-current").textContent = configured ? "답변 API 연결됨 · " + configured.model : "답변 API 연결 전";
     element("settings-remove").hidden = !configured;
     element("settings-key").placeholder = configured ? "같은 주소에서 키를 유지하려면 비워 두세요" : "";
@@ -690,6 +741,7 @@ element("settings-open").addEventListener("click", async () => {
   element("settings-current").textContent = "설정을 불러오는 중입니다.";
   element("settings-remove").hidden = true;
   element("settings-key").value = "";
+  gatewayAdvanced.open = false;
   setSettingsBusy(true);
   settingsDialog.showModal();
   const loading = new AbortController();
@@ -702,8 +754,9 @@ element("settings-open").addEventListener("click", async () => {
     if (version !== settingsRequest || !settingsDialog.open) return;
     gatewaySettings = internal;
     genericSettings = external;
-    settingsProvider.value = external.configured && !internal.configured && internal.selections.embedding !== localEmbedding
-      ? "external" : "intranet";
+    settingsProvider.value = lastSettingsProvider ?? (
+      external.configured && !internal.configured && internal.selections.embedding !== localEmbedding ? "external" : "intranet"
+    );
     renderSettings();
     setSettingsBusy(false);
     element("settings-key").focus();
@@ -719,6 +772,7 @@ element("settings-open").addEventListener("click", async () => {
   }
 });
 settingsProvider.addEventListener("change", () => {
+  lastSettingsProvider = settingsProvider.value;
   renderSettings();
   setSettingsBusy(false);
   settingsMessage("");
@@ -734,20 +788,26 @@ settingsDialog.addEventListener("close", () => {
 async function changeSettings(action) {
   if (action !== "disconnect" && !settingsForm.reportValidity()) return;
   const version = settingsRequest;
-  const gateway = settingsProvider.value === "intranet";
+  const provider = settingsProvider.value;
+  const gateway = provider === "intranet";
+  const submittedDraft = settingsDrafts[provider];
   const route = gateway ? "/api/intranet/settings" : "/api/external/settings";
   const payload = { action };
   if (action !== "disconnect") {
-    payload.key = element("settings-key").value.trim();
+    Object.assign(payload, readSettingsFields(gateway));
+    payload.key = payload.key.trim();
     if (gateway) {
-      payload.gateway_url = element("gateway-url").value.trim();
-      payload.answer_models = element("gateway-answer-models").value.trim();
-      payload.ca_file = element("gateway-ca-file").value.trim();
-      payload.test_unverified = action === "test" && element("gateway-test-unverified").checked;
-      payload.selections = Object.fromEntries(Object.keys(gatewayRoles).map((role) => [role, element("gateway-" + role).value]));
+      payload.test_unverified = action === "test" && payload.test_unverified;
+      const { answer, embedding, rerank } = payload.selections;
+      if (!payload.gateway_url.trim() && (payload.key || answer || rerank || (embedding && embedding !== localEmbedding))) {
+        gatewayAdvanced.open = true;
+        element("gateway-url").focus();
+        settingsMessage(issueNames.gateway_url);
+        return;
+      }
     } else {
-      payload.destination = element("settings-url").value.trim();
-      payload.model = element("settings-model").value.trim();
+      payload.destination = payload.destination.trim();
+      payload.model = payload.model.trim();
     }
   }
   setSettingsBusy(true);
@@ -755,12 +815,23 @@ async function changeSettings(action) {
   settingsMessage(action === "test" ? "선택한 모델의 연결을 확인하는 중입니다." : "");
   try {
     const data = await call(route, payload);
-    if (action !== "test") showSources().catch(() => {});
+    if (action !== "test") {
+      if (settingsDrafts[provider] === submittedDraft) delete settingsDrafts[provider];
+      showSources().catch(() => {});
+    }
     if (version !== settingsRequest || !settingsDialog.open) return;
     if (action === "test") {
-      const checks = gateway ? Object.entries(data.checks).map(([role, result]) =>
-        gatewayRoles[role][0] + (result.ok ? " 성공" : " 실패" + (result.http_status ? " (HTTP " + result.http_status + ")" : "")
-          + (role === "embedding" && payload.selections.embedding === localEmbedding ? " (Ollama의 bge-m3 설치를 확인하세요)" : ""))) : [];
+      const checks = gateway ? Object.keys(gatewayRoles).filter(role => data.checks[role]).map(role => {
+        const result = data.checks[role];
+        const model = payload.selections[role] === localEmbedding ? "로컬 Ollama · BGE-M3" : payload.selections[role];
+        const hint = gatewayHttpReasons[result.http_status];
+        const reason = result.http_status ? "HTTP " + result.http_status + (hint ? " · " + hint : "")
+          : gatewayCheckReasons[result.reason];
+        return gatewayRoles[role][0] + " (" + model + ") " + (result.ok ? "성공" : "실패" + (reason ? " — " + reason : ""));
+      }) : [];
+      if (payload.test_unverified && checks.length) {
+        checks.push("인증서 검증을 생략한 테스트입니다. 실제 사용 전에 체크를 해제하고 다시 테스트하세요.");
+      }
       settingsMessage(gateway ? (checks.join(" · ") || "테스트할 모델을 선택하세요.") : "연결 테스트에 성공했습니다.");
       return;
     }
