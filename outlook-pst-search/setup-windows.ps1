@@ -40,4 +40,4 @@ if (Test-Path "$PSScriptRoot\vendor\readpst-win64\readpst.exe") {
 Write-Host ""
 Write-Host "준비 완료. start.cmd 를 두 번 클릭해 실행하세요."
 Write-Host "외부 AI(z.ai 등)를 쓰려면 앱 오른쪽 위의 API 설정에서 주소·모델·키를 입력합니다."
-Write-Host "HD AIC 의미 검색은 앱을 실행하기 전에 환경 변수 LITELLM_API_KEY를 설정하세요."
+Write-Host "사내 API 사용 시 실행 전에 MAILSEARCH_GATEWAY_URL을 설정하세요. 키는 앱 설정에서 입력할 수 있습니다."
