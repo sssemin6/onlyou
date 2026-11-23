@@ -14,7 +14,7 @@ Outlook PST 보관 메일을 로컬에서 색인해 검색하고, 원문 인용�
 py -3 -m unittest discover -s tests          # 전체 테스트(변경 후 반드시 통과 확인)
 ```
 
-서버 인자: `--port`(기본 8765), `--readpst`, `--pdftotext`, `--model`(로컬 생성), `--embedding-model`, `--ollama-port`(기본 11435). 외부 AI는 `MAILSEARCH_EXTERNAL_URL/MODEL/API_KEY` 환경 변수 또는 GUI API 설정. `LITELLM_API_KEY`를 설정하면 HD AIC의 bge-m3로 색인·검색용 벡터를 만든다. `--embedding-model`을 명시하면 PC에 설치한 Ollama 모델을 사용한다.
+서버 인자: `--port`(기본 8765), `--readpst`, `--pdftotext`, `--model`(로컬 생성), `--embedding-model`, `--ollama-port`(기본 11435). 외부 AI는 `MAILSEARCH_EXTERNAL_URL/MODEL/API_KEY` 환경 변수 또는 GUI API 설정. HD AIC는 GUI에서 공유 키와 용도별 모델을 설정하며, `LITELLM_API_KEY`로 시작할 때는 임베딩을 켠다. `--embedding-model`을 명시하면 PC에 설치한 Ollama 모델을 사용한다.
 
 **종료 동작**: 페이지가 2.5초마다 `/api/ping`을 보내고 `main()`의 `watch_page` 스레드가 12초 이상 무응답이면 서버를 종료한다(탭을 모두 닫으면 앱이 죽는다. 새로고침은 끊기지 않게 임계값이 넉넉하다). `--no-browser`로 실행하면 이 감시가 켜지지 않는다.
 
@@ -26,7 +26,8 @@ py -3 -m unittest discover -s tests          # 전체 테스트(변경 후 반�
 | `mailsearch/indexer.py` | 백그라운드 가져오기(단일 워커 스레드), readpst 실행, 버전 원자 스왑, 증분 갱신 |
 | `mailsearch/store.py` | SQLite 스키마(sources/mails/passages/terms/vectors/pst_files), 키워드·의미·정확 검색 |
 | `mailsearch/answer.py` | 루프백 Ollama 연결(생성·임베딩, 필요 시 `ensure_server`가 백그라운드 시작), 근거 검색 `evidence_for`, 답변 검증 `validate` |
-| `mailsearch/embedding.py` | HD AIC HTTPS 임베딩 API 요청·응답 검증 |
+| `mailsearch/embedding.py` | HD AIC HTTPS 요청과 임베딩 응답 검증 |
+| `mailsearch/intranet.py` | HD AIC 모델 목록·연결 테스트·재정렬 |
 | `mailsearch/external.py` | 외부 AI 전송(OpenAI 호환 + Anthropic Messages 호환), 발췌문 리뷰 토큰 |
 | `mailsearch/extract.py` | EML 파싱, 문서 텍스트 추출(PDF/DOCX/XLSX/TXT, 구형 DOC/XLS는 LibreOffice 읽기 전용 변환) |
 | `mailsearch/static/` | UI(`index.html`/`app.js`/`style.css`) |
@@ -50,7 +51,7 @@ PST --readpst--> EML 스풀 --> `parse_mail` --> `mails`/`passages`/`terms`(FTS5
 ## 불변식 — 변경 시 반드시 유지
 
 1. 웹 서버는 127.0.0.1 전용. `/api/*`는 `X-Mail-Session` 토큰 필요, Origin/Host 검증 유지.
-2. 기본 답변 API는 검토한 발췌문(≤5개·각 800자)과 질문만 전송한다. 일반 메일·문서는 운영자가 설정한 `MAILSEARCH_INTERNAL_URL`과 일치할 때 검토한 발췌문과 표시된 메타데이터를 설정된 바이트 예산 내에서 보낸다. 구조화 Word PCF는 운영자가 설정한 `MAILSEARCH_PCF_INTERNAL_URL`과 정확히 일치하는 HTTPS 주소에서만 검토한 셀과 필요한 구조 정보를 별도 입력 예산으로 보낸다. HD AIC 임베딩은 환경에 키를 설정했을 때만 사용하며 색인 시 제목·첨부명·텍스트, 의미 검색 시 검색어를 고정 HTTPS 주소로 전송한다. API 키는 어떤 응답에도 반환하지 않는다.
+2. 기본 답변 API는 검토한 발췌문(≤5개·각 800자)과 질문만 전송한다. 일반 메일·문서는 운영자가 설정한 `MAILSEARCH_INTERNAL_URL`과 일치할 때 검토한 발췌문과 표시된 메타데이터를 설정된 바이트 예산 내에서 보낸다. 구조화 Word PCF는 운영자가 설정한 `MAILSEARCH_PCF_INTERNAL_URL`과 정확히 일치하는 HTTPS 주소에서만 검토한 셀과 필요한 구조 정보를 별도 입력 예산으로 보낸다. HD AIC는 GUI에서 사용자가 선택한 역할과 환경에서 설정한 임베딩만 고정 HTTPS 주소로 보낸다. 임베딩은 색인 텍스트와 검색어, 재정렬은 후보 발췌문을 사용한다. HD AIC 답변은 해당 고정 주소에서 사내 답변 예산과 검토 절차를 사용한다. API 키는 어떤 응답에도 반환하지 않는다.
 3. 표준 라이브러리만 사용. readpst/pdftotext는 서브프로세스로만 호출.
 4. API 키를 소스·저장소·로그에 기록 금지. 환경 변수 또는 실행 중 GUI 세션에서만.
 5. 색인 원자성: 검색 가능 상태는 항상 직전 완성 버전을 유지한다.
