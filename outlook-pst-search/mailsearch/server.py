@@ -22,7 +22,7 @@ from urllib.parse import urlsplit
 
 from .answer import (PCF_INSTRUCTIONS, LocalAI, map_citations, pcf_candidates, pcf_retrieval, pcf_word, delivery_date_answer,
                      evidence_for, merge_rows, public_row, validate)
-from .api_settings import ApiSettings
+from .api_settings import ApiSettings, write_api_settings
 from .embedding import CA_FILE_ENV, GatewayTLSOptions, MODEL as BGE_MODEL, gateway_origin, logger as gateway_logger
 from .external import DEFAULT_MODEL, DEFAULT_URL, MAX_EXCERPTS, MAX_INTERNAL_EXCERPTS, MAX_PCF_CELLS, ExternalAI, ExternalRequestError, Reviews, pcf_batches, pcf_input_fits
 from .extract import MAX_ATTACHMENT
@@ -75,6 +75,8 @@ class App(ThreadingHTTPServer):
         self.ollama_setup = OllamaSetup(ai)
         self.external = external
         self.generic_answer = external
+        self.gateway_preset = gateway_preset
+        self.gateway_preset_lock = threading.Lock()
         self.gateway_fields = gateway_defaults(gateway_preset)
         self.gateway_test_origin = self.gateway_fields["gateway_url"] if self.gateway_fields.pop("test_unverified") else ""
         self.api_settings = api_settings
@@ -167,25 +169,39 @@ def gateway_fields(payload, defaults):
     return fields
 
 
-def gateway_defaults(preset_path):
-    defaults = {
+def gateway_environment():
+    return {
         "gateway_url": gateway_origin(),
         "answer_models": os.environ.get("MAILSEARCH_GATEWAY_ANSWER_MODELS", ""),
         "ca_file": os.environ.get(CA_FILE_ENV, ""),
         "test_unverified": False,
     }
+
+
+def validate_gateway_preset(preset):
+    if not isinstance(preset, dict) or preset.keys() - {"gateway_url", "answer_models", "ca_file", "test_unverified"}:
+        raise ValueError("gateway_preset")
+    test_unverified = preset.get("test_unverified", False)
+    if type(test_unverified) is not bool:
+        raise ValueError("gateway_preset")
+    fields = gateway_fields(preset, {})
+    if not fields["gateway_url"]:
+        raise ValueError("gateway_url")
+    return {**fields, "test_unverified": test_unverified}
+
+
+def read_gateway_preset(path):
+    with path.open(encoding="utf-8-sig") as file:
+        raw = file.read(MAX_REQUEST + 1)
+    return validate_gateway_preset(json.loads(raw) if len(raw) <= MAX_REQUEST else None)
+
+
+def gateway_defaults(preset_path):
+    defaults = gateway_environment()
     if preset_path is None:
         return defaults
     try:
-        with preset_path.open(encoding="utf-8-sig") as file:
-            raw = file.read(MAX_REQUEST + 1)
-        preset = json.loads(raw) if len(raw) <= MAX_REQUEST else None
-        if not isinstance(preset, dict) or preset.keys() - defaults.keys():
-            raise ValueError("gateway_preset")
-        test_unverified = preset.pop("test_unverified", False)
-        if type(test_unverified) is not bool:
-            raise ValueError("gateway_preset")
-        fields = gateway_fields(preset, {})
+        fields = read_gateway_preset(preset_path)
     except FileNotFoundError:
         return defaults
     except (OSError, ValueError):
@@ -193,7 +209,6 @@ def gateway_defaults(preset_path):
         return defaults
     if defaults["gateway_url"] and defaults["gateway_url"] != fields["gateway_url"]:
         return defaults
-    fields["test_unverified"] = bool(test_unverified and fields["gateway_url"])
     return {name: value or fields[name] for name, value in defaults.items()}
 
 
@@ -384,6 +399,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_external(payload, pcf=route == "/api/pcf/send")
             elif route == "/api/intranet/settings":
                 self.change_intranet_settings(payload)
+            elif route == "/api/intranet/defaults":
+                self.use_gateway_preset(payload)
             elif route == "/api/ollama/setup":
                 self.send_json(202, self.server.ollama_setup.start(payload.get("action")))
             elif route == "/api/external/settings":
@@ -731,9 +748,43 @@ class Handler(BaseHTTPRequestHandler):
             **fields, "destination": origin + CHAT_PATH if origin else "", "models": models,
             "configured": configured, "persistent_keys": self.server.persistent_keys,
             "test_unverified": bool(origin and origin == self.server.gateway_test_origin),
+            "preset_available": bool(self.server.gateway_preset and
+                                     (self.server.gateway_preset.is_file() or gateway_origin())),
             "selections": selections,
             "active_answer": configured and current.answer_client is not None and self.server.external is current.answer_client,
         }
+
+    def use_gateway_preset(self, payload):
+        server = self.server
+        path = server.gateway_preset
+        if path is None:
+            self.send_json(404, {"error": "gateway_preset_missing"})
+            return
+        with server.gateway_preset_lock:
+            save = "preset" in payload
+            try:
+                if save:
+                    fields = validate_gateway_preset(payload["preset"])
+                else:
+                    try:
+                        fields = read_gateway_preset(path)
+                    except FileNotFoundError:
+                        if not gateway_origin():
+                            self.send_json(404, {"error": "gateway_preset_missing"})
+                            return
+                        fields = validate_gateway_preset(gateway_environment())
+                        save = True
+                if save:
+                    data = (json.dumps(fields, ensure_ascii=False, indent=2) + "\n").encode()
+                    write_api_settings(path, data)
+                server.gateway_test_origin = fields["gateway_url"] if fields["test_unverified"] else ""
+            except ValueError:
+                self.send_json(400, {"error": "gateway_preset_invalid"})
+                return
+            except OSError:
+                self.send_json(500, {"error": "gateway_preset_io"})
+                return
+        self.send_json(200, fields)
 
     def change_intranet_settings(self, payload):
         action = payload.get("action")
