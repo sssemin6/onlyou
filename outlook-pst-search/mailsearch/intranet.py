@@ -1,6 +1,8 @@
 """Configured gateway text model roles and reranking calls."""
 import http.client
 import os
+import socket
+import ssl
 
 from .answer import MODEL_NAME
 from .embedding import EmbeddingAPI, GatewayRequestError, MODEL, gateway_origin
@@ -85,6 +87,18 @@ class IntranetAI(EmbeddingAPI):
                 checks[role] = {"ok": True}
             except (GatewayRequestError, ExternalRequestError) as exc:
                 checks[role] = {"ok": False, "http_status": exc.status}
-            except (OSError, ValueError, KeyError, IndexError, TypeError, http.client.HTTPException):
-                checks[role] = {"ok": False}
+            except ssl.SSLCertVerificationError:
+                checks[role] = {"ok": False, "reason": "tls_certificate"}
+            except FileNotFoundError:
+                checks[role] = {"ok": False, "reason": "missing_ca"}
+            except ssl.SSLError:
+                checks[role] = {"ok": False, "reason": "tls_error"}
+            except socket.gaierror:
+                checks[role] = {"ok": False, "reason": "dns"}
+            except TimeoutError:
+                checks[role] = {"ok": False, "reason": "timeout"}
+            except OSError:
+                checks[role] = {"ok": False, "reason": "connection"}
+            except (ValueError, KeyError, IndexError, TypeError, http.client.HTTPException):
+                checks[role] = {"ok": False, "reason": "invalid_response"}
         return checks
