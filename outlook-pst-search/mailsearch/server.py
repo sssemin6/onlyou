@@ -404,7 +404,9 @@ class Handler(BaseHTTPRequestHandler):
             elif route == "/api/intranet/settings":
                 self.change_intranet_settings(payload)
             elif route == "/api/intranet/defaults":
-                self.use_gateway_preset(payload)
+                if payload:
+                    raise ValueError("gateway_preset")
+                self.use_gateway_preset()
             elif route == "/api/ollama/setup":
                 self.send_json(202, self.server.ollama_setup.start(payload.get("action")))
             elif route == "/api/external/settings":
@@ -752,33 +754,28 @@ class Handler(BaseHTTPRequestHandler):
             **fields, "destination": origin + CHAT_PATH if origin else "", "models": models,
             "configured": configured, "persistent_keys": self.server.persistent_keys,
             "test_unverified": bool(origin and origin == self.server.gateway_test_origin),
-            "preset_available": bool(self.server.gateway_preset and
-                                     (self.server.gateway_preset.is_file() or gateway_origin())),
             "selections": selections,
             "active_answer": configured and current.answer_client is not None and self.server.external is current.answer_client,
         }
 
-    def use_gateway_preset(self, payload):
+    def use_gateway_preset(self):
         server = self.server
         path = server.gateway_preset
         if path is None:
             self.send_json(404, {"error": "gateway_preset_missing"})
             return
         with server.gateway_preset_lock:
-            save = "preset" in payload
             try:
-                if save:
-                    fields = validate_gateway_preset(payload["preset"])
-                else:
+                try:
+                    fields = read_gateway_preset(path)
+                except FileNotFoundError:
                     try:
-                        fields = read_gateway_preset(path)
+                        fields = read_gateway_preset(path.with_suffix(".seed.json"))
                     except FileNotFoundError:
                         if not gateway_origin():
                             self.send_json(404, {"error": "gateway_preset_missing"})
                             return
                         fields = validate_gateway_preset(gateway_environment())
-                        save = True
-                if save:
                     data = (json.dumps(fields, ensure_ascii=False, indent=2) + "\n").encode()
                     write_api_settings(path, data)
                 server.gateway_test_origin = fields["gateway_url"] if fields["test_unverified"] else ""
