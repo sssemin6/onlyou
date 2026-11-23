@@ -319,26 +319,31 @@ class Integration(unittest.TestCase):
             install.assert_called_once()
             model_response.assert_called_once()
 
-    def test_gateway_preset_import_is_validated_and_can_be_reapplied(self):
+    def test_gateway_preset_button_creates_defaults_from_the_private_seed(self):
         self.app.gateway_preset = Path(self.workspace.name) / "gateway-defaults.json"
+        seed = self.app.gateway_preset.with_suffix(".seed.json")
         route = "/api/intranet/defaults"
         preset = {"gateway_url": "https://test-preset.example.invalid/v1", "answer_models": "chat-a, chat-b",
                   "test_unverified": True}
         with patch.dict(os.environ, {"MAILSEARCH_GATEWAY_URL": ""}):
             self.assertEqual(self.call(route, {})[0], 404)
-            self.assertEqual(self.call(route, {"preset": preset}, token=False)[0], 403)
-            self.assertEqual(self.call(route, {"preset": {**preset, "key": "forbidden"}})[0], 400)
+            self.assertEqual(self.call(route, {}, token=False)[0], 403)
+            self.assertEqual(self.call(route, {"preset": preset})[0], 400)
+            seed.write_text(json.dumps({**preset, "key": "forbidden"}), encoding="utf-8")
+            self.assertEqual(self.call(route, {})[0], 400)
             self.assertFalse(self.app.gateway_preset.exists())
-            status, values = self.call(route, {"preset": preset})
+            seed.write_text(json.dumps(preset), encoding="utf-8")
+            self.assertFalse(gateway_defaults(self.app.gateway_preset)["gateway_url"])
+            status, values = self.call(route, {})
             self.assertEqual(status, 200)
             self.assertEqual(values, {**preset, "gateway_url": "https://test-preset.example.invalid",
                                       "answer_models": "chat-a,chat-b", "ca_file": ""})
             self.assertEqual(json.loads(self.app.gateway_preset.read_bytes()), values)
+            seed.unlink()
             self.assertEqual(self.call(route, {}), (200, values))
             active = self.call("/api/intranet/settings")[1]
             self.assertEqual(active["gateway_url"], GATEWAY_ORIGIN)
             self.assertFalse(active["test_unverified"])
-            self.assertTrue(active["preset_available"])
 
     def test_external_settings_are_session_scoped_and_do_not_echo_key(self):
         route = "/api/external/settings"
