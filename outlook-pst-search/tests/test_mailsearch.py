@@ -23,6 +23,7 @@ from mailsearch.external import ExternalAI, Excerpt, Reviews, pcf_batches
 from mailsearch.extract import convert_legacy, extract_attachment
 from mailsearch.intranet import CHAT_PATH, IntranetAI, LOCAL_EMBEDDING
 from mailsearch.indexer import Indexer
+from mailsearch.ollama_setup import package_progress, pull_model
 from mailsearch.server import App, gateway_defaults, gateway_diagnostics
 from mailsearch.store import Store
 from tools.demo import generate
@@ -285,36 +286,59 @@ class Integration(unittest.TestCase):
 
         with (patch.object(self.ai, "ensure_server", side_effect=OSError("ollama_not_found")) as ensure_server,
               patch.object(self.ai, "ensure_model") as ensure_model,
-              patch.object(self.ai, "call") as model_call,
+              patch.object(self.ai, "response") as model_response,
               patch("mailsearch.ollama_setup.ollama_binary", return_value=None) as binary,
               patch("mailsearch.ollama_setup.winget_binary", return_value="fixture-winget"),
               patch("mailsearch.ollama_setup.install_ollama") as install):
             self.assertEqual(self.call(route, {"action": "check"})[0], 202)
             self.assertEqual(await_setup(), {"phase": "idle", "installed": False, "running": False,
-                                            "model_present": None, "can_install": True, "error": ""})
+                                            "model_present": None, "can_install": True, "error": "", "progress": None})
             ensure_server.assert_called_once_with()
             install.assert_not_called()
-            model_call.assert_not_called()
+            model_response.assert_not_called()
 
-            def installed(_winget):
+            def installed(_winget, report):
+                report(42)
+                self.assertEqual(self.app.ollama_setup.snapshot()["progress"], 42)
                 binary.return_value = "fixture-ollama"
                 ensure_server.side_effect = None
 
             install.side_effect = installed
             ensure_model.side_effect = [RuntimeError("local_model_missing"), "bge-m3:latest"]
-            model_call.return_value = {"status": "success"}
+            model_response.return_value.__enter__.return_value = io.BytesIO(b'{"status":"success"}\n')
             self.assertEqual(self.call(route, {"action": "install"})[0], 202)
             self.assertEqual(await_setup(), {"phase": "idle", "installed": True, "running": True,
-                                            "model_present": True, "can_install": False, "error": ""})
-            install.assert_called_once_with("fixture-winget")
-            model_call.assert_called_once_with("/api/pull", {"model": "bge-m3", "stream": False}, timeout=1800)
+                                            "model_present": True, "can_install": False, "error": "", "progress": None})
+            install.assert_called_once_with("fixture-winget", self.app.ollama_setup.report_progress)
+            model_response.assert_called_once_with("/api/pull", {"model": "bge-m3", "stream": True}, timeout=1800)
 
             ensure_model.side_effect = RuntimeError("local_model_missing")
             self.assertEqual(self.call(route, {"action": "check"})[0], 202)
             self.assertEqual(await_setup(), {"phase": "idle", "installed": True, "running": True,
-                                            "model_present": False, "can_install": True, "error": ""})
+                                            "model_present": False, "can_install": True, "error": "", "progress": None})
             install.assert_called_once()
-            model_call.assert_called_once()
+            model_response.assert_called_once()
+
+    def test_gateway_preset_import_is_validated_and_can_be_reapplied(self):
+        self.app.gateway_preset = Path(self.workspace.name) / "gateway-defaults.json"
+        route = "/api/intranet/defaults"
+        preset = {"gateway_url": "https://test-preset.example.invalid/v1", "answer_models": "chat-a, chat-b",
+                  "test_unverified": True}
+        with patch.dict(os.environ, {"MAILSEARCH_GATEWAY_URL": ""}):
+            self.assertEqual(self.call(route, {})[0], 404)
+            self.assertEqual(self.call(route, {"preset": preset}, token=False)[0], 403)
+            self.assertEqual(self.call(route, {"preset": {**preset, "key": "forbidden"}})[0], 400)
+            self.assertFalse(self.app.gateway_preset.exists())
+            status, values = self.call(route, {"preset": preset})
+            self.assertEqual(status, 200)
+            self.assertEqual(values, {**preset, "gateway_url": "https://test-preset.example.invalid",
+                                      "answer_models": "chat-a,chat-b", "ca_file": ""})
+            self.assertEqual(json.loads(self.app.gateway_preset.read_bytes()), values)
+            self.assertEqual(self.call(route, {}), (200, values))
+            active = self.call("/api/intranet/settings")[1]
+            self.assertEqual(active["gateway_url"], GATEWAY_ORIGIN)
+            self.assertFalse(active["test_unverified"])
+            self.assertTrue(active["preset_available"])
 
     def test_external_settings_are_session_scoped_and_do_not_echo_key(self):
         route = "/api/external/settings"
@@ -1247,6 +1271,30 @@ class EmbeddingTransport(unittest.TestCase):
             response.read.return_value = json.dumps({"data": entries}).encode()
             with self.assertRaises(ValueError):
                 api.embed(["first", "second"], timeout=10)
+
+
+class OllamaProgress(unittest.TestCase):
+    def test_winget_progress_uses_reported_percentage_or_size(self):
+        self.assertEqual(package_progress("████    512 MB / 1.00 GB"), 50)
+        self.assertEqual(package_progress("  32 %"), 32)
+        self.assertIsNone(package_progress("Installing…"))
+
+    def test_model_progress_reports_download_and_success(self):
+        ai = MagicMock()
+        stream = ai.response.return_value.__enter__
+        stream.return_value = io.BytesIO(
+            b'{"status":"pulling manifest"}\n'
+            b'{"digest":"layer-a","total":100,"completed":27}\n'
+            b'{"digest":"layer-a","total":100,"completed":90}\n'
+            b'{"digest":"layer-a","total":100,"completed":100}\n'
+            b'{"status":"success"}\n'
+        )
+        reports = []
+        pull_model(ai, reports.append)
+        self.assertEqual(reports, [27, 90, 99, 100])
+        stream.return_value = io.BytesIO(b'{"digest":"layer-a","total":100,"completed":99}\n')
+        with self.assertRaises(ValueError):
+            pull_model(ai, reports.append)
 
 
 class ApiSettingsPersistence(unittest.TestCase):
