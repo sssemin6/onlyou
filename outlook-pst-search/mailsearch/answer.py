@@ -9,6 +9,7 @@ import subprocess
 import time
 from pathlib import Path
 
+from .embedding import ENDPOINT as EMBEDDING_ENDPOINT, MODEL as EMBEDDING_MODEL
 from .extract import CREATE_FLAGS
 from .pcf import PCF_CELL, WORD_SUFFIXES, comment_number
 from .store import normalized, query_words, topic_key
@@ -79,7 +80,7 @@ PCF_INSTRUCTIONS = """너는 조선소 선주 교신문(PCF) 검토 도우미다
 
 
 class LocalAI:
-    def __init__(self, model, embedding_model="", port=11435, timeout=55, models_dir=None):
+    def __init__(self, model, embedding_model="", port=11435, timeout=55, *, embedding_api=None):
         for name in (model, embedding_model):
             if name and (not MODEL_NAME.fullmatch(name) or "cloud" in name.casefold() or name.startswith("http")):
                 raise ValueError("Use an installed local model name.")
@@ -87,8 +88,14 @@ class LocalAI:
         self.embedding_model = embedding_model
         self.port = port
         self.timeout = timeout
-        self.models_dir = models_dir
+        self.embedding_api = embedding_api
         self.server = None
+
+    @property
+    def embedding_index(self):
+        if self.embedding_api:
+            return f"{EMBEDDING_ENDPOINT}#{EMBEDDING_MODEL}"
+        return self.embedding_model
 
     def call(self, path, data=None, timeout=None):
         # HTTPConnection uses a fixed IP. It does not follow redirects or environment proxies.
@@ -118,8 +125,6 @@ class LocalAI:
             raise OSError("ollama_not_found")
         if self.server is None or self.server.poll() is not None:
             environment = dict(os.environ, OLLAMA_HOST=f"127.0.0.1:{self.port}")
-            if self.models_dir:
-                environment["OLLAMA_MODELS"] = str(self.models_dir)
             self.server = subprocess.Popen(
                 [binary, "serve"], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL, env=environment, creationflags=CREATE_FLAGS,
@@ -155,6 +160,8 @@ class LocalAI:
         raise RuntimeError("local_model_missing")
 
     def embed(self, texts, timeout=8):
+        if self.embedding_api:
+            return self.embedding_api.embed(texts, timeout)
         self.ensure_server()
         model = self.ensure_model(self.embedding_model)
         values = self.call("/api/embed", {"model": model, "input": texts, "truncate": True}, timeout)
@@ -259,9 +266,9 @@ def evidence_for(store, ai, question, filters, context, semantic=True, limit=9, 
     lexical = store.lexical(search_text, filters, fuzzy=True)
     semantic_rows = []
     mode = "keyword"
-    if semantic and ai.embedding_model:
+    if semantic and ai.embedding_index:
         try:
-            semantic_rows = store.semantic(ai.embed([search_text], timeout=6)[0], ai.embedding_model, filters)
+            semantic_rows = store.semantic(ai.embed([search_text], timeout=6)[0], ai.embedding_index, filters)
             mode = "hybrid" if semantic_rows else "keyword"
         except (OSError, ValueError, RuntimeError, KeyError, IndexError, TypeError, http.client.HTTPException):
             mode = "keyword_only"
