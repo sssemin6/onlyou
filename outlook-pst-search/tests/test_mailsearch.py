@@ -18,6 +18,7 @@ from mailsearch.answer import LocalAI, delivery_date_answer, validate
 from mailsearch.embedding import ENDPOINT as EMBEDDING_ENDPOINT, EmbeddingAPI
 from mailsearch.external import ExternalAI, Excerpt, Reviews, pcf_batches
 from mailsearch.extract import convert_legacy, extract_attachment
+from mailsearch.intranet import CHAT_URL, DEFAULTS as HD_DEFAULTS
 from mailsearch.indexer import Indexer
 from mailsearch.server import App
 from mailsearch.store import Store
@@ -118,6 +119,77 @@ class Integration(unittest.TestCase):
         self.assertIsNone(row["issue"])
         self.assertEqual((row["done"], row["omitted"]), (4, 1))
         return source
+
+    def test_hd_settings_probes_use_one_key_and_review_the_chosen_answer_model(self):
+        source = self.import_mail()
+        selections = {**HD_DEFAULTS, "rerank": "bge-reranker-v2-m3"}
+        private = "synthetic-session-key"
+        self.assertEqual(self.call("/api/intranet/settings", token=False)[0], 403)
+        self.assertEqual(self.call("/api/intranet/settings", {"action": "apply", "key": private,
+            "selections": {**selections, "answer": "outside-catalog"}})[0], 400)
+        with patch("mailsearch.embedding.http.client.HTTPSConnection") as https:
+            request = https.return_value.request
+            response = https.return_value.getresponse.return_value
+            response.status = 200
+
+            def reply(method, path, body, headers):
+                self.assertEqual(method, "POST")
+                self.assertEqual(headers["Authorization"], "Bearer " + private)
+                data = json.loads(body)
+                model = data["model"]
+                if path == "/v1/embeddings":
+                    self.assertEqual(model, "bge-m3")
+                    value = {"data": [{"index": 0, "embedding": [1.0, 0.05, 0.12]}]}
+                elif path == "/v1/rerank":
+                    self.assertEqual(model, "bge-reranker-v2-m3")
+                    self.assertEqual(len(data["documents"]), data["top_n"])
+                    value = {"results": [{"index": i, "relevance_score": i}
+                                         for i in range(data["top_n"])]}
+                else:
+                    self.assertEqual(path, "/v1/chat/completions")
+                    self.assertEqual(model, "qwen3-8-27b")
+                    content = '```json\n{"ok": true}\n```'
+                    value = {"choices": [{"message": {"content": content}, "finish_reason": "stop"}]}
+                response.read.return_value = json.dumps(value).encode()
+
+            request.side_effect = reply
+            status, test = self.call("/api/intranet/settings", {"action": "test", "key": private, "selections": selections})
+            self.assertEqual(status, 200)
+            self.assertEqual(test, {"checks": {role: {"ok": True} for role in selections}})
+            self.assertFalse(self.call("/api/intranet/settings")[1]["configured"])
+            status, applied = self.call("/api/intranet/settings", {"action": "apply", "key": private, "selections": selections})
+            self.assertEqual(status, 200)
+            self.assertTrue(applied["active_answer"])
+            self.assertNotIn(private, json.dumps(applied))
+            request.reset_mock()
+            query = {"query": "A-17 납기", "filters": {"source": source}}
+            status, preview = self.call("/api/external/preview", query)
+            self.assertEqual(status, 200)
+            self.assertEqual((preview["destination"], preview["model"]), (CHAT_URL, "qwen3-8-27b"))
+            self.assertTrue(preview["excerpts"])
+            self.assertIn("/v1/rerank", [args.args[1] for args in request.call_args_list])
+            self.assertNotIn("/v1/chat/completions", [args.args[1] for args in request.call_args_list])
+            request.reset_mock()
+            status, _ = self.call("/api/intranet/settings", {"action": "apply", "selections": {
+                **selections, "answer": "deepseek-v4-1-flash-1017"}})
+            self.assertEqual(status, 200)
+            status, _ = self.call("/api/external/send", {"review": preview["review"],
+                                                      "excerpts": [preview["excerpts"][0]["id"]]})
+            self.assertEqual(status, 409)
+            request.assert_not_called()
+            status, new_review = self.call("/api/external/preview", query)
+            self.assertEqual(status, 200)
+            self.assertEqual(new_review["model"], "deepseek-v4-1-flash-1017")
+            request.reset_mock(side_effect=True)
+            response.read.return_value = json.dumps({"choices": [{"message": {
+                "content": '{"status":"insufficient","claims":[]}'
+            }}]}).encode()
+            status, answer = self.call("/api/external/send", {"review": new_review["review"],
+                                                           "excerpts": [new_review["excerpts"][0]["id"]]})
+            self.assertEqual((status, answer["status"]), (200, "insufficient"))
+            request.assert_called_once()
+            _, path, body, _ = request.call_args.args
+            self.assertEqual((path, json.loads(body)["model"]), ("/v1/chat/completions", "deepseek-v4-1-flash-1017"))
 
     def test_external_settings_are_session_scoped_and_do_not_echo_key(self):
         route = "/api/external/settings"
