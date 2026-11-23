@@ -23,7 +23,8 @@ from mailsearch.external import ExternalAI, Excerpt, Reviews, pcf_batches
 from mailsearch.extract import convert_legacy, extract_attachment
 from mailsearch.intranet import CHAT_PATH, IntranetAI, LOCAL_EMBEDDING
 from mailsearch.indexer import Indexer
-from mailsearch.ollama_setup import package_progress, pull_model
+from mailsearch.ollama_setup import (InstallCommandError, install_ollama, package_progress,
+                                    pull_model, run_install_command, winget_binary)
 from mailsearch.server import App, gateway_defaults, gateway_diagnostics
 from mailsearch.store import Store
 from tools.demo import generate
@@ -1282,6 +1283,7 @@ class OllamaProgress(unittest.TestCase):
     def test_winget_progress_uses_reported_percentage_or_size(self):
         self.assertEqual(package_progress("████    512 MB / 1.00 GB"), 50)
         self.assertEqual(package_progress("  32 %"), 32)
+        self.assertEqual(package_progress("#####   42.8%"), 42)
         self.assertIsNone(package_progress("Installing…"))
 
     def test_model_progress_reports_download_and_success(self):
@@ -1300,6 +1302,81 @@ class OllamaProgress(unittest.TestCase):
         stream.return_value = io.BytesIO(b'{"digest":"layer-a","total":100,"completed":99}\n')
         with self.assertRaises(ValueError):
             pull_model(ai, reports.append)
+        stream.return_value = io.BytesIO(b'{"error":"x509: certificate signed by unknown authority"}\n')
+        with self.assertRaisesRegex(RuntimeError, "registry TLS certificate verification failed"):
+            pull_model(ai, reports.append)
+
+    def test_winget_skips_broken_alias_and_finds_the_newest_app_installer(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            alias = root / "User" / "Microsoft" / "WindowsApps" / "winget.exe"
+            alias.parent.mkdir(parents=True)
+            alias.touch()
+            packages = root / "Program Files" / "WindowsApps"
+            executables = [
+                packages / f"Microsoft.DesktopAppInstaller_{version}_x64__8wekyb3d8bbwe" / "winget.exe"
+                for version in ("1.9.0.0", "1.29.380.0")
+            ]
+            for path in executables:
+                path.parent.mkdir(parents=True)
+                path.touch()
+
+            def probe(command, **_kwargs):
+                if command[0] == str(alias):
+                    raise OSError("disabled alias")
+                return MagicMock(stdout=b"v1.29.380\r\n")
+
+            with (patch("mailsearch.ollama_setup.os") as environment,
+                  patch("mailsearch.ollama_setup.shutil.which", return_value=str(alias)),
+                  patch("mailsearch.ollama_setup.windows_tool", return_value=None),
+                  patch("mailsearch.ollama_setup.subprocess.run", side_effect=probe) as run):
+                environment.name = "nt"
+                environment.environ = {"LOCALAPPDATA": str(root / "User"), "ProgramW6432": str(packages.parent),
+                                       "PROCESSOR_ARCHITEW6432": "AMD64"}
+                self.assertEqual(winget_binary(), str(executables[1]))
+                self.assertEqual([call.args[0] for call in run.call_args_list],
+                                 [[str(alias), "--version"], [str(executables[1]), "--version"]])
+
+    def test_install_command_logs_winget_output_and_hresult(self):
+        command = [sys.executable, "-c", "import sys; print('CRYPT_E_NO_REVOCATION_CHECK'); sys.exit(1)"]
+        with self.assertLogs("mailsearch.gateway.ollama", level="ERROR") as logs:
+            with self.assertRaises(InstallCommandError) as result:
+                run_install_command(command, "fixture WinGet", lambda _value: None, 5)
+        self.assertTrue(result.exception.contains(("crypt_e_no_revocation_check",)))
+        self.assertIn("exit 1 (0x00000001)", logs.output[0])
+        self.assertIn("CRYPT_E_NO_REVOCATION_CHECK", logs.output[0])
+
+    def test_tls_fallback_runs_only_after_the_pinned_hash_matches(self):
+        fixture = b"synthetic-installer"
+        executed = []
+        payload = fixture
+
+        def command(args, label, _report, _timeout):
+            executed.append((label, args))
+            if args[0] == "fixture-winget":
+                raise InstallCommandError(0x80092012, "CRYPT_E_NO_REVOCATION_CHECK")
+            if args[0] == "fixture-curl":
+                if "--insecure" not in args:
+                    raise InstallCommandError(60, "SEC_E_UNTRUSTED_ROOT")
+                Path(args[args.index("--output") + 1]).write_bytes(payload)
+
+        with (patch("mailsearch.ollama_setup.ollama_binary", return_value=None),
+              patch("mailsearch.ollama_setup.windows_tool", return_value="fixture-curl"),
+              patch("mailsearch.ollama_setup.run_install_command", side_effect=command),
+              patch("mailsearch.ollama_setup.OLLAMA_INSTALLER_SHA256", hashlib.sha256(fixture).hexdigest())):
+            with self.assertLogs("mailsearch.gateway.ollama", level="WARNING"):
+                install_ollama("fixture-winget", lambda _value: None)
+            self.assertEqual([label for label, _ in executed], ["WinGet Ollama install", "Ollama installer download",
+                                                               "Ollama installer download retry", "Verified Ollama installer"])
+            self.assertNotIn("--insecure", executed[1][1])
+            self.assertIn("--insecure", executed[2][1])
+
+            executed.clear()
+            payload = b"tampered"
+            with self.assertLogs("mailsearch.gateway.ollama", level="ERROR"):
+                with self.assertRaisesRegex(RuntimeError, "SHA-256 mismatch"):
+                    install_ollama("fixture-winget", lambda _value: None)
+            self.assertEqual(len(executed), 3)
 
 
 class ApiSettingsPersistence(unittest.TestCase):
