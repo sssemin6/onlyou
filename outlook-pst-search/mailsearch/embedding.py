@@ -5,6 +5,7 @@ import logging
 import os
 import re
 import ssl
+from dataclasses import dataclass
 from functools import lru_cache
 from http import HTTPStatus
 from urllib.parse import urlsplit
@@ -23,8 +24,10 @@ class GatewayRequestError(RuntimeError):
         self.status = status
 
 
-def gateway_origin():
-    raw = os.environ.get("MAILSEARCH_GATEWAY_URL", "").strip()
+def gateway_origin(raw=None):
+    if raw is None:
+        raw = os.environ.get("MAILSEARCH_GATEWAY_URL", "")
+    raw = raw.strip()
     if not raw or any(ord(ch) <= 32 or ord(ch) >= 127 for ch in raw):
         return ""
     try:
@@ -38,6 +41,12 @@ def gateway_origin():
             or endpoint.path not in {"", "/", "/v1", "/v1/"} or port == 0):
         return ""
     return f"https://{host}" + (f":{port}" if port not in (None, 443) else "")
+
+
+@dataclass(frozen=True)
+class GatewayTLSOptions:
+    ca_file: str = ""
+    verify: bool = True
 
 
 @lru_cache(maxsize=4)
@@ -56,12 +65,12 @@ def warn_unverified(destination):
     logger.warning("TLS certificate verification disabled for %s by %s=0 (test only)", destination, VERIFY_ENV)
 
 
-def request_gateway_json(origin, path, payload, headers, *, timeout, max_bytes):
+def request_gateway_json(origin, path, payload, headers, *, timeout, max_bytes, tls=None):
     """Send to the configured gateway and log transport errors without request or response data."""
     endpoint = urlsplit(origin)
     destination = endpoint.netloc + path
-    verify = os.environ.get(VERIFY_ENV, "1").strip()
-    ca_file = os.environ.get(CA_FILE_ENV, "").strip()
+    verify = os.environ.get(VERIFY_ENV, "1").strip() if tls is None else ("1" if tls.verify else "0")
+    ca_file = os.environ.get(CA_FILE_ENV, "").strip() if tls is None else tls.ca_file
     if verify not in {"0", "1"} or (verify == "0" and ca_file):
         logger.error("TLS configuration error: set %s to 0 or 1 and use %s only with verification enabled",
                      VERIFY_ENV, CA_FILE_ENV)
@@ -107,10 +116,11 @@ def request_gateway_json(origin, path, payload, headers, *, timeout, max_bytes):
 class EmbeddingAPI:
     model = MODEL
 
-    def __init__(self, key):
+    def __init__(self, key, *, origin=None, tls=None):
         if not re.fullmatch(r"[!-~]{1,2048}", key):
             raise ValueError("embedding_api_key")
-        self.origin = gateway_origin()
+        self.origin = gateway_origin(origin)
+        self.tls = tls
         if not self.origin:
             raise ValueError("gateway_url")
         self._key = key
@@ -126,7 +136,7 @@ class EmbeddingAPI:
     def request(self, path, payload, timeout):
         return request_gateway_json(self.origin, path, payload, {
             "Authorization": f"Bearer {self._key}", "Content-Type": "application/json",
-        }, timeout=timeout, max_bytes=MAX_RESPONSE_BYTES)
+        }, timeout=timeout, max_bytes=MAX_RESPONSE_BYTES, tls=self.tls)
 
     def embed(self, texts, timeout):
         data = self.request(PATH, {"model": self.model, "input": texts[0] if len(texts) == 1 else texts}, timeout)
