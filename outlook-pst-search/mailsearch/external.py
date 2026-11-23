@@ -9,6 +9,7 @@ import time
 from dataclasses import dataclass
 from urllib.parse import urlsplit
 
+from .embedding import HOST as HD_HOST
 from .store import query_words
 from .answer import ANSWER_INSTRUCTIONS, MODEL_NAME, map_citations
 
@@ -48,7 +49,7 @@ class ExternalAI:
         url = os.environ.get("MAILSEARCH_EXTERNAL_URL") or DEFAULT_URL
         return cls(url, model, key)
 
-    def __init__(self, url, model, key):
+    def __init__(self, url, model, key, *, intranet=False):
         if not isinstance(url, str) or not 1 <= len(url) <= 512 or any(ord(ch) <= 32 or ord(ch) >= 127 for ch in url):
             raise ValueError("external_url")
         try:
@@ -69,6 +70,7 @@ class ExternalAI:
         self.port = port if port is not None else 443
         self.path = endpoint.path
         self.anthropic = endpoint.path.endswith("/messages")
+        self.intranet = intranet and self.host == HD_HOST and self.port == 443 and self.path == "/v1/chat/completions"
         self.model = model
         self._key = key
         self.review_generation = object()
@@ -91,14 +93,14 @@ class ExternalAI:
 
     @property
     def pcf_budget(self):
-        if os.environ.get("MAILSEARCH_PCF_INTERNAL_URL") != self.public["destination"]:
+        if not self.intranet and os.environ.get("MAILSEARCH_PCF_INTERNAL_URL") != self.public["destination"]:
             return 0
         raw = os.environ.get("MAILSEARCH_PCF_INPUT_BYTES", "12000")
         return int(raw) if re.fullmatch(r"[0-9]{4,6}", raw) and 3000 <= int(raw) <= 96000 else 0
 
     @property
     def internal_budget(self):
-        if os.environ.get("MAILSEARCH_INTERNAL_URL") != self.public["destination"]:
+        if not self.intranet and os.environ.get("MAILSEARCH_INTERNAL_URL") != self.public["destination"]:
             return 0
         raw = os.environ.get("MAILSEARCH_INTERNAL_INPUT_BYTES", "24000")
         return int(raw) if re.fullmatch(r"[0-9]{4,6}", raw) and 3000 <= int(raw) <= 96000 else 0
@@ -152,6 +154,9 @@ class ExternalAI:
             if self.host == "api.openai.com":
                 options.update(max_completion_tokens=token_limit, store=False)
             else:
+                if self.intranet:
+                    options.pop("response_format")
+                    token_limit = max(token_limit, 8192 if self.model.startswith("deepseek-") else 4096)
                 options["max_tokens"] = token_limit
             headers = {"Authorization": f"Bearer {self._key}", "Content-Type": "application/json"}
         # HTTPSConnection uses normal certificate verification and follows neither redirects nor proxies.
@@ -171,6 +176,10 @@ class ExternalAI:
                 text = "".join(block.get("text", "") for block in payload["content"] if isinstance(block, dict))
             else:
                 text = payload["choices"][0]["message"]["content"]
+            if self.intranet and isinstance(text, str):
+                fenced = re.fullmatch(r"\s*```(?:json)?\s*(.*?)\s*```\s*", text, re.S | re.I)
+                if fenced:
+                    text = fenced[1]
             return json.loads(text)
         finally:
             connection.close()
