@@ -39,7 +39,7 @@ const issueNames = {
   disk_or_source: "파일 접근 권한과 저장 공간을 확인하세요.",
   changed: "파일이 변경되었습니다. 갱신해 주세요.",
   interrupted: "중단된 색인입니다.",
-  embedding_unavailable: "의미 검색 모델을 열지 못했습니다. 일반 검색은 사용할 수 있습니다.",
+  embedding_unavailable: "의미 색인을 완료하지 못했습니다. 키워드 검색은 사용 가능하며, 연결을 확인한 뒤 보관함을 갱신할 수 있습니다.",
   pcf_input_too_large: "선택한 COMMENT이 현재 입력 한도를 초과합니다.",
   external_disabled: "상단의 API 설정에서 답변에 사용할 AI를 연결해 주세요.",
   external_url: "HTTPS 주소를 확인하세요. 주소는 /chat/completions 또는 /messages로 끝나야 합니다.",
@@ -250,7 +250,13 @@ async function showSources() {
   }
   const modelStatus = element("model-status");
   modelStatus.parentElement.dataset.configured = Boolean(data.embedding);
-  modelStatus.textContent = data.embedding ? "로컬 의미 검색 · " + data.embedding : "로컬 키워드 검색";
+  if (data.embedding_endpoint) {
+    modelStatus.textContent = "HD AIC 의미 검색 · " + data.embedding;
+    modelStatus.title = data.embedding_endpoint;
+  } else {
+    modelStatus.textContent = data.embedding ? "로컬 의미 검색 · " + data.embedding : "로컬 키워드 검색";
+    modelStatus.removeAttribute("title");
+  }
   element("external-panel").dataset.configured = Boolean(data.external);
   const externalStatus = element("external-status");
   externalStatus.textContent = data.external
