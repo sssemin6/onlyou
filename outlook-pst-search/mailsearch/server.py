@@ -29,6 +29,7 @@ from .extract import MAX_ATTACHMENT
 from .filesystem import local_path
 from .indexer import ImportIssue, Indexer
 from .intranet import CHAT_PATH, LOCAL_EMBEDDING, IntranetAI, available_models, validate_selections
+from .ollama_setup import OllamaSetup
 from .pcf import PCF_CELL
 from .store import Store, normalized, pack_vector, query_words, quoted_plan
 
@@ -71,9 +72,11 @@ class App(ThreadingHTTPServer):
     def __init__(self, port, store, indexer, ai, external=None, *, api_settings=None, gateway_preset=None):
         super().__init__(("127.0.0.1", port), Handler)
         self.store, self.indexer, self.ai = store, indexer, ai
+        self.ollama_setup = OllamaSetup(ai)
         self.external = external
         self.generic_answer = external
         self.gateway_fields = gateway_defaults(gateway_preset)
+        self.gateway_test_origin = self.gateway_fields["gateway_url"] if self.gateway_fields.pop("test_unverified") else ""
         self.api_settings = api_settings
         self.api_profiles = api_settings.load() if api_settings else {}
         for profile in ("gateway", "external"):
@@ -169,6 +172,7 @@ def gateway_defaults(preset_path):
         "gateway_url": gateway_origin(),
         "answer_models": os.environ.get("MAILSEARCH_GATEWAY_ANSWER_MODELS", ""),
         "ca_file": os.environ.get(CA_FILE_ENV, ""),
+        "test_unverified": False,
     }
     if preset_path is None:
         return defaults
@@ -178,6 +182,9 @@ def gateway_defaults(preset_path):
         preset = json.loads(raw) if len(raw) <= MAX_REQUEST else None
         if not isinstance(preset, dict) or preset.keys() - defaults.keys():
             raise ValueError("gateway_preset")
+        test_unverified = preset.pop("test_unverified", False)
+        if type(test_unverified) is not bool:
+            raise ValueError("gateway_preset")
         fields = gateway_fields(preset, {})
     except FileNotFoundError:
         return defaults
@@ -186,6 +193,7 @@ def gateway_defaults(preset_path):
         return defaults
     if defaults["gateway_url"] and defaults["gateway_url"] != fields["gateway_url"]:
         return defaults
+    fields["test_unverified"] = bool(test_unverified and fields["gateway_url"])
     return {name: value or fields[name] for name, value in defaults.items()}
 
 
@@ -324,6 +332,8 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(200, {"ok": True})
         elif route.path == "/api/intranet/settings":
             self.send_json(200, self.intranet_settings())
+        elif route.path == "/api/ollama/setup":
+            self.send_json(200, self.server.ollama_setup.snapshot())
         elif route.path == "/api/external/settings":
             external = self.server.generic_provider()
             saved = self.server.api_profiles.get("external") or {}
@@ -374,6 +384,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_external(payload, pcf=route == "/api/pcf/send")
             elif route == "/api/intranet/settings":
                 self.change_intranet_settings(payload)
+            elif route == "/api/ollama/setup":
+                self.send_json(202, self.server.ollama_setup.start(payload.get("action")))
             elif route == "/api/external/settings":
                 self.change_external_settings(payload)
             else:
@@ -718,6 +730,7 @@ class Handler(BaseHTTPRequestHandler):
         return {
             **fields, "destination": origin + CHAT_PATH if origin else "", "models": models,
             "configured": configured, "persistent_keys": self.server.persistent_keys,
+            "test_unverified": bool(origin and origin == self.server.gateway_test_origin),
             "selections": selections,
             "active_answer": configured and current.answer_client is not None and self.server.external is current.answer_client,
         }
@@ -962,7 +975,7 @@ def main(argv=None):
                         while True:
                             time.sleep(3)
                             seen = app.last_seen
-                            if seen and time.time() - seen > 12:
+                            if seen and time.time() - seen > 12 and app.ollama_setup.snapshot()["phase"] == "idle":
                                 app.shutdown()
                                 return
                     threading.Thread(target=watch_page, daemon=True).start()
