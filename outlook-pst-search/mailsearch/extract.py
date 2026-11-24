@@ -288,9 +288,12 @@ def pdf_pages(input_pdf, pages, check):
     return locations, status
 
 
+TEXT_EXTRACTION_SUFFIXES = {".txt", ".pdf", ".docx", ".xlsx"}
+
+
 def extract_bytes(content, suffix, temporary, pdf_command, *, check=lambda: None, structure=None):
     """(status, [(location, text)]) for document bytes; never raises."""
-    if suffix not in {".txt", ".pdf", ".docx", ".xlsx"}:
+    if suffix not in TEXT_EXTRACTION_SUFFIXES:
         return "미지원 형식", []
     if not content:
         return "텍스트 없음", []
@@ -381,4 +384,7 @@ def extract_document(path, temporary, pdf_command, *, check=lambda: None, struct
 
 
 def extract_attachment(name, part, temporary, pdf_command, *, check=lambda: None):
-    return extract_bytes(part.get_payload(decode=True), Path(name).suffix.lower(), temporary, pdf_command, check=check)
+    suffix = Path(name).suffix.lower()
+    if suffix not in TEXT_EXTRACTION_SUFFIXES:
+        return "미지원 형식", []
+    return extract_bytes(part.get_payload(decode=True), suffix, temporary, pdf_command, check=check)
