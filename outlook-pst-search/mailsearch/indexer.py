@@ -20,6 +20,10 @@ from .store import buckets, document_kind, document_identity, now, pack_vector, 
 NO_MAIL = {"pst_no_mail", "eml_no_mail"}
 
 
+def pst_access_error(exc):
+    return isinstance(exc, PermissionError) or getattr(exc, "winerror", None) in {5, 32, 33, 65, 86, 1326}
+
+
 def document_date(path):
     try:
         return datetime.datetime.fromtimestamp(path.stat().st_mtime, datetime.timezone.utc).isoformat(timespec="seconds")
@@ -118,7 +122,11 @@ class Indexer:
                         raise ImportIssue("source_action")
                     if action == "refresh" and row["state"] == "queued":
                         raise ImportIssue("source_busy")
-                    if action == "refresh" or row["issue"] in NO_MAIL | {"changed", "mail_parse_failed"}:
+                    deferred_psts = conn.execute(
+                        "SELECT 1 FROM problems WHERE source=? AND version=? AND code='pst_in_use' LIMIT 1",
+                        (source, row["pending"]),
+                    ).fetchone()
+                    if action == "refresh" or deferred_psts or row["issue"] in NO_MAIL | {"changed", "mail_parse_failed"}:
                         self.discard_pending(conn, row)
                         conn.execute(
                             """UPDATE sources SET pending=revision+1,revision=revision+1,signature=NULL,
@@ -223,26 +231,41 @@ class Indexer:
             header = stream.read(12)
         return len(header) == 12 and header[:4] == b"!BDN" and header[8:10] == b"SM"
 
-    def import_folder_psts(self, folder, stage, event, known=None):
+    def import_folder_psts(self, folder, stage, event, known):
         """Also import PST files kept inside a registered mail folder.
 
         PSTs whose signature matches the last committed import are carried over
         from that version instead of being re-exported and re-indexed. Empty or
-        unreadable PST files are skipped and counted so the rest of the folder
-        still imports; locking and mid-import changes still fail the source.
+        unreadable PST files are skipped. A locked PST keeps its previous index
+        and signature so the next refresh still sees it as pending.
         """
         extras, carried = [], []
         skipped = 0
         signatures = {}
+        deferred = []
         files = sorted(path for path in folder.rglob("*")
-                       if path.suffix.lower() == ".pst" and path.is_file() and not path.is_symlink())
+                       if path.suffix.lower() == ".pst")
         for pst in files:
             self.check(event)
-            label = pst.relative_to(folder).as_posix() + "/"
-            signature = read_signature(pst)
-            if (known or {}).get(label) == signature:
-                carried.append(label)
-                signatures[label] = signature
+            item = pst.relative_to(folder).as_posix()
+            label = item + "/"
+            try:
+                if pst.is_symlink() or not stat.S_ISREG(pst.stat().st_mode):
+                    continue
+                signature = read_signature(pst)
+                if known.get(label) == signature:
+                    carried.append(label)
+                    signatures[label] = signature
+                    continue
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                if not pst_access_error(exc):
+                    raise
+                deferred.append(item)
+                if label in known:
+                    carried.append(label)
+                    signatures[label] = known[label]
                 continue
             slot = stage / ("pst-" + hashlib.sha1(label.encode("utf-8")).hexdigest()[:16])
             slot.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -253,8 +276,14 @@ class Indexer:
                     output = self.export(pst, slot, event)
                     if read_signature(pst) != signature:
                         raise ImportIssue("changed")
-            except PermissionError as exc:
-                raise ImportIssue("pst_in_use") from exc
+            except OSError as exc:
+                if not pst_access_error(exc):
+                    raise
+                deferred.append(item)
+                if label in known:
+                    carried.append(label)
+                    signatures[label] = known[label]
+                continue
             except ImportIssue as exc:
                 if str(exc) in {"pst_no_mail", "pst_export", "pst_invalid"}:
                     skipped += 1
@@ -265,7 +294,7 @@ class Indexer:
                 raise
             extras.append((output, label))
             signatures[label] = signature
-        return extras, carried, skipped, signatures
+        return extras, carried, skipped, signatures, deferred
 
     def export(self, path, stage, event):
         output = stage / "eml"
@@ -335,7 +364,7 @@ class Indexer:
             conn.execute("UPDATE sources SET signature=?,state='extracting' WHERE id=? AND state='queued'", (signature, source))
         self.check(event)
         is_pst = row["kind"] == "pst"
-        extras, carried, signatures = (), (), None
+        extras, carried, signatures, deferred = (), (), None, ()
         if is_pst:
             try:
                 with stable_input(path):
@@ -346,26 +375,33 @@ class Indexer:
                     root = self.export(path, stage, event)
                     if read_signature(path) != signature:
                         raise ImportIssue("changed")
-            except PermissionError as exc:
+            except OSError as exc:
+                if not pst_access_error(exc):
+                    raise
                 raise ImportIssue("pst_in_use") from exc
         else:
             root = path
             if path.is_dir():
-                extras, carried, skipped_psts, signatures = self.import_folder_psts(
+                extras, carried, skipped_psts, signatures, deferred = self.import_folder_psts(
                     path, stage, event, self.store.pst_files(source))
-                if skipped_psts:
+                if skipped_psts or deferred:
                     with self.store.connection() as conn:
-                        conn.execute("UPDATE sources SET omitted=omitted+? WHERE id=?", (skipped_psts, source))
+                        conn.executemany("INSERT INTO problems VALUES(?,?,?,'pst_in_use')",
+                                         ((source, version, item) for item in deferred))
+                        conn.execute("UPDATE sources SET omitted=omitted+? WHERE id=?",
+                                     (skipped_psts + len(deferred), source))
         self.check(event)
         self.state(source, "headers")
         self.index_headers(root, source, version, event, numbered=is_pst, extras=extras,
                            previous=previous, carried=carried, temp=temp)
         self.check(event)
         progress = self.store.source(source)
+        if not progress["done"] and deferred and not progress["failed"]:
+            raise ImportIssue("pst_in_use")
         if not progress["done"] and progress["omitted"] and not is_pst:
             with self.store.connection() as conn:
                 missing_document = conn.execute(
-                    "SELECT 1 FROM problems WHERE source=? AND version=? AND code<>'parse' LIMIT 1",
+                    "SELECT 1 FROM problems WHERE source=? AND version=? AND code NOT IN ('parse','pst_in_use') LIMIT 1",
                     (source, version),
                 ).fetchone()
             if missing_document:
@@ -406,17 +442,17 @@ class Indexer:
         known = self.store.pst_files(row["id"])
         changed = []
         try:
-            files = sorted(item for item in path.rglob("*")
-                           if item.suffix.lower() == ".pst" and item.is_file() and not item.is_symlink())
+            files = sorted(item for item in path.rglob("*") if item.suffix.lower() == ".pst")
         except OSError:
             return []
         for pst in files:
-            label = pst.relative_to(path).as_posix() + "/"
+            item = pst.relative_to(path).as_posix()
             try:
-                if known.get(label) != read_signature(pst):
-                    changed.append(pst.relative_to(path).as_posix())
-            except OSError:
-                continue
+                if not pst.is_symlink() and stat.S_ISREG(pst.stat().st_mode) and known.get(item + "/") != read_signature(pst):
+                    changed.append(item)
+            except OSError as exc:
+                if pst_access_error(exc):
+                    changed.append(item)
         return changed
 
     def scan_entries(self, root, *, numbered, extras=()):
