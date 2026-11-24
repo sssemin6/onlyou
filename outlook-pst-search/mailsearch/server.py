@@ -22,8 +22,9 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from urllib.parse import quote, urlsplit
 
-from .answer import (PCF_INSTRUCTIONS, LocalAI, map_citations, pcf_candidates, pcf_retrieval, pcf_word, delivery_date_answer,
-                     evidence_for, merge_rows, public_row, validate)
+from .answer import (ANSWER_CLAIM_LIMIT, ANSWER_EVIDENCE_LIMIT, ANSWER_TEXT_LIMIT, DEFAULT_ANSWER_NUM_CTX,
+                     PCF_INSTRUCTIONS, SYNTHESIS_QUESTION, LocalAI, delivery_date_answer, evidence_for,
+                     map_citations, merge_rows, pcf_candidates, pcf_retrieval, pcf_word, public_row, validate)
 from .api_settings import ApiSettings, write_api_settings
 from .embedding import (CA_FILE_ENV, GatewayTLSOptions, MODEL as BGE_MODEL, PATH as EMBEDDING_PATH,
                         gateway_origin, logger as gateway_logger)
@@ -35,7 +36,8 @@ from .intranet import CHAT_PATH, LOCAL_EMBEDDING, RERANK_PATH, IntranetAI, avail
 from .ollama_setup import OllamaSetup
 from .pcf import PCF_CELL
 from .search_profile import SearchProfile, SearchTickets
-from .store import Store, normalized, pack_vector, query_words, quoted_plan
+from .store import (Store, local_midnight_utc, normalized, pack_vector, prioritize_attachments, query_words,
+                    question_scope, quoted_plan)
 
 STATIC = Path(__file__).with_name("static")
 FILES = {
@@ -353,8 +355,7 @@ def filters_from(get):
             date = datetime.date.fromisoformat(value)
             if name == "before":
                 date += datetime.timedelta(days=1)
-            local = datetime.datetime.combine(date, datetime.time()).astimezone(datetime.timezone.utc)
-            filters[name] = local.isoformat(timespec="seconds")
+            filters[name] = local_midnight_utc(date)
     return filters
 
 
@@ -599,6 +600,7 @@ class Handler(BaseHTTPRequestHandler):
                     rows = store.lexical(query, filters, limit=180)
             if future:
                 rows = merge_rows(rows, future.result(), limit=60)
+            rows = prioritize_attachments(rows, filters)
             if defer and rows:
                 sources, documents = {}, {}
                 allowed, unknown = [], False
@@ -656,6 +658,7 @@ class Handler(BaseHTTPRequestHandler):
         return (row["id"], cell[1]) if cell else row["fingerprint"]
 
     def search_results(self, rows, query, filters, quick, exact):
+        rows = prioritize_attachments(rows, filters)
         distinct = {}
         for row in rows:
             key = self.search_result_key(row, filters)
@@ -695,7 +698,8 @@ class Handler(BaseHTTPRequestHandler):
         filters = filters_from(options.get)
         store, ai = self.server.store, self.server.ai
         if route == "/api/search":
-            self.search(query, filters, payload)
+            search_text, filters = question_scope(query, filters)
+            self.search(search_text, filters, payload)
             return
         if not query:
             self.send_json(400, {"error": "question_required"})
@@ -715,11 +719,14 @@ class Handler(BaseHTTPRequestHandler):
             evidence, mode = pcf_retrieval(store, ai, query, filters, context)
             evidence = [row for row in evidence if not pcf_word(row)]
         else:
-            evidence, mode = evidence_for(store, ai, query, filters, context,
-                                          semantic=(route in {"/api/answer", "/api/external/preview"}),
-                                          limit=MAX_INTERNAL_EXCERPTS if budget else 9,
-                                          expand=bool(budget) or route == "/api/answer",
-                                          thread_hops=3 if route == "/api/answer" else 1)
+            local_answer = route == "/api/answer"
+            search_text, filters = question_scope(query, filters)
+            evidence, mode = evidence_for(store, ai, search_text, filters, context,
+                                          semantic=local_answer or route == "/api/external/preview",
+                                          limit=MAX_INTERNAL_EXCERPTS if budget else 12 if local_answer else 9,
+                                          expand=bool(budget) or local_answer,
+                                          thread_hops=3 if local_answer else 1,
+                                          max_evidence=ANSWER_EVIDENCE_LIMIT if local_answer else None)
         if route in {"/api/external/preview", "/api/pcf/preview"}:
             token, review = self.server.reviews.create(query, evidence, external.review_generation, pcf=pcf, internal_budget=budget)
             by_passage = {row["passage"]: public_row(row) for row in evidence}
@@ -742,7 +749,8 @@ class Handler(BaseHTTPRequestHandler):
         elif evidence:
             try:
                 full_question = f"{query} {context}"
-                direct = delivery_date_answer(query, evidence, context)
+                synthesis = SYNTHESIS_QUESTION.search(query)
+                direct = None if synthesis else delivery_date_answer(query, evidence, context)
                 with store.measure("generation"):
                     proposed = ai.answer(query, evidence, context) if direct is None else None
                 # Recheck visibility after inference, including source removal during generation.
@@ -752,7 +760,8 @@ class Handler(BaseHTTPRequestHandler):
                 result = delivery_date_answer(query, evidence, context) if direct is not None else None
                 if result is None:
                     with store.measure("validation"):
-                        result = validate(proposed, evidence, full_question)
+                        result = validate(proposed, evidence, full_question, claim_limit=ANSWER_CLAIM_LIMIT,
+                                          text_limit=ANSWER_TEXT_LIMIT)
             except (OSError, ValueError, RuntimeError, KeyError, TypeError, http.client.HTTPException):
                 result["status"] = "model_unavailable"
             finally:
@@ -1250,12 +1259,17 @@ def main(argv=None):
     parser.add_argument("--model", default="")
     parser.add_argument("--embedding-model", default="")
     parser.add_argument("--ollama-port", type=int, default=11435)
+    parser.add_argument("--answer-num-ctx", type=int,
+                        default=os.environ.get("MAILSEARCH_ANSWER_NUM_CTX", str(DEFAULT_ANSWER_NUM_CTX)),
+                        help="Local answer context tokens, capped by the installed model (2048–32768)")
     parser.add_argument("--no-browser", action="store_true")
     parser.add_argument("--vector-index", choices=("sqlite", "usearch"),
                         default=os.environ.get("MAILSEARCH_VECTOR_INDEX", "sqlite"))
     args = parser.parse_args(argv)
     if not 0 < args.ollama_port < 65536 or not 0 <= args.port < 65536 or args.port == args.ollama_port:
         parser.error("Invalid port configuration")
+    if not 2048 <= args.answer_num_ctx <= 32768:
+        parser.error("--answer-num-ctx must be between 2048 and 32768")
     try:
         external = ExternalAI.from_environment()
     except ValueError:
@@ -1281,7 +1295,8 @@ def main(argv=None):
     try:
         root = local_path(args.data)
         root.mkdir(mode=0o700, parents=True, exist_ok=True)
-        ai = LocalAI(args.model, args.embedding_model, args.ollama_port, embedding_api=embedding_api)
+        ai = LocalAI(args.model, args.embedding_model, args.ollama_port, embedding_api=embedding_api,
+                     answer_num_ctx=args.answer_num_ctx)
         stage = "세션 잠금 파일 열기"
         with SessionLock(root), gateway_diagnostics(root), file_diagnostics(root / "app-runtime.log", runtime_logger):
             runtime_logger.setLevel(logging.INFO)
@@ -1293,8 +1308,11 @@ def main(argv=None):
                     try:
                         from .vector_index import USearchIndex
                         store.vector_index = USearchIndex(store)
-                    except (ImportError, OSError) as exc:
+                    except (ImportError, OSError, RuntimeError, ValueError) as exc:
                         runtime_logger.warning("USearch unavailable; using SQLite (%s)", type(exc).__name__)
+                backend = store.vector_backend
+                runtime_logger.info("Vector search backend=%s numpy=%s", backend,
+                                    "disabled" if backend == "sqlite(pure-python)" else "enabled")
                 indexer = Indexer(store, args.readpst, args.pdftotext, ai)
                 preset = Path(__file__).resolve().parent.parent / "gateway-defaults.json"
                 stage = f"로컬 포트 {args.port} 열기"
