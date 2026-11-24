@@ -23,7 +23,8 @@ from urllib.parse import urlsplit
 from .answer import (PCF_INSTRUCTIONS, LocalAI, map_citations, pcf_candidates, pcf_retrieval, pcf_word, delivery_date_answer,
                      evidence_for, merge_rows, public_row, validate)
 from .api_settings import ApiSettings, write_api_settings
-from .embedding import CA_FILE_ENV, GatewayTLSOptions, MODEL as BGE_MODEL, gateway_origin, logger as gateway_logger
+from .embedding import (CA_FILE_ENV, GatewayTLSOptions, MODEL as BGE_MODEL, PATH as EMBEDDING_PATH,
+                        gateway_origin, logger as gateway_logger)
 from .external import DEFAULT_MODEL, DEFAULT_URL, MAX_EXCERPTS, MAX_INTERNAL_EXCERPTS, MAX_PCF_CELLS, ExternalAI, ExternalRequestError, Reviews, pcf_batches, pcf_input_fits
 from .extract import MAX_ATTACHMENT
 from .filesystem import local_path, source_path
@@ -83,6 +84,7 @@ class App(ThreadingHTTPServer):
         self.gateway_preset_lock = threading.Lock()
         self.gateway_fields = gateway_defaults(gateway_preset)
         self.gateway_test_origin = self.gateway_fields["gateway_url"] if self.gateway_fields.pop("test_unverified") else ""
+        self.gateway_unverified_origin = ""
         self.api_settings = api_settings
         self.api_profiles = api_settings.load() if api_settings else {}
         for profile in ("gateway", "external"):
@@ -130,13 +132,15 @@ class App(ThreadingHTTPServer):
         if isinstance(gateway, dict):
             try:
                 fields = gateway_fields(gateway, self.gateway_fields)
+                origin = fields["gateway_url"]
+                unverified = bool(origin and gateway.get("unverified_origin") == origin)
                 selections = gateway["selections"]
                 validate_selections(selections, fields["answer_models"])
                 current = self.ai.embedding_api
                 try:
                     client = IntranetAI.from_settings(
-                        gateway.get("key", ""), selections, current, origin=fields["gateway_url"],
-                        answer_models=fields["answer_models"], tls=GatewayTLSOptions(fields["ca_file"]),
+                        gateway.get("key", ""), selections, current, origin=origin,
+                        answer_models=fields["answer_models"], tls=gateway_tls(fields["ca_file"], unverified),
                     )
                 except ValueError:
                     client = None
@@ -145,6 +149,7 @@ class App(ThreadingHTTPServer):
                 self.ai.configure_embedding(local, client)
                 self.embedding_selection = selections["embedding"]
                 self.gateway_fields = fields
+                self.gateway_unverified_origin = origin if unverified else ""
                 gateway_answer = client.answer_client if client else None
             except (ValueError, TypeError, KeyError):
                 self.api_profiles.pop("gateway", None)
@@ -171,6 +176,12 @@ def gateway_fields(payload, defaults):
         raise ValueError("gateway_models")
     fields["answer_models"] = ",".join(models)
     return fields
+
+
+def gateway_tls(ca_file, runtime_unverified, test_unverified=False):
+    if runtime_unverified:
+        return GatewayTLSOptions(ca_file, unverified_paths=(CHAT_PATH, EMBEDDING_PATH))
+    return GatewayTLSOptions(verify=False) if test_unverified else GatewayTLSOptions(ca_file)
 
 
 def gateway_environment():
@@ -754,6 +765,7 @@ class Handler(BaseHTTPRequestHandler):
             **fields, "destination": origin + CHAT_PATH if origin else "", "models": models,
             "configured": configured, "persistent_keys": self.server.persistent_keys,
             "test_unverified": bool(origin and origin == self.server.gateway_test_origin),
+            "runtime_unverified": bool(origin and origin == self.server.gateway_unverified_origin),
             "selections": selections,
             "active_answer": configured and current.answer_client is not None and self.server.external is current.answer_client,
         }
@@ -802,6 +814,7 @@ class Handler(BaseHTTPRequestHandler):
             candidate = None
             local_model = server.ai.embedding_model
             fields = server.gateway_fields
+            unverified_origin = ""
             selections = {"answer": "", "rerank": "", "embedding": LOCAL_EMBEDDING if local_model == BGE_MODEL else ""}
             if action != "disconnect":
                 key = payload.get("key", "")
@@ -813,7 +826,11 @@ class Handler(BaseHTTPRequestHandler):
                     skip_verify = payload.get("test_unverified", False)
                     if type(skip_verify) is not bool or (skip_verify and action != "test"):
                         raise ValueError("gateway_settings")
-                    tls = GatewayTLSOptions("", verify=False) if skip_verify else GatewayTLSOptions(fields["ca_file"])
+                    runtime_unverified = payload.get("runtime_unverified", False)
+                    if type(runtime_unverified) is not bool or (runtime_unverified and not fields["gateway_url"]):
+                        raise ValueError("gateway_settings")
+                    unverified_origin = fields["gateway_url"] if runtime_unverified else ""
+                    tls = gateway_tls(fields["ca_file"], runtime_unverified, skip_verify)
                     candidate = IntranetAI.from_settings(
                         key.strip(), selections, current, origin=fields["gateway_url"],
                         answer_models=fields["answer_models"], tls=tls,
@@ -848,12 +865,13 @@ class Handler(BaseHTTPRequestHandler):
                 elif current and answer is current.answer_client:
                     answer = server.generic_answer
                 try:
-                    server.remember_api("gateway", {**fields, "selections": selections,
+                    server.remember_api("gateway", {**fields, "selections": selections, "unverified_origin": unverified_origin,
                                                    "key": candidate._key if candidate else ""}, answer)
                 except (OSError, ValueError):
                     self.send_json(500, {"error": "api_settings_save_failed"})
                     return
                 server.gateway_fields = fields
+                server.gateway_unverified_origin = unverified_origin
                 server.ai.configure_embedding(local_model, candidate)
                 server.embedding_selection = LOCAL_EMBEDDING if local_model == BGE_MODEL else ""
                 server.external = answer
