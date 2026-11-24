@@ -40,6 +40,7 @@ const issueNames = {
   changed: "파일이 변경되었습니다. 갱신해 주세요.",
   interrupted: "중단된 색인입니다.",
   embedding_unavailable: "의미 색인을 완료하지 못했습니다. 키워드 검색은 사용 가능하며, 연결을 확인한 뒤 보관함을 갱신할 수 있습니다.",
+  embedding_connection_aborted: "임베딩 연결이 중단됐습니다. 키워드 검색은 가능합니다. 연결을 확인한 뒤 보관함을 갱신하세요.",
   pcf_input_too_large: "선택한 COMMENT이 현재 입력 한도를 초과합니다.",
   gateway_indexing: "색인 중에는 모델 설정을 유지합니다. 색인이 끝나거나 일시정지한 뒤 적용하세요.",
   gateway_models: "용도별 모델 선택을 확인하세요.",
@@ -198,6 +199,20 @@ async function showSources() {
     const heading = node("h3", name, "source-name");
     heading.title = source.path;
     entry.append(heading, node("p", (stateNames[source.state] || source.state) + " · " + kindCountLine(source), "source-state"));
+    if (source.embedding_total > 0) {
+      const done = source.embedding_done;
+      const total = source.embedding_total;
+      const percent = Math.floor((done / total) * 100);
+      const count = done.toLocaleString("ko-KR") + " / " + total.toLocaleString("ko-KR");
+      entry.append(node("p", "임베딩 " + count + " 구간 · " + percent + "%", "embedding-count"));
+      if (source.state === "embeddings" || done < total) {
+        const progress = node("progress", "", "embedding-progress");
+        progress.max = total;
+        progress.value = done;
+        progress.setAttribute("aria-label", name + " 임베딩 진행률");
+        entry.append(progress);
+      }
+    }
     if (source.failed || source.omitted || source.partial) {
       entry.append(node("p", "실패 " + source.failed + " · 누락 " + source.omitted + " · 일부 색인 " + source.partial));
       for (const problem of source.problems || []) {
