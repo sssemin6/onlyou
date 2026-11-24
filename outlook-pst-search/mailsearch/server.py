@@ -28,7 +28,7 @@ from .embedding import (CA_FILE_ENV, GatewayTLSOptions, MODEL as BGE_MODEL, PATH
 from .external import DEFAULT_MODEL, DEFAULT_URL, MAX_EXCERPTS, MAX_INTERNAL_EXCERPTS, MAX_PCF_CELLS, ExternalAI, ExternalRequestError, Reviews, pcf_batches, pcf_input_fits
 from .extract import MAX_ATTACHMENT
 from .filesystem import local_path, source_path
-from .indexer import ImportIssue, Indexer
+from .indexer import ImportIssue, Indexer, runtime_logger
 from .intranet import CHAT_PATH, LOCAL_EMBEDDING, IntranetAI, available_models, validate_selections
 from .ollama_setup import OllamaSetup
 from .pcf import PCF_CELL
@@ -42,6 +42,7 @@ FILES = {
     "/fonts/onlyou-display.ttf": ("fonts/onlyou-display.ttf", "font/ttf"),
 }
 MAX_REQUEST = 16 * 1024
+PAGE_IDLE_SECONDS = 12
 
 
 class SessionLock:
@@ -99,6 +100,19 @@ class App(ThreadingHTTPServer):
         self.last_seen = 0.0
 
         self.restore_api_settings()
+
+    def watch_page(self, stopped):
+        last_busy = 0.0
+        while not stopped.wait(3):
+            now = time.monotonic()
+            if self.indexer.has_work() or self.ollama_setup.snapshot()["phase"] != "idle":
+                last_busy = now
+                continue
+            seen = self.last_seen
+            if seen and now - max(seen, last_busy) > PAGE_IDLE_SECONDS:
+                runtime_logger.info("App shutdown requested (no browser heartbeat, indexing idle)")
+                self.shutdown()
+                return
 
     @property
     def persistent_keys(self):
@@ -360,7 +374,7 @@ class Handler(BaseHTTPRequestHandler):
                 "external": external.public if external else None,
             })
         elif route.path == "/api/ping":
-            self.server.last_seen = time.time()
+            self.server.last_seen = time.monotonic()
             self.send_json(200, {"ok": True})
         elif route.path == "/api/intranet/settings":
             self.send_json(200, self.intranet_settings())
@@ -979,20 +993,24 @@ def combine_pcf_findings(external, review, rows, claims, budget):
 
 
 @contextmanager
-def gateway_diagnostics(root):
+def file_diagnostics(path, logger):
     try:
-        handler = RotatingFileHandler(root / "api-connection.log", maxBytes=256 * 1024, backupCount=1, encoding="utf-8")
+        handler = RotatingFileHandler(path, maxBytes=256 * 1024, backupCount=1, encoding="utf-8")
     except OSError as exc:
-        print(f"Cannot open gateway diagnostic log ({exc.strerror or type(exc).__name__}).", file=sys.stderr)
+        print(f"Cannot open {path.name} ({type(exc).__name__}).", file=sys.stderr)
         yield
         return
     handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
-    gateway_logger.addHandler(handler)
+    logger.addHandler(handler)
     try:
         yield
     finally:
-        gateway_logger.removeHandler(handler)
+        logger.removeHandler(handler)
         handler.close()
+
+
+def gateway_diagnostics(root):
+    return file_diagnostics(root / "api-connection.log", gateway_logger)
 
 
 def main(argv=None):
@@ -1033,33 +1051,37 @@ def main(argv=None):
         root = local_path(args.data)
         root.mkdir(mode=0o700, parents=True, exist_ok=True)
         ai = LocalAI(args.model, args.embedding_model, args.ollama_port, embedding_api=embedding_api)
-        with SessionLock(root), gateway_diagnostics(root):
-            store = Store(root)
-            indexer = Indexer(store, args.readpst, args.pdftotext, ai)
-            preset = Path(__file__).resolve().parent.parent / "gateway-defaults.json"
-            with App(args.port, store, indexer, ai, external, api_settings=ApiSettings(root), gateway_preset=preset) as app:
-                indexer.wake()
-                print(app.origin, flush=True)
-                if not args.no_browser:
-                    webbrowser.open(app.origin)
-                    # Closing every app page stops the server (and its Ollama).
-                    def watch_page():
-                        while True:
-                            time.sleep(3)
-                            seen = app.last_seen
-                            if seen and time.time() - seen > 12 and app.ollama_setup.snapshot()["phase"] == "idle":
-                                app.shutdown()
-                                return
-                    threading.Thread(target=watch_page, daemon=True).start()
-                try:
-                    app.serve_forever()
-                except KeyboardInterrupt:
-                    pass
-                finally:
-                    indexer.stop()
-                    ai.shutdown()
+        with SessionLock(root), gateway_diagnostics(root), file_diagnostics(root / "app-runtime.log", runtime_logger):
+            runtime_logger.setLevel(logging.INFO)
+            runtime_logger.info("App starting (pid=%d)", os.getpid())
+            try:
+                store = Store(root)
+                indexer = Indexer(store, args.readpst, args.pdftotext, ai)
+                preset = Path(__file__).resolve().parent.parent / "gateway-defaults.json"
+                with App(args.port, store, indexer, ai, external, api_settings=ApiSettings(root), gateway_preset=preset) as app:
+                    stopped = threading.Event()
+                    try:
+                        indexer.wake()
+                        print(app.origin, flush=True)
+                        if not args.no_browser:
+                            webbrowser.open(app.origin)
+                            threading.Thread(target=app.watch_page, args=(stopped,), daemon=True).start()
+                        app.serve_forever()
+                    except KeyboardInterrupt:
+                        runtime_logger.info("App shutdown requested (Ctrl+C)")
+                    finally:
+                        stopped.set()
+                        indexer.stop()
+                        ai.shutdown()
+            except Exception as exc:
+                runtime_logger.error("App stopped with an error (type=%s, errno=%s, winerror=%s, sqlite=%s)",
+                                     type(exc).__name__, getattr(exc, "errno", None), getattr(exc, "winerror", None),
+                                     getattr(exc, "sqlite_errorname", None))
+                raise
+            else:
+                runtime_logger.info("App stopped normally")
     except (OSError, sqlite3.Error, ValueError, RuntimeError) as exc:
-        print(f"Startup failed ({type(exc).__name__}). Check the data folder, port, and SQLite 3.42+ with FTS5.", file=sys.stderr)
+        print(f"App failed ({type(exc).__name__}). Check app-runtime.log and the data folder, port, and SQLite 3.42+ with FTS5.", file=sys.stderr)
         return 1
     return 0
 
