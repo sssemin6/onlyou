@@ -324,7 +324,8 @@ class Handler(BaseHTTPRequestHandler):
     def handle(self):
         try:
             super().handle()
-        except (BrokenPipeError, ConnectionResetError, TimeoutError):
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, TimeoutError):
+            # The browser can close a local connection while a request is in flight.
             pass
 
     def do_GET(self):
