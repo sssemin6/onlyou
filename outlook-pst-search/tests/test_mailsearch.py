@@ -21,7 +21,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path, PureWindowsPath
 
 from mailsearch.api_settings import ApiSettings, user_dpapi
-from mailsearch.answer import LocalAI, delivery_date_answer, evidence_for, validate
+from mailsearch.answer import AnswerSessions, LocalAI, answer_groups, answer_plan, delivery_date_answer, evidence_for, validate
 from mailsearch.embedding import EmbeddingAPI, GatewayRequestError, tls_context, warn_unverified
 from mailsearch.external import ExternalAI, Excerpt, Reviews, pcf_batches
 from mailsearch.extract import convert_legacy, extract_attachment, extract_bytes
@@ -1461,7 +1461,8 @@ class Integration(unittest.TestCase):
                 return {"model_info": {"general.architecture": "test", "test.context_length": 12288}}
             if path != "/api/generate":
                 return actual_call(path, payload, timeout)
-            self.assertEqual(payload["options"]["num_ctx"], 12288)
+            self.assertEqual(payload["options"]["num_ctx"], 8192)
+            self.assertEqual(self.ai.model_context_limit, 12288)
             self.assertEqual(payload["format"]["properties"]["claims"]["maxItems"], 8)
             snippets = json.loads(payload["prompt"])["evidence"]
             claims = [{"text": quote, "citations": [{"source": row["source"], "quote": quote}]}
@@ -1474,6 +1475,136 @@ class Integration(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(answer["status"], "answered")
         self.assertEqual([claim["text"] for claim in answer["claims"]], quotes)
+
+    def test_compound_answer_retrieves_several_queries_and_uses_only_validated_map_notes(self):
+        folder = Path(self.workspace.name) / "query-plan"
+        folder.mkdir()
+        for number, code in ((50, "A-17"), (70, "B-22")):
+            for day in range(1, 6):
+                msg = EmailMessage()
+                msg["Subject"] = f"{code} 단가"
+                msg["Date"] = f"{day} Jan 2026 12:00:00 +0000"
+                msg["Message-ID"] = f"<{code}-{day}@example.invalid>"
+                if day > 1:
+                    msg["In-Reply-To"] = f"<{code}-{day - 1}@example.invalid>"
+                msg.set_content(f"{code} 단가는 {number}만원입니다.")
+                (folder / f"{code}-{day}.eml").write_bytes(msg.as_bytes())
+        source = self.indexer.register(folder)
+        self.assertEqual(await_source(self.store, source, {"ready", "error"})["state"], "ready")
+        self.ai.configure_embedding("", None)
+        requests = []
+        original = self.ai.call
+
+        def respond(path, payload=None, timeout=None):
+            if path != "/api/generate":
+                return original(path, payload, timeout)
+            incoming = json.loads(payload["prompt"])
+            rows = incoming["evidence"]
+            requests.append(incoming)
+            if "verified_notes" not in incoming:
+                row = rows[0]
+                quote = row["text"].splitlines()[-1]
+                claims = [{"text": quote, "citations": [{"source": row["source"], "quote": quote}]},
+                          {"text": "단가는 999만원입니다.", "citations": [{"source": row["source"], "quote": quote}]}]
+            else:
+                self.assertEqual(len(incoming["verified_notes"]), 2)
+                self.assertTrue(all("999" not in note["text"] for note in incoming["verified_notes"]))
+                claims = []
+                for note in incoming["verified_notes"]:
+                    row = next(row for row in rows if row["source"] in note["sources"])
+                    claims.append({"text": note["text"], "citations": [
+                        {"source": row["source"], "quote": row["text"].splitlines()[-1]},
+                    ]})
+            return {"response": json.dumps({"status": "answered", "claims": claims})}
+
+        with (patch.object(self.ai, "call", side_effect=respond),
+              patch("mailsearch.server.evidence_for", wraps=evidence_for) as retrieve):
+            status, result = self.call("/api/answer", {"query": "A-17와 B-22 단가를 비교해줘", "filters": {"source": source}})
+        self.assertEqual(status, 200)
+        self.assertEqual(retrieve.call_count, 2)
+        self.assertTrue(all(call.kwargs["expand"] and call.kwargs["thread_hops"] == 3 for call in retrieve.call_args_list))
+        self.assertEqual(len(requests), 3)
+        self.assertEqual({claim["text"] for claim in result["claims"]},
+                         {"A-17 단가는 50만원입니다.", "B-22 단가는 70만원입니다."})
+
+    def test_live_answer_stream_matches_json_and_protects_the_endpoint(self):
+        source = self.import_mail()
+        payload = {"query": "한빛 A-17", "filters": {"source": source}}
+        self.assertEqual(self.call("/api/answer/stream", payload, token=False)[0], 403)
+        self.assertEqual(self.call("/api/answer/stream", {**payload, "query": ""})[0], 400)
+        expected = self.call("/api/answer", payload)[1]
+        connection = http.client.HTTPConnection("127.0.0.1", self.app.server_port, timeout=8)
+        try:
+            connection.request("POST", "/api/answer/stream", json.dumps(payload),
+                               {"X-Mail-Session": self.app.token, "Content-Type": "application/json"})
+            response = connection.getresponse()
+            self.assertEqual(response.status, 200)
+            self.assertTrue(response.getheader("Content-Type").startswith("text/event-stream"))
+            events = [json.loads(line[6:]) for line in response.read().decode().splitlines() if line.startswith("data: ")]
+        finally:
+            connection.close()
+        self.assertEqual([event["stage"] for event in events],
+                         ["planning", "retrieving", "synthesizing", "validating", "done"])
+        self.assertGreater(events[1]["count"], 0)
+        self.assertEqual(events[1]["queries"], 1)
+        self.assertEqual({key: events[-1][key] for key in expected}, expected)
+        self.assertTrue(events[-1]["session_id"])
+
+    def test_closed_answer_stream_stops_before_validation_and_releases_generation_slot(self):
+        source = self.import_mail()
+        started, release = threading.Event(), threading.Event()
+
+        def generation(_question, evidence, _context, **_options):
+            started.set()
+            release.wait(4)
+            return {"status": "insufficient", "claims": []}
+
+        connection = http.client.HTTPConnection("127.0.0.1", self.app.server_port, timeout=8)
+        response = None
+        with (patch.object(self.ai, "answer", side_effect=generation),
+              patch("mailsearch.server.validate", wraps=validate) as checked):
+            try:
+                connection.request("POST", "/api/answer/stream",
+                                   json.dumps({"query": "한빛 A-17", "filters": {"source": source}}),
+                                   {"X-Mail-Session": self.app.token, "Content-Type": "application/json"})
+                response = connection.getresponse()
+                self.assertEqual(response.status, 200)
+                self.assertTrue(started.wait(3))
+                response.close()
+                connection.close()
+            finally:
+                release.set()
+                if response is not None:
+                    response.close()
+                connection.close()
+            deadline = time.monotonic() + 3
+            while not self.app.generation.acquire(blocking=False):
+                if time.monotonic() >= deadline:
+                    self.fail("Cancelled generation did not release its slot")
+                time.sleep(.01)
+            self.app.generation.release()
+        checked.assert_not_called()
+        self.assertTrue(all(not turns for _, turns in self.app.answer_sessions.items.values()))
+
+    def test_follow_up_prioritizes_live_scoped_citations_and_reset_clears_context(self):
+        source = self.import_mail()
+        base = {"filters": {"source": source}, "session_id": ""}
+        first = self.call("/api/answer", {**base, "query": "한빛 A-17"})[1]
+        cited = first["claims"][0]["citations"][0]["passage"]
+        key = first["session_id"]
+        follow = {**base, "session_id": key, "query": "그중 단가만 다시 비교해줘"}
+        with patch.object(self.ai, "answer", wraps=self.ai.answer) as ask:
+            result = self.call("/api/answer", follow)[1]
+            self.assertEqual(result["session_id"], key)
+            self.assertEqual(ask.call_args.args[1][0]["passage"], cited)
+            self.assertIn("한빛 A-17", ask.call_args.args[2])
+            ask.reset_mock()
+            restricted = self.call("/api/answer", {**follow, "filters": {"source": 999999}})[1]
+            self.assertEqual(restricted["results"], [])
+            ask.assert_not_called()
+        self.assertEqual(self.call("/api/answer/reset", {"session_id": key})[0], 200)
+        fresh = self.call("/api/answer", follow)[1]
+        self.assertNotEqual(fresh["session_id"], key)
 
     def test_validation_preserves_original_whitespace_and_checks_each_synthesis_clause(self):
         source = self.import_mail()
@@ -2501,6 +2632,43 @@ class ExternalTransport(unittest.TestCase):
 
 
 class AttachmentsAndCitations(unittest.TestCase):
+    def test_groups_follow_explicit_replies_even_when_subject_changes(self):
+        store = MagicMock()
+        store.reply_links.return_value = [(1, 10, "<one>", None), (2, 10, "<two>", "<one>"), (3, 10, "<three>", None)]
+        evidence = [{"id": index, "passage": index, "kind": "mail", "source": 10, "subject": subject,
+                     "sent": f"2026-01-0{index}"} for index, subject in ((3, "Zeta"), (2, "Changed"), (1, "Atlas"))]
+        groups = answer_groups(store, evidence)
+        self.assertEqual([[row["id"] for row in group] for group in groups], [[1, 2], [3]])
+
+    def test_simple_questions_keep_one_query_and_timelines_use_three(self):
+        self.assertEqual(answer_plan("A-17 승인일은 언제였어?"), ["A-17 승인일은 언제였어?"])
+        self.assertEqual(len(answer_plan("Atlas 변경 타임라인")), 3)
+        self.assertEqual(len(answer_plan("한빛과 대성의 단가 비교")), 2)
+
+    def test_sessions_expire_and_keep_only_three_turns(self):
+        sessions = AnswerSessions()
+        with patch("mailsearch.answer.time.monotonic", return_value=100):
+            key, handle, _ = sessions.begin("")
+            result = {"status": "answered", "claims": [{"text": "결과", "citations": [{"passage": 123}]}]}
+            for question in ("첫 질문", "둘째 질문", "셋째 질문", "넷째 질문"):
+                sessions.record(key, handle, question, result)
+            _, _, turns = sessions.begin(key)
+            self.assertEqual([turn[0] for turn in turns], ["둘째 질문", "셋째 질문", "넷째 질문"])
+        with patch("mailsearch.answer.time.monotonic", return_value=1901):
+            new, _, turns = sessions.begin(key)
+        self.assertNotEqual(new, key)
+        self.assertFalse(turns)
+
+    def test_context_grows_for_large_evidence_without_exceeding_model_limit(self):
+        ai = LocalAI("test")
+        ai.model_context_limit = 12288
+        rows = [{"id": index, "passage": index, "sent": "", "sender": "", "subject": "Atlas",
+                 "text": "배관 연결부를 점검했습니다. " * 46} for index in range(1, 19)]
+        with (patch.object(ai, "ensure_server"), patch.object(ai, "ensure_model"),
+              patch.object(ai, "call", return_value={"response": '{"status":"answered","claims":[]}'}) as generate):
+            self.assertEqual(ai.answer("Atlas 종합", rows, "")["status"], "partial")
+        self.assertEqual(generate.call_args.args[1]["options"]["num_ctx"], 12288)
+
     def test_natural_scope_only_infers_clear_calendar_windows(self):
         today = date(2026, 1, 1)
         windows = {"최근": (date(2025, 12, 3), date(2026, 1, 2)),
