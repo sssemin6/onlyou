@@ -39,7 +39,10 @@ const issueNames = {
   mail_parse_failed: "가져온 메일을 읽을 수 없습니다. 아래 실패 건수를 확인하고 다시 색인해 보세요.",
   readpst_dependencies: "readpst가 시작되지 않았습니다. MSYS2에서 함께 설치된 DLL이 있는지 확인하세요.",
   disk_or_source: "파일 접근 권한과 저장 공간을 확인하세요.",
-  changed: "파일이 변경되었습니다. 갱신해 주세요.",
+  changed: "색인 중 원본 파일이나 폴더가 변경되었습니다. 경로 확인 후 다시 색인하세요.",
+  pst_changed: "색인 중 PST가 변경되었습니다. 이 파일은 다음 갱신에서 다시 읽습니다.",
+  mail_original_changed: "색인 중 메일 원본이 변경되어 첨부 본문을 건너뛰었습니다.",
+  app_disconnected: "검색 앱과 연결이 끊겼습니다. 앱이 실행 중인지 확인한 뒤 다시 시도하세요.",
   interrupted: "중단된 색인입니다. 재개를 누르면 저장된 작업부터 이어서 진행합니다.",
   index_unexpected: "색인 중 오류가 발생했습니다. 데이터 폴더의 app-runtime.log에서 오류 유형을 확인할 수 있습니다.",
   embedding_unavailable: "의미 색인을 완료하지 못했습니다. 키워드 검색은 사용 가능하며, 연결을 확인한 뒤 보관함을 갱신할 수 있습니다.",
@@ -143,7 +146,10 @@ async function call(route, data, signal) {
     headers["Content-Type"] = "application/json";
     options.body = JSON.stringify(data);
   }
-  const response = await fetch(route, options);
+  const response = await fetch(route, options).catch((error) => {
+    if (error instanceof TypeError) throw new Error(issueNames.app_disconnected);
+    throw error;
+  });
   const body = await response.json();
   if (!response.ok) throw new Error(issueNames[body.error] || "이 PC의 검색 앱과 연결하지 못했습니다.");
   return body;
@@ -235,7 +241,7 @@ async function showSources() {
     if (source.embedding_total > 0) {
       const done = source.embedding_done;
       const total = source.embedding_total;
-      const percent = Math.floor((done / total) * 100);
+      const percent = ((done / total) * 100).toLocaleString("ko-KR", { maximumFractionDigits: 2 });
       const count = done.toLocaleString("ko-KR") + " / " + total.toLocaleString("ko-KR");
       entry.append(node("p", "임베딩 " + count + " 구간 · " + percent + "%", "embedding-count"));
       if (source.state === "embeddings" || done < total) {
