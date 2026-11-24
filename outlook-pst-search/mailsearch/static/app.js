@@ -22,7 +22,7 @@ const TAB_FILTERS = {
 const ALL_FILTERS = ["source", ...new Set(Object.values(TAB_FILTERS).flat())];
 const dateFormat = new Intl.DateTimeFormat("ko-KR", { dateStyle: "medium", timeStyle: "short" });
 const stateNames = {
-  queued: "대기", extracting: "PST 읽는 중", headers: "자료 색인 중", attachments: "첨부 색인 중",
+  queued: "대기", extracting: "가져올 자료 확인 중", headers: "자료 색인 중", attachments: "첨부 색인 중",
   embeddings: "의미 검색 준비 중", ready: "검색 가능", paused: "일시정지", error: "오류", empty: "가져온 자료 없음",
   removing: "삭제 중", remove_failed: "삭제 재시도 필요",
 };
@@ -177,9 +177,23 @@ function kindCountLine(source) {
   return parts.length ? parts.join(" · ") : "항목 " + source.done.toLocaleString("ko-KR") + "건";
 }
 
+function elapsedTime(seconds) {
+  const hours = Math.floor(seconds / 3600);
+  const minutes = Math.floor(seconds / 60) % 60;
+  return [hours && hours + "시간", minutes && minutes + "분", seconds % 60 + "초"].filter(Boolean).join(" ");
+}
+
 async function showSources() {
   const version = ++sourceRequest;
-  const data = await call("/api/sources");
+  const data = await call("/api/sources", undefined, AbortSignal.timeout(10000)).catch((error) => {
+    if (version === sourceRequest && !element("source-connection")) {
+      const status = node("p", "작업 상태 연결이 지연되고 있습니다. 다시 확인하는 중입니다.", "source-empty");
+      status.id = "source-connection";
+      sourcesList.prepend(status);
+      sourceSnapshot = null;
+    }
+    throw error;
+  });
   if (version !== sourceRequest) return;
   const next = JSON.stringify(data);
   if (next === sourceSnapshot) return;
@@ -198,7 +212,23 @@ async function showSources() {
     entry.dataset.state = source.state;
     const heading = node("h3", name, "source-name");
     heading.title = source.path;
-    entry.append(heading, node("p", (stateNames[source.state] || source.state) + " · " + kindCountLine(source), "source-state"));
+    const pstRead = source.pst_read;
+    const stateLabel = pstRead ? "PST 읽는 중" : (stateNames[source.state] || source.state);
+    const countLine = source.state === "extracting" ? "" : " · " + kindCountLine(source);
+    entry.append(heading, node("p", stateLabel + countLine, "source-state"));
+    if (source.state === "extracting") {
+      if (pstRead) {
+        const position = source.kind === "eml_dir" ? "PST " + pstRead.position + " / " + pstRead.total + " · " : "";
+        entry.append(node("p", position + pstRead.item));
+        entry.append(node("p", "경과 " + elapsedTime(pstRead.elapsed) + " · 추출 파일 " + pstRead.files.toLocaleString("ko-KR") + "개"));
+        if (pstRead.idle >= 60) {
+          entry.append(node("p", "최근 " + elapsedTime(pstRead.idle) + " 동안 새 추출 파일이 확인되지 않았습니다."));
+        }
+      }
+      const progress = node("progress", "", "source-progress");
+      progress.setAttribute("aria-label", name + " " + stateLabel);
+      entry.append(progress);
+    }
     if (source.embedding_total > 0) {
       const done = source.embedding_done;
       const total = source.embedding_total;
@@ -206,7 +236,7 @@ async function showSources() {
       const count = done.toLocaleString("ko-KR") + " / " + total.toLocaleString("ko-KR");
       entry.append(node("p", "임베딩 " + count + " 구간 · " + percent + "%", "embedding-count"));
       if (source.state === "embeddings" || done < total) {
-        const progress = node("progress", "", "embedding-progress");
+        const progress = node("progress", "", "source-progress");
         progress.max = total;
         progress.value = done;
         progress.setAttribute("aria-label", name + " 임베딩 진행률");
@@ -1031,7 +1061,7 @@ addForm.addEventListener("submit", async (event) => {
 });
 
 async function pollSources() {
-  try { await showSources(); } catch (error) { if (!sourceSnapshot) notice(error.message); }
+  try { await showSources(); } catch { /* The next poll retries the connection. */ }
   setTimeout(pollSources, 3000);
 }
 pollSources();
