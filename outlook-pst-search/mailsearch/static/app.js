@@ -736,6 +736,7 @@ async function applyGatewayDefaults() {
     settingsDrafts.intranet = {
       ...fields, ...preset, key: sameAddress ? fields.key : "",
       ca_file: preset.ca_file || (sameAddress ? fields.ca_file : ""),
+      runtime_unverified: sameAddress && fields.runtime_unverified,
     };
     renderSettings();
     settingsMessage("기본값을 불러왔습니다. 연결에 반영하려면 아래 적용 버튼을 누르세요.");
@@ -757,13 +758,20 @@ function readSettingsFields(gateway) {
     key, gateway_url: element("gateway-url").value,
     answer_models: element("gateway-answer-models").value, ca_file: element("gateway-ca-file").value,
     test_unverified: element("gateway-test-unverified").checked,
+    runtime_unverified: element("gateway-runtime-unverified").checked,
     selections: Object.fromEntries(Object.keys(gatewayRoles).map(role => [role, element("gateway-" + role).value])),
   };
 }
 
 settingsForm.addEventListener("input", (event) => {
   if (event.target !== settingsProvider) {
-    if (event.target.id === "gateway-url") element("gateway-test-unverified").checked = false;
+    if (event.target.id === "gateway-url") {
+      element("gateway-test-unverified").checked = false;
+      element("gateway-runtime-unverified").checked = false;
+    }
+    if (event.target.id === "gateway-runtime-unverified" && event.target.checked) {
+      element("gateway-test-unverified").checked = false;
+    }
     const provider = settingsProvider.value;
     settingsDrafts[provider] = readSettingsFields(provider === "intranet");
   }
@@ -791,11 +799,15 @@ function renderSettings() {
     element("gateway-url").value = fields.gateway_url;
     element("gateway-answer-models").value = fields.answer_models;
     element("gateway-ca-file").value = fields.ca_file;
-    element("gateway-test-unverified").checked = fields.test_unverified ?? false;
+    element("gateway-test-unverified").checked = Boolean(fields.test_unverified && !fields.runtime_unverified);
+    element("gateway-runtime-unverified").checked = fields.runtime_unverified ?? false;
     element("settings-current").textContent = gatewaySettings.configured
       ? (gatewaySettings.active_answer ? "사내 답변 모델 사용 중" : "사내 API 키 등록됨")
       : (fields.gateway_url ? "사내 API를 선택한 기능에만 키가 필요합니다."
         : "사내 API를 사용하려면 고급 설정에 HTTPS 주소를 입력하세요.");
+    if (gatewaySettings.runtime_unverified) {
+      element("settings-current").textContent += " · 답변·임베딩 인증서 검증 생략 중";
+    }
     element("settings-remove").hidden = !gatewaySettings.configured;
     element("settings-key").placeholder = gatewaySettings.configured ? "등록된 사내 키를 쓰려면 비워 두세요" : "";
     const roles = element("settings-roles");
@@ -900,9 +912,9 @@ async function changeSettings(action) {
     Object.assign(payload, readSettingsFields(gateway));
     payload.key = payload.key.trim();
     if (gateway) {
-      payload.test_unverified = action === "test" && payload.test_unverified;
+      payload.test_unverified = action === "test" && payload.test_unverified && !payload.runtime_unverified;
       const { answer, embedding, rerank } = payload.selections;
-      if (!payload.gateway_url.trim() && (payload.key || answer || rerank || (embedding && embedding !== localEmbedding))) {
+      if (!payload.gateway_url.trim() && (payload.key || payload.runtime_unverified || answer || rerank || (embedding && embedding !== localEmbedding))) {
         gatewayAdvanced.open = true;
         element("gateway-url").focus();
         settingsMessage(issueNames.gateway_url);
@@ -932,7 +944,9 @@ async function changeSettings(action) {
           : gatewayCheckReasons[result.reason];
         return gatewayRoles[role][0] + " (" + model + ") " + (result.ok ? "성공" : "실패" + (reason ? " — " + reason : ""));
       }) : [];
-      if (payload.test_unverified && checks.length) {
+      if (payload.runtime_unverified && (payload.selections.answer || payload.selections.embedding === "bge-m3")) {
+        checks.push("답변·사내 임베딩의 인증서 검증을 생략했습니다.");
+      } else if (payload.test_unverified && checks.length) {
         checks.push("인증서 검증을 생략한 테스트입니다. 실제 사용 전에 체크를 해제하고 다시 테스트하세요.");
       }
       settingsMessage(gateway ? (checks.join(" · ") || "테스트할 모델을 선택하세요.") : "연결 테스트에 성공했습니다.");
