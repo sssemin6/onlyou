@@ -248,6 +248,65 @@ class Integration(unittest.TestCase):
             self.assertEqual(self.call(route, {"action": "disconnect"})[0], 200)
             self.assertFalse(self.app.api_settings.load()["gateway"]["key"])
 
+    def test_gateway_runtime_tls_opt_in_applies_only_to_answer_and_embeddings(self):
+        route = "/api/intranet/settings"
+        self.app.api_settings = ApiSettings(self.store.root)
+        roles = {"answer": "answer-model-a", "embedding": "bge-m3", "rerank": "bge-reranker-v2-m3"}
+        payload = {"action": "apply", "key": "tls-fixture-key", "selections": roles}
+        with (patch.object(ApiSettings, "secure", True),
+              patch("mailsearch.api_settings.user_dpapi",
+                    side_effect=lambda data, decrypt=False: zlib.decompress(data) if decrypt else zlib.compress(data)),
+              patch("mailsearch.embedding.http.client.HTTPSConnection") as https):
+            self.assertFalse(self.call(route)[1]["runtime_unverified"])
+            result = self.call(route, {**payload, "runtime_unverified": "true"})
+            self.assertEqual(result, (400, {"error": "gateway_settings"}))
+            status, settings = self.call(route, {**payload, "runtime_unverified": True})
+            self.assertEqual(status, 200)
+            self.assertTrue(settings["runtime_unverified"])
+            self.assertEqual(self.app.api_settings.load()["gateway"]["unverified_origin"], GATEWAY_ORIGIN)
+            response = https.return_value.getresponse.return_value
+            response.status = 200
+
+            def gateway_reply(method, path, body, headers):
+                verify = https.call_args.kwargs["context"].verify_mode
+                hostname_checked = https.call_args.kwargs["context"].check_hostname
+                self.assertEqual(method, "POST")
+                self.assertEqual(headers["Authorization"], "Bearer tls-fixture-key")
+                request = json.loads(body)
+                if path == "/v1/rerank":
+                    self.assertEqual((verify, hostname_checked), (ssl.CERT_REQUIRED, True))
+                    value = {"results": [{"index": i, "relevance_score": 1} for i in range(len(request["documents"]))]}
+                else:
+                    self.assertEqual((verify, hostname_checked), (ssl.CERT_NONE, False))
+                    if path == "/v1/embeddings":
+                        texts = request["input"]
+                        count = len(texts) if isinstance(texts, list) else 1
+                        value = {"data": [{"index": i, "embedding": [1., .05, .12]} for i in range(count)]}
+                    else:
+                        self.assertEqual(path, "/v1/chat/completions")
+                        value = {"choices": [{"message": {"content": '{"status":"insufficient","claims":[]}'}}]}
+                response.read.return_value = json.dumps(value).encode()
+
+            request = https.return_value.request
+            request.side_effect = gateway_reply
+            source = self.import_mail()
+            self.assertIn("/v1/embeddings", [call.args[1] for call in request.call_args_list])
+            query = {"query": "A-17 납기", "filters": {"source": source}}
+            status, preview = self.call("/api/external/preview", query)
+            self.assertEqual(status, 200)
+            status, answer = self.call("/api/external/send", {"review": preview["review"],
+                                                            "excerpts": [preview["excerpts"][0]["id"]]})
+            self.assertEqual((status, answer["status"]), (200, "insufficient"))
+            self.assertEqual(request.call_args.args[1], "/v1/chat/completions")
+            self.assertIn("/v1/rerank", [call.args[1] for call in request.call_args_list])
+            with App(0, self.store, self.indexer, LocalAI("test"), api_settings=self.app.api_settings) as restored:
+                self.assertEqual(restored.gateway_unverified_origin, GATEWAY_ORIGIN)
+                self.assertEqual(restored.external.tls, self.app.external.tls)
+            status, settings = self.call(route, {**payload, "gateway_url": "https://other.example.invalid"})
+            self.assertEqual(status, 200)
+            self.assertFalse(settings["runtime_unverified"])
+            self.assertEqual(self.app.external.tls.unverified_paths, ())
+
     def test_gateway_probes_distinguish_local_model_tls_http_and_response_errors(self):
         route = "/api/intranet/settings"
         roles = {"answer": "", "embedding": LOCAL_EMBEDDING, "rerank": "bge-reranker-v2-m3"}
