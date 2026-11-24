@@ -24,7 +24,7 @@ from mailsearch.api_settings import ApiSettings, user_dpapi
 from mailsearch.answer import LocalAI, delivery_date_answer, evidence_for, validate
 from mailsearch.embedding import EmbeddingAPI, GatewayRequestError, tls_context, warn_unverified
 from mailsearch.external import ExternalAI, Excerpt, Reviews, pcf_batches
-from mailsearch.extract import convert_legacy, extract_attachment
+from mailsearch.extract import convert_legacy, extract_attachment, extract_bytes
 from mailsearch.filesystem import DRIVE_REMOTE, is_unc_share, local_path, source_path
 from mailsearch.intranet import CHAT_PATH, IntranetAI, LOCAL_EMBEDDING
 from mailsearch.indexer import ImportIssue, Indexer
@@ -32,7 +32,7 @@ from mailsearch.ollama_setup import (InstallCommandError, install_ollama, packag
                                     pull_model, run_install_command, winget_binary)
 from mailsearch.server import (App, INSTANCE_FILE, SessionLock, existing_origin, gateway_defaults,
                                gateway_diagnostics, main, publish_instance)
-from mailsearch.store import Store, local_midnight_utc, question_scope, read_signature
+from mailsearch.store import VECTOR_LOOKUP_SQL, Store, fingerprint, local_midnight_utc, question_scope, read_signature, sections
 from tools.demo import generate
 
 
@@ -681,6 +681,75 @@ class Integration(unittest.TestCase):
         self.assertEqual(set(self.store.pst_files(source)), {"보관.pst/", "깨진.pst/"})
         self.assertTrue(self.call("/api/search", {"query": "폴더 안 PST에서", "filters": {}})[1]["results"])
         self.assertTrue(self.call("/api/search", {"query": "직접 추가한", "filters": {}})[1]["results"])
+
+    def test_folder_refresh_rebuilds_legacy_pst_from_cached_messages(self):
+        folder = Path(self.workspace.name) / "legacy-archive"
+        folder.mkdir()
+        (folder / "old.pst").write_bytes(b"!BDN" + bytes(4) + b"SM" + bytes(2))
+        (folder / "standalone.txt").write_text("Document content should be reused.", encoding="utf-8")
+        document = "공통 첨부 본문입니다."
+
+        def export(pst, stage, event, source):
+            output = stage / "eml"
+            output.mkdir()
+            for i in (1, 2):
+                mail = EmailMessage()
+                mail["Subject"] = f"Legacy agenda {i}"
+                mail.set_content("현재 답변입니다.\n\n> ArchivedReplyOnlyMarker")
+                mail.add_attachment(document, filename="agenda.txt")
+                (output / str(i)).write_bytes(mail.as_bytes())
+            (stage / "export-complete").touch()
+            return output
+
+        def no_cache(name, part, temp, pdf, *, check, cache):
+            return extract_attachment(name, part, temp, pdf, check=check)
+
+        def finished(source):
+            row = await_source(self.store, source, {"ready", "error"})
+            for _ in range(300):
+                if source not in self.indexer.events:
+                    break
+                time.sleep(.01)
+            self.assertEqual(row["state"], "ready")
+            return row
+
+        with (patch.object(self.indexer, "export", side_effect=export) as exported,
+              patch("mailsearch.store.fingerprint",
+                    side_effect=lambda mail, item, **_: fingerprint(mail, item, index_format=None)),
+              patch("mailsearch.store.mail_sections", side_effect=sections),
+              patch("mailsearch.indexer.extract_attachment", side_effect=no_cache)):
+            source = self.indexer.register(folder)
+            first = finished(source)
+            exported.assert_called_once()
+        filters = {"source": source}
+        self.assertTrue(self.store.lexical("ArchivedReplyOnlyMarker", filters))
+        self.assertEqual(self.indexer.pending_updates(first), ["old.pst"])
+        with self.store.connection() as conn:
+            attachment = conn.execute("""SELECT a.id FROM attachments a JOIN mails m ON a.mail=m.id
+                                         WHERE m.source=? AND m.kind='mail' ORDER BY a.id LIMIT 1""", (source,)).fetchone()[0]
+        self.assertEqual(self.indexer.attachment_bytes(self.store.original_attachment(attachment)).decode().strip(), document)
+        with patch("mailsearch.indexer.stable_input", side_effect=PermissionError("PST in use")):
+            self.indexer.command(source, "refresh")
+            locked = finished(source)
+        self.assertTrue(self.store.lexical("ArchivedReplyOnlyMarker", filters))
+        self.assertEqual(self.indexer.pending_updates(locked), ["old.pst"])
+
+        with (patch.object(self.indexer, "export", side_effect=AssertionError("reuse cached messages")),
+              patch.object(self.store, "adopt_mail", wraps=self.store.adopt_mail) as adopted,
+              patch("mailsearch.extract.extract_bytes", wraps=extract_bytes) as extracts):
+            self.indexer.command(source, "refresh")
+            ready = finished(source)
+            self.assertEqual((ready["state"], ready["done"]), ("ready", 3))
+            adopted.assert_called_once()  # The standalone document still uses its old fingerprint.
+            attached = [call for call in extracts.call_args_list if call.args[0].decode().strip() == document]
+            self.assertEqual(len(attached), 1)
+        self.assertEqual(self.indexer.pending_updates(ready), [])
+        self.assertFalse(self.store.lexical("ArchivedReplyOnlyMarker", filters))
+        self.assertTrue(self.store.lexical("현재 답변", filters))
+        with self.store.connection() as conn:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM embedding_refs").fetchone()[0], 2)
+            original = conn.execute("SELECT body FROM mails WHERE source=? AND kind='mail'", (source,)).fetchone()[0]
+        self.assertIn("ArchivedReplyOnlyMarker", original)
 
     def test_gateway_indexes_existing_archive_and_searches_with_the_same_backend(self):
         source = self.import_mail()
@@ -1445,6 +1514,50 @@ class Integration(unittest.TestCase):
         with patch("mailsearch.store.source_readable", return_value=False):
             self.assertFalse(self.call("/api/search-access", {"ticket": first["access_ticket"]})[1]["results"])
 
+    def test_search_access_returns_ready_sources_while_another_is_blocked(self):
+        for name in ("fast", "slow"):
+            path = Path(self.workspace.name) / f"{name}.eml"
+            message = EmailMessage()
+            message["Subject"] = "Atlas " + name
+            message.set_content(f"Test {name}")
+            path.write_bytes(message.as_bytes())
+            source = self.indexer.register(path)
+            self.assertEqual(await_source(self.store, source, {"ready", "error"})["state"], "ready")
+        release = threading.Event()
+        blocked = threading.Event()
+
+        def probe(path, kind):
+            if Path(path).stem == "slow":
+                blocked.set()
+                return release.wait(4)
+            return True
+
+        payload = {"query": "Atlas", "mode": "quick", "defer_access": True}
+        with patch("mailsearch.store.source_readable", side_effect=probe) as checks:
+            try:
+                first = self.call("/api/search", payload)[1]
+                started = time.monotonic()
+                _, verified = self.call("/api/search-access", {"ticket": first["access_ticket"]})
+                self.assertLess(time.monotonic() - started, 2)
+                self.assertTrue(blocked.is_set())
+                self.assertTrue(verified["access_pending"])
+                self.assertEqual([row["subject"] for row in verified["results"]], ["Atlas fast"])
+            finally:
+                release.set()
+            deadline = time.monotonic() + 2
+            while self.store.access_inflight and time.monotonic() < deadline:
+                time.sleep(.01)
+            warm = self.call("/api/search", payload)[1]
+            self.assertEqual({row["subject"] for row in warm["results"]}, {"Atlas fast", "Atlas slow"})
+            self.assertEqual(checks.call_count, 2)
+
+    def test_vector_lookup_plan_uses_model_and_passage_keys(self):
+        with self.store.connection() as conn:
+            lines = [row[3] for row in conn.execute("EXPLAIN QUERY PLAN " + VECTOR_LOOKUP_SQL, ("embed", "[1,2,3]"))]
+        for table in ("vectors", "r", "v"):
+            fields = "model=? AND digest=?" if table == "v" else "model=? AND passage=?"
+            self.assertTrue(any(f"SEARCH {table} USING PRIMARY KEY ({fields})" in line for line in lines), lines)
+
     def test_query_embeddings_are_reused_until_configuration_changes(self):
         source = self.import_mail()
         with patch.object(self.ai, "embed_local", wraps=self.ai.embed_local) as embed:
@@ -1938,6 +2051,31 @@ class Integration(unittest.TestCase):
             self.assertEqual((row["state"], row["issue"], row["embedding_done"], row["embedding_total"]),
                              ("ready", None, 30, 30))
             self.assertEqual(sizes, [24, 6, 6])
+
+    def test_background_embedding_uses_configured_timeout_and_reduces_timed_out_batch(self):
+        folder = Path(self.workspace.name) / "embedding-batches"
+        folder.mkdir()
+        for i in range(37):
+            message = EmailMessage()
+            message["Subject"] = f"Batch fixture {i}"
+            message.set_content("Text for background embedding.")
+            (folder / f"{i}.eml").write_bytes(message.as_bytes())
+        self.indexer.embedding_batch_size = 32
+        self.indexer.embedding_batch_timeout = 50
+        requests = []
+
+        def slow_embed(texts, timeout):
+            requests.append((len(texts), timeout))
+            if len(texts) > 8:
+                raise TimeoutError()
+            return [[1., .05, .12] for _ in texts]
+
+        with (patch.object(self.ai, "embed", side_effect=slow_embed), self.assertLogs("mailsearch.gateway", "WARNING")):
+            source = self.indexer.register(folder)
+            row = await_source(self.store, source, {"ready", "error"})
+        self.assertEqual((row["state"], row["issue"], row["embedding_done"], row["embedding_total"]),
+                         ("ready", None, 37, 37))
+        self.assertEqual(requests, [(size, 50) for size in (32, 16, 8, 8, 8, 8, 5)])
 
     def test_raw_attachment_download_survives_missing_text_and_old_pst_indexes(self):
         pst = self.mail / "source.pst"
