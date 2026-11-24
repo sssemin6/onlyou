@@ -1,0 +1,23 @@
+name: Sync to Google Drive
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install rclone
+        run: curl -fsSL https://rclone.org/install.sh | sudo bash
+
+      - name: Write rclone config
+        env:
+          RCLONE_CONFIG_CONTENT: ${{ secrets.RCLONE_CONFIG }}
+        run: echo "$RCLONE_CONFIG_CONTENT" > rclone.conf
+
+      - name: Sync repo to Google Drive
+        run: rclone sync . gdrive:onlyou --config rclone.conf --exclude ".git/**" --exclude "rclone.conf" -v
