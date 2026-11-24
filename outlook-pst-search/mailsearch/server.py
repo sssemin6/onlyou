@@ -495,10 +495,14 @@ class Handler(BaseHTTPRequestHandler):
         store, ai = self.server.store, self.server.ai
         if route == "/api/search":
             started = time.monotonic()
-            keyword_only = payload.get("mode") == "keyword"
+            mode = payload.get("mode")
+            keyword_only = mode in ("keyword", "quick")
             plan = quoted_plan(query)
+            quick = mode == "quick" and plan is None and not filters.get("body")
             if plan is not None:
                 rows = store.exact_search(plan, filters)
+            elif quick:
+                rows = store.quick_search(query, filters)
             else:
                 rows = store.lexical(query, filters, limit=180)
                 if query and not keyword_only and ai.embedding_index:
@@ -512,7 +516,7 @@ class Handler(BaseHTTPRequestHandler):
             elapsed = time.monotonic() - started
             if elapsed >= 1:
                 runtime_logger.info("Search took %.2fs (mode=%s, tab=%s, scoped=%s)", elapsed,
-                                    "keyword" if keyword_only or plan else "hybrid",
+                                    "quick" if quick else "keyword" if keyword_only or plan else "hybrid",
                                     filters.get("tab", "all"), "source" in filters)
             tokens = query_words(query, fuzzy=True)[:8]
             distinct = {}
@@ -531,7 +535,10 @@ class Handler(BaseHTTPRequestHandler):
                     matched = [token for token in tokens if normalized(token) in haystack]
                     shown["matched"] = matched
                     shown["snippet"] = best_snippet(row["text"], matched)
-            self.send_json(200, {"results": list(distinct.values())})
+            result = {"results": list(distinct.values())}
+            if quick:
+                result["mode"] = "quick"
+            self.send_json(200, result)
             return
         if not query:
             self.send_json(400, {"error": "question_required"})
