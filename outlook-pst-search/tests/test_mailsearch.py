@@ -14,13 +14,14 @@ import unittest
 import zipfile
 import zlib
 from contextlib import nullcontext, redirect_stderr, redirect_stdout
+from datetime import date
 from unittest.mock import MagicMock, patch
 from email.message import EmailMessage
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path, PureWindowsPath
 
 from mailsearch.api_settings import ApiSettings, user_dpapi
-from mailsearch.answer import LocalAI, delivery_date_answer, validate
+from mailsearch.answer import LocalAI, delivery_date_answer, evidence_for, validate
 from mailsearch.embedding import EmbeddingAPI, GatewayRequestError, tls_context, warn_unverified
 from mailsearch.external import ExternalAI, Excerpt, Reviews, pcf_batches
 from mailsearch.extract import convert_legacy, extract_attachment
@@ -31,7 +32,7 @@ from mailsearch.ollama_setup import (InstallCommandError, install_ollama, packag
                                     pull_model, run_install_command, winget_binary)
 from mailsearch.server import (App, INSTANCE_FILE, SessionLock, existing_origin, gateway_defaults,
                                gateway_diagnostics, main, publish_instance)
-from mailsearch.store import Store, read_signature
+from mailsearch.store import Store, local_midnight_utc, question_scope, read_signature
 from tools.demo import generate
 
 
@@ -1327,6 +1328,84 @@ class Integration(unittest.TestCase):
         self.assertIn("errno=13", message)
         self.assertNotIn("다른 실행이", message)
 
+    def test_startup_logs_active_vector_backend_after_optional_backend_fails(self):
+        data = Path(self.workspace.name) / "startup"
+        for numpy, expected in ((None, "sqlite(pure-python) numpy=disabled"),
+                                (object(), "sqlite+numpy numpy=enabled")):
+            with (patch("mailsearch.vector_index.USearchIndex", side_effect=ImportError),
+                  patch("mailsearch.store.optional_numpy", return_value=numpy),
+                  patch.object(App, "serve_forever"), redirect_stdout(io.StringIO())):
+                self.assertEqual(main(["--data", str(data), "--port", "0", "--no-browser",
+                                       "--vector-index", "usearch"]), 0)
+            log = (data / "app-runtime.log").read_text(encoding="utf-8")
+            self.assertIn(f"Vector search backend={expected}", log)
+        with patch.object(self.store, "vector_index", object()):
+            self.assertEqual(self.store.vector_backend, "usearch(int8)")
+
+    def test_question_filters_use_metadata_and_preserve_ui_selection(self):
+        folder = Path(self.workspace.name) / "metadata"
+        folder.mkdir()
+        for sender, sent, attachment, subject in (
+            ("Owner <owner@example.invalid>", "1 Dec 2025 01:00:00 -0800", True, "Atlas matching"),
+            ("otherowner@example.invalid", "20 Dec 2025 12:00:00 +0000", True, "Atlas other address"),
+            ("owner@example.invalid", "20 Dec 2025 12:00:00 +0000", False, "Atlas without file"),
+            ("owner@example.invalid", "9 Jan 2026 12:00:00 +0000", True, "Atlas January"),
+        ):
+            msg = EmailMessage()
+            msg["From"], msg["Date"], msg["Subject"] = sender, sent, subject
+            msg.set_content(subject)
+            if attachment:
+                msg.add_attachment("Atlas revision notes", filename="notes.txt")
+            (folder / (subject + ".eml")).write_bytes(msg.as_bytes())
+        source = self.indexer.register(folder)
+        self.assertEqual(await_source(self.store, source, {"ready", "error"})["state"], "ready")
+        payload = {"query": "지난달 owner@example.invalid이 보낸 첨부가 있는 메일 Atlas",
+                   "filters": {"source": source}}
+        with patch("mailsearch.server.question_scope",
+                   side_effect=lambda question, filters: question_scope(question, filters, today=date(2026, 1, 10))):
+            for route in ("/api/search", "/api/answer"):
+                status, response = self.call(route, payload)
+                self.assertEqual(status, 200)
+                self.assertEqual({row["subject"] for row in response["results"]}, {"Atlas matching"})
+            payload["filters"].update(after="2026-01-01", sender="owner@example.invalid", attachment="yes")
+            status, response = self.call("/api/search", payload)
+            self.assertEqual(status, 200)
+            self.assertEqual({row["subject"] for row in response["results"]}, {"Atlas January"})
+
+    def test_local_answer_accepts_eight_cited_claims_and_model_context_cap(self):
+        folder = Path(self.workspace.name) / "synthesis"
+        folder.mkdir()
+        quotes = [f"Atlas 단계 {index}의 점검을 진행했습니다." for index in range(1, 9)]
+        for index, quote in enumerate(quotes, 1):
+            msg = EmailMessage()
+            msg["Subject"] = "Atlas"
+            msg["Date"] = f"{index} Jan 2026 12:00:00 +0000"
+            msg.set_content(quote)
+            (folder / f"{index}.eml").write_bytes(msg.as_bytes())
+        source = self.indexer.register(folder)
+        self.assertEqual(await_source(self.store, source, {"ready", "error"})["state"], "ready")
+        self.ai.configure_embedding("", None)
+        actual_call = self.ai.call
+
+        def local(path, payload=None, timeout=None):
+            if path == "/api/show":
+                return {"model_info": {"general.architecture": "test", "test.context_length": 12288}}
+            if path != "/api/generate":
+                return actual_call(path, payload, timeout)
+            self.assertEqual(payload["options"]["num_ctx"], 12288)
+            self.assertEqual(payload["format"]["properties"]["claims"]["maxItems"], 8)
+            snippets = json.loads(payload["prompt"])["evidence"]
+            claims = [{"text": quote, "citations": [{"source": row["source"], "quote": quote}]}
+                      for row, quote in zip(snippets, quotes)]
+            self.assertTrue(all(claim["text"] in row["text"] for claim, row in zip(claims, snippets)))
+            return {"response": json.dumps({"status": "answered", "claims": claims})}
+
+        with patch.object(self.ai, "call", side_effect=local):
+            status, answer = self.call("/api/answer", {"query": "Atlas 종합", "filters": {"source": source}})
+        self.assertEqual(status, 200)
+        self.assertEqual(answer["status"], "answered")
+        self.assertEqual([claim["text"] for claim in answer["claims"]], quotes)
+
     def test_validation_preserves_original_whitespace_and_checks_each_synthesis_clause(self):
         source = self.import_mail()
         row = self.store.lexical("납품", {"source": source})[0]
@@ -2284,6 +2363,53 @@ class ExternalTransport(unittest.TestCase):
 
 
 class AttachmentsAndCitations(unittest.TestCase):
+    def test_natural_scope_only_infers_clear_calendar_windows(self):
+        today = date(2026, 1, 1)
+        windows = {"최근": (date(2025, 12, 3), date(2026, 1, 2)),
+                   "이번 주": (date(2025, 12, 29), date(2026, 1, 5)),
+                   "지난달": (date(2025, 12, 1), date(2026, 1, 1)),
+                   "올해": (date(2026, 1, 1), date(2027, 1, 1))}
+        for phrase, window in windows.items():
+            search, filters = question_scope(f"{phrase} Atlas 회신", {}, today=today)
+            self.assertEqual(search, "Atlas 회신")
+            self.assertEqual(filters, dict(zip(("after", "before"), map(local_midnight_utc, window))))
+        self.assertEqual(question_scope('지난달 "Atlas" 회신', {}, today=today)[0], '"Atlas" 회신')
+        for question in ('"올해" 회신', "올해 Atlas 납기", "이번 주와 지난달 회신 비교",
+                         "최근 3개월 메일", "지난달 대비 회신", "첨부가 있는 메일이 아닌 자료"):
+            self.assertEqual(question_scope(question, {}, today=today), (question, {}))
+        filters = {"before": "explicit", "sender": "chosen", "attachment": "no"}
+        question = '지난달 발신자: "홍길동" 첨부파일 내용 비교'
+        self.assertEqual(question_scope(question, filters, today=today), (question, filters))
+        self.assertEqual(question_scope("첨부파일 내용 정리", {})[1], {"prefer_attachment": True})
+
+    def test_context_expansion_keeps_twelve_ranked_passages_and_caps_at_eighteen(self):
+        def row(passage):
+            return {"passage": passage, "id": passage, "fingerprint": str(passage), "kind": "document",
+                    "location": "본문", "attachment": None, "text": "Atlas"}
+        store = MagicMock()
+        store.lexical.return_value = [row(i) for i in range(12)]
+        store.related.return_value = []
+        store.evidence_context.side_effect = lambda match, _: [row(100 + match["passage"])]
+        evidence, _ = evidence_for(store, None, "Atlas", {}, "", semantic=False, limit=12, expand=True,
+                                   max_evidence=18)
+        self.assertEqual(len(evidence), 18)
+        self.assertEqual([match["passage"] for match in evidence[:12]], list(range(12)))
+
+    def test_small_context_keeps_complete_excerpts_and_marks_partial(self):
+        ai = LocalAI("test", answer_num_ctx=4096)
+        text = "배관 상태를 점검했습니다. " * 40
+        rows = [{"sent": "", "sender": "", "subject": "Atlas", "text": text, "id": index, "passage": index}
+                for index in range(1, 19)]
+        with (patch.object(ai, "ensure_server"),
+              patch.object(ai, "ensure_model", return_value="test:latest"),
+              patch.object(ai, "call", return_value={"response": '{"status":"answered","claims":[]}'}) as generate):
+            self.assertEqual(ai.answer("Atlas 종합", rows, "")["status"], "partial")
+        payload = generate.call_args.args[1]
+        self.assertEqual(payload["options"]["num_ctx"], 4096)
+        excerpts = json.loads(payload["prompt"])["evidence"]
+        self.assertTrue(0 < len(excerpts) < len(rows))
+        self.assertTrue(all(excerpt["text"].endswith(text) for excerpt in excerpts))
+
     def office_zip(self, documents):
         buffer = io.BytesIO()
         with zipfile.ZipFile(buffer, "w") as zipped:
