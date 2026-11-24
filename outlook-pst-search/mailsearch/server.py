@@ -10,6 +10,8 @@ import logging
 import os
 import re
 import secrets
+import select
+import socket
 import sqlite3
 import sys
 import threading
@@ -22,8 +24,9 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from urllib.parse import quote, urlsplit
 
-from .answer import (ANSWER_CLAIM_LIMIT, ANSWER_EVIDENCE_LIMIT, ANSWER_TEXT_LIMIT, DEFAULT_ANSWER_NUM_CTX,
-                     PCF_INSTRUCTIONS, SYNTHESIS_QUESTION, LocalAI, delivery_date_answer, evidence_for,
+from .answer import (ANSWER_CLAIM_LIMIT, ANSWER_EVIDENCE_LIMIT, ANSWER_TEXT_LIMIT, CONVERSATION_ID,
+                     DEFAULT_ANSWER_NUM_CTX, PCF_INSTRUCTIONS, SYNTHESIS_QUESTION, AnswerSessions, LocalAI,
+                     answer_groups, answer_plan, combine_answer_evidence, delivery_date_answer, evidence_for, follow_up_evidence,
                      map_citations, merge_rows, pcf_candidates, pcf_retrieval, pcf_word, public_row, validate)
 from .api_settings import ApiSettings, write_api_settings
 from .embedding import (CA_FILE_ENV, GatewayTLSOptions, MODEL as BGE_MODEL, PATH as EMBEDDING_PATH,
@@ -52,6 +55,10 @@ PAGE_IDLE_SECONDS = 12
 
 class SessionBusy(Exception):
     """The data directory is already locked by another process."""
+
+
+class AnswerCancelled(Exception):
+    """The browser disconnected from the answer stream."""
 
 
 class SessionLock:
@@ -130,6 +137,7 @@ class App(ThreadingHTTPServer):
         self.store, self.indexer, self.ai = store, indexer, ai
         self.search_workers = ThreadPoolExecutor(max_workers=2, thread_name_prefix="semantic-search")
         self.search_tickets = SearchTickets()
+        self.answer_sessions = AnswerSessions()
         self.ollama_setup = OllamaSetup(ai)
         self.external = external
         self.generic_answer = external
@@ -463,6 +471,7 @@ class Handler(BaseHTTPRequestHandler):
             self.download_attachment(int(route.path.rsplit("/", 1)[-1]))
         elif route.path == "/api/ping":
             self.server.last_seen = time.monotonic()
+            self.server.answer_sessions.prune()
             self.send_json(200, {"ok": True})
         elif route.path == "/api/intranet/settings":
             self.send_json(200, self.intranet_settings())
@@ -538,13 +547,16 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(202, {})
             elif route == "/api/search-access":
                 self.verify_search(payload["ticket"])
-            elif route == "/api/answer":
+            elif route in {"/api/answer", "/api/answer/stream"}:
                 profile = SearchProfile("answer")
-                try:
-                    with self.server.store.search_session(profile):
-                        self.query(route, payload)
-                finally:
-                    profile.log(runtime_logger, "answer")
+                with self.server.store.search_session(profile):
+                    self.answer_request(payload, profile, stream=route.endswith("/stream"))
+            elif route == "/api/answer/reset":
+                key = payload.get("session_id")
+                if not isinstance(key, str) or not CONVERSATION_ID.fullmatch(key):
+                    raise ValueError("session_id")
+                self.server.answer_sessions.reset(key)
+                self.send_json(200, {"ok": True})
             elif route in {"/api/search", "/api/candidates", "/api/external/preview", "/api/pcf/preview"}:
                 self.query(route, payload)
             elif route in {"/api/external/send", "/api/pcf/send"}:
@@ -694,12 +706,16 @@ class Handler(BaseHTTPRequestHandler):
             result["mode"] = "quick"
         return result
 
-    def query(self, route, payload):
+    @staticmethod
+    def question_input(payload):
         query, context, options = payload.get("query", ""), payload.get("context", ""), payload.get("filters", {})
         if not isinstance(query, str) or not isinstance(context, str) or not isinstance(options, dict):
             raise ValueError("query")
         query, context = query.strip()[:450], context.strip()[:450]
-        filters = filters_from(options.get)
+        return query, context, filters_from(options.get)
+
+    def query(self, route, payload):
+        query, context, filters = self.question_input(payload)
         store, ai = self.server.store, self.server.ai
         if route == "/api/search":
             search_text, filters = question_scope(query, filters)
@@ -723,14 +739,10 @@ class Handler(BaseHTTPRequestHandler):
             evidence, mode = pcf_retrieval(store, ai, query, filters, context)
             evidence = [row for row in evidence if not pcf_word(row)]
         else:
-            local_answer = route == "/api/answer"
             search_text, filters = question_scope(query, filters)
             evidence, mode = evidence_for(store, ai, search_text, filters, context,
-                                          semantic=local_answer or route == "/api/external/preview",
-                                          limit=MAX_INTERNAL_EXCERPTS if budget else 12 if local_answer else 9,
-                                          expand=bool(budget) or local_answer,
-                                          thread_hops=3 if local_answer else 1,
-                                          max_evidence=ANSWER_EVIDENCE_LIMIT if local_answer else None)
+                                          semantic=route == "/api/external/preview",
+                                          limit=MAX_INTERNAL_EXCERPTS if budget else 9, expand=bool(budget))
         if route in {"/api/external/preview", "/api/pcf/preview"}:
             token, review = self.server.reviews.create(query, evidence, external.review_generation, pcf=pcf, internal_budget=budget)
             by_passage = {row["passage"]: public_row(row) for row in evidence}
@@ -741,10 +753,93 @@ class Handler(BaseHTTPRequestHandler):
                 "results": [public_row(row) for row in evidence],
             })
             return
-        rows = [public_row(row) for row in evidence]
-        if route == "/api/candidates":
-            self.send_json(200, {"results": rows})
+        self.send_json(200, {"results": [public_row(row) for row in evidence]})
+
+    def stream_answer_event(self, stage, **fields):
+        event = json.dumps({"stage": stage, **fields}, ensure_ascii=False)
+        self.check_answer_stream()
+        try:
+            self.wfile.write(f"event: {stage}\ndata: {event}\n\n".encode("utf-8"))
+            self.wfile.flush()
+        except ConnectionError as exc:
+            raise AnswerCancelled() from exc
+
+    def check_answer_stream(self):
+        try:
+            readable, _, _ = select.select([self.connection], [], [], 0)
+            if readable and not self.connection.recv(1, socket.MSG_PEEK):
+                raise AnswerCancelled()
+        except OSError as exc:
+            raise AnswerCancelled() from exc
+
+    def answer_request(self, payload, profile, *, stream=False):
+        query, context, filters = self.question_input(payload)
+        if not query:
+            self.send_json(400, {"error": "question_required"})
             return
+        session_id = payload.get("session_id", "")
+        if not isinstance(session_id, str) or (session_id and not CONVERSATION_ID.fullmatch(session_id)):
+            raise ValueError("session_id")
+        sessions = self.server.answer_sessions
+        handle, turns = None, ()
+        if stream or "session_id" in payload:
+            session_id, handle, turns = sessions.begin(session_id)
+        if stream:
+            self.close_connection = True
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Connection", "close")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.end_headers()
+        report = self.stream_answer_event if stream else lambda *args, **kwargs: None
+        check = self.check_answer_stream if stream else None
+        try:
+            result = self.local_answer(query, context, filters, report, turns, check)
+            if check:
+                check()
+        except AnswerCancelled:
+            return
+        except sqlite3.Error:
+            if not stream:
+                raise
+            result = {"status": "index_unavailable", "claims": [], "results": [], "retrieval": "keyword"}
+        finally:
+            profile.log(runtime_logger, "answer")
+        if handle is not None:
+            result["session_id"] = session_id
+            sessions.record(session_id, handle, query, result)
+        try:
+            if stream:
+                report("done", **result)
+            else:
+                self.send_json(200, result)
+        except AnswerCancelled:
+            return
+
+    def local_answer(self, query, context, filters, report, turns, check):
+        store, ai = self.server.store, self.server.ai
+        report("planning")
+        search_text, filters = question_scope(query, filters)
+        subqueries = answer_plan(search_text)
+        with store.measure("context"):
+            follow_up, anchors = follow_up_evidence(store, query, filters, turns)
+        pools = []
+        modes = []
+        for question in subqueries:
+            if check:
+                check()
+            found, mode = evidence_for(store, ai, question, filters, context, limit=12,
+                                       expand=True, thread_hops=3, max_evidence=ANSWER_EVIDENCE_LIMIT,
+                                       local_context=follow_up)
+            pools.append(found)
+            modes.append(mode)
+        evidence = combine_answer_evidence(pools, anchors)
+        if follow_up:
+            context = f"{follow_up} {context}".strip()[:450]
+        mode = next(label for label in ("hybrid", "keyword_only", "keyword") if label in modes)
+        report("retrieving", count=len(evidence), queries=len(subqueries))
+        rows = [public_row(row) for row in evidence]
         result = {"status": "insufficient", "claims": []}
         if not ai.model:
             result["status"] = "model_not_configured"
@@ -753,10 +848,17 @@ class Handler(BaseHTTPRequestHandler):
         elif evidence:
             try:
                 full_question = f"{query} {context}"
-                synthesis = SYNTHESIS_QUESTION.search(query)
+                synthesis = len(subqueries) > 1 or SYNTHESIS_QUESTION.search(query)
                 direct = None if synthesis else delivery_date_answer(query, evidence, context)
+                report("synthesizing")
                 with store.measure("generation"):
-                    proposed = ai.answer(query, evidence, context) if direct is None else None
+                    groups = answer_groups(store, evidence) if len(subqueries) > 1 and len(evidence) >= 8 else ()
+                    if direct is None:
+                        options = {"groups": groups} if groups else {}
+                        if check:
+                            options["check"] = check
+                        proposed = ai.answer(query, evidence, context, **options)
+                report("validating")
                 # Recheck visibility after inference, including source removal during generation.
                 visible = {r["passage"] for r in store.passages([r["passage"] for r in evidence], filters)}
                 evidence = [r for r in evidence if r["passage"] in visible]
@@ -770,7 +872,7 @@ class Handler(BaseHTTPRequestHandler):
                 result["status"] = "model_unavailable"
             finally:
                 self.server.generation.release()
-        self.send_json(200, {**result, "results": rows, "retrieval": mode})
+        return {**result, "results": rows, "retrieval": mode}
 
     def preview_pcf_word(self, passage, question, context, filters, external):
         store = self.server.store
