@@ -26,7 +26,8 @@ from urllib.parse import quote, urlsplit
 
 from .answer import (ANSWER_CLAIM_LIMIT, ANSWER_EVIDENCE_LIMIT, ANSWER_TEXT_LIMIT, CONVERSATION_ID,
                      DEFAULT_ANSWER_NUM_CTX, PCF_INSTRUCTIONS, SYNTHESIS_QUESTION, AnswerSessions, LocalAI,
-                     answer_groups, answer_plan, combine_answer_evidence, delivery_date_answer, evidence_for, follow_up_evidence,
+                     answer_groups, answer_plan, combine_answer_evidence, delivery_date_answer, evidence_for,
+                     follow_up_evidence, follow_up_replies, follow_up_reply_sender,
                      map_citations, merge_rows, pcf_candidates, pcf_retrieval, pcf_word, public_row, validate)
 from .api_settings import ApiSettings, write_api_settings
 from .embedding import (CA_FILE_ENV, GatewayTLSOptions, MODEL as BGE_MODEL, PATH as EMBEDDING_PATH,
@@ -781,17 +782,20 @@ class Handler(BaseHTTPRequestHandler):
         if not isinstance(session_id, str) or (session_id and not CONVERSATION_ID.fullmatch(session_id)):
             raise ValueError("session_id")
         sessions = self.server.answer_sessions
-        handle, turns = None, ()
+        handle, turns = None, None
         if stream or "session_id" in payload:
             session_id, handle, turns = sessions.begin(session_id)
         if stream:
             self.close_connection = True
-            self.send_response(200)
-            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
-            self.send_header("Cache-Control", "no-store")
-            self.send_header("Connection", "close")
-            self.send_header("X-Content-Type-Options", "nosniff")
-            self.end_headers()
+            try:
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("Connection", "close")
+                self.send_header("X-Content-Type-Options", "nosniff")
+                self.end_headers()
+            except ConnectionError:
+                return
         report = self.stream_answer_event if stream else lambda *args, **kwargs: None
         check = self.check_answer_stream if stream else None
         try:
@@ -804,6 +808,10 @@ class Handler(BaseHTTPRequestHandler):
             if not stream:
                 raise
             result = {"status": "index_unavailable", "claims": [], "results": [], "retrieval": "keyword"}
+        except (ImportIssue, ValueError, TypeError, KeyError, OverflowError):
+            if not stream:
+                raise
+            result = {"status": "answer_unavailable", "claims": [], "results": [], "retrieval": "keyword"}
         finally:
             profile.log(runtime_logger, "answer")
         if handle is not None:
@@ -821,9 +829,13 @@ class Handler(BaseHTTPRequestHandler):
         store, ai = self.server.store, self.server.ai
         report("planning")
         search_text, filters = question_scope(query, filters)
-        subqueries = answer_plan(search_text)
+        mail_conversation = turns is not None and filters.get("tab") not in ("document", "pcf")
+        reply_sender = follow_up_reply_sender(query) if mail_conversation else ""
+        subqueries = () if reply_sender else answer_plan(search_text)
         with store.measure("context"):
             follow_up, anchors = follow_up_evidence(store, query, filters, turns)
+            if reply_sender:
+                anchors = follow_up_replies(store, anchors, filters, reply_sender)
         pools = []
         modes = []
         for question in subqueries:
@@ -837,8 +849,8 @@ class Handler(BaseHTTPRequestHandler):
         evidence = combine_answer_evidence(pools, anchors)
         if follow_up:
             context = f"{follow_up} {context}".strip()[:450]
-        mode = next(label for label in ("hybrid", "keyword_only", "keyword") if label in modes)
-        report("retrieving", count=len(evidence), queries=len(subqueries))
+        mode = next((label for label in ("hybrid", "keyword_only") if label in modes), "keyword")
+        report("retrieving", count=len(evidence), queries=len(pools))
         rows = [public_row(row) for row in evidence]
         result = {"status": "insufficient", "claims": []}
         if not ai.model:
@@ -852,12 +864,11 @@ class Handler(BaseHTTPRequestHandler):
                 direct = None if synthesis else delivery_date_answer(query, evidence, context)
                 report("synthesizing")
                 with store.measure("generation"):
-                    groups = answer_groups(store, evidence) if len(subqueries) > 1 and len(evidence) >= 8 else ()
-                    if direct is None:
-                        options = {"groups": groups} if groups else {}
-                        if check:
-                            options["check"] = check
-                        proposed = ai.answer(query, evidence, context, **options)
+                    groups = answer_groups(store, evidence) if synthesis else ()
+                    options = {"groups": groups} if groups else {}
+                    if check:
+                        options["check"] = check
+                    proposed = ai.answer(query, evidence, context, **options) if direct is None else None
                 report("validating")
                 # Recheck visibility after inference, including source removal during generation.
                 visible = {r["passage"] for r in store.passages([r["passage"] for r in evidence], filters)}

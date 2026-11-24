@@ -29,7 +29,17 @@ SYNTHESIS_QUESTION = re.compile(r"종합|비교|타임라인|시간\s*순|경과
 TIMELINE_QUESTION = re.compile(r"타임라인|시간\s*순|경과|흐름|이력")
 PROJECT_CODE = re.compile(r"(?<![A-Za-z0-9_-])[A-Za-z0-9]+(?:[-_][A-Za-z0-9]+)+(?![A-Za-z0-9_-])")
 COMPARE_PARTS = re.compile(r"\s+(?:vs\.?|versus|및|와|과|하고|and)\s+|(?<=[가-힣\w])(?:와|과)\s+", re.I)
+COMPARISON_QUESTION = re.compile(r"비교|차이|각각|대비|\b(?:compar\w*|versus|vs|difference\w*)\b", re.I)
+ANSWER_ASPECT = re.compile(
+    r"단가|견적가|가격|금액|비용|예산|납기|납품일|출하일|일정|수량|규격|품질|검수|"
+    r"결제\s*조건|지급\s*조건|승인\s*여부"
+)
+ASPECT_SEPARATOR = re.compile(r"\s*(?:[,·/]|와|과|및|그리고|이랑|하고|랑|도)\s*")
 FOLLOW_UP = re.compile(r"^(?:그중|그\s*중|그\s*메일|그\s*자료|그\s*건|그때|방금|직전|아까|앞서|같은\s*(?:건|자료))|다시|이어서")
+FOLLOW_UP_REPLY = re.compile(
+    r"(?<!\w)(?P<sender>[가-힣]{1,5}\s*(?:부장|과장|차장|대리|팀장|실장|본부장|담당자))"
+    r"\s*(?:님)?(?:의|이|가)?\s*(?:회신|답장)"
+)
 CONVERSATION_ID = re.compile(r"[A-Za-z0-9_-]{32}")
 CONVERSATION_TTL = 1800
 MAX_HTTP_BODY = 8 * 1024 * 1024
@@ -288,7 +298,7 @@ class LocalAI:
         self.ensure_server()
         model = self.ensure_model(self.model)
         prompt = (ANSWER_INSTRUCTIONS + " context는 앞선 질문에서 선택한 검색 맥락이다. "
-                  "근거는 발송 시각 순서다. 요청, 잠정 회신, 최종 확정, 취소를 구분하고 "
+                  "각 묶음의 근거는 발송 시각 순서다. 요청, 잠정 회신, 최종 확정, 취소를 구분하고 "
                   "독립된 사실마다 해당 출처를 직접 인용한다.")
         # Ollama has no generation-model tokenizer endpoint. Estimate from JSON UTF-8
         # size and reserve room for output and the model's template.
@@ -296,12 +306,17 @@ class LocalAI:
         costs = {row["passage"]: passage_cost(row) for row in evidence}
         maximum = min(self.answer_num_ctx, self.model_context_limit or BASE_ANSWER_NUM_CTX)
         num_ctx = min(BASE_ANSWER_NUM_CTX, maximum)
-        initial_notes = min(900, num_ctx // 10) if groups else 0
+        use_map = bool(groups) and len(evidence) >= (8 if len(groups) > 1 else 12)
+        initial_notes = min(900, num_ctx // 10) if use_map else 0
         if fixed_cost + sum(costs.values()) + min(2400, num_ctx // 4) + initial_notes > num_ctx:
             num_ctx = maximum
         num_predict = min(2400, num_ctx // 4)
-        note_budget = min(900, num_ctx // 10) if groups else 0
+        note_budget = min(900, num_ctx // 10) if use_map else 0
         budget = num_ctx - num_predict - fixed_cost - note_budget
+        summaries = self.map_facts(model, question, groups, num_ctx, check) if use_map and budget > 0 else []
+        if summaries:
+            cited = {passage for item in summaries for passage in item["sources"]}
+            evidence = sorted(evidence, key=lambda row: row["passage"] not in cited)
         included = []
         for row in evidence:
             size = costs[row["passage"]]
@@ -311,18 +326,24 @@ class LocalAI:
         if not included:
             return {"status": "insufficient", "claims": []}
         reduced = len(included) < len(evidence)
-        evidence = sorted(included, key=evidence_order)
+        group_numbers = {row["passage"]: number for number, group in enumerate(groups, 1) for row in group}
+        evidence = sorted(included, key=lambda row: (group_numbers.get(row["passage"], 0), evidence_order(row)))
         ids = {index: row["passage"] for index, row in enumerate(evidence, 1)}
         data = {"question": question, "context": context, "evidence": [
             {"source": index, "text": source_text(row)} for index, row in enumerate(evidence, 1)
         ]}
         if groups:
+            for item, row in zip(data["evidence"], evidence):
+                item["group"] = group_numbers[row["passage"]]
+        if summaries:
             numbered = {passage: index for index, passage in ids.items()}
-            summaries = self.map_facts(model, question, groups, numbered, num_ctx, check)
             added = " verified_notes는 원문과 대조한 중간 메모다. 각 메모의 출처 원문에서 인용하여 최종 답변을 작성한다."
             hints = []
             remaining = note_budget - estimate_tokens(added) - 30
-            for item in summaries:
+            for note in summaries:
+                if any(source not in numbered for source in note["sources"]):
+                    continue
+                item = {"text": note["text"], "sources": [numbered[source] for source in note["sources"]]}
                 cost = estimate_tokens(json.dumps(item, ensure_ascii=False)) + 4
                 if cost <= remaining:
                     hints.append(item)
@@ -342,24 +363,25 @@ class LocalAI:
             result["status"] = "partial"
         return result
 
-    def map_facts(self, model, question, groups, numbered, num_ctx, check):
+    def map_facts(self, model, question, groups, num_ctx, check):
         """Extract a bounded set of independently checked facts from each useful group."""
         notes = []
-        for group in groups[:3]:
-            eligible = [row for row in group if row["passage"] in numbered]
-            selected = eligible if len(eligible) <= 4 else [*eligible[:2], *eligible[-2:]]
+        deadline = time.monotonic() + min(20, self.timeout)
+        for group in groups:
             budget = num_ctx - min(640, num_ctx // 5) - 550 - estimate_tokens(question)
-            fitted = []
-            for row in selected:
+            selected = []
+            for row in group:
                 cost = passage_cost(row)
                 if cost <= budget:
-                    fitted.append(row)
+                    selected.append(row)
                     budget -= cost
-            selected = fitted
             if not selected:
                 continue
             if check:
                 check()
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
             try:
                 response = self.call("/api/generate", {
                     "model": model, "stream": False, "think": False, "format": FORMAT,
@@ -369,12 +391,12 @@ class LocalAI:
                         {"source": row["passage"], "text": source_text(row)} for row in selected
                     ]}, ensure_ascii=False),
                     "options": {"temperature": 0, "num_ctx": num_ctx, "num_predict": min(640, num_ctx // 5)},
-                }, timeout=min(20, self.timeout))
+                }, timeout=remaining)
                 checked = validate(json.loads(response["response"]), selected, question, claim_limit=2)
             except (OSError, ValueError, RuntimeError, KeyError, TypeError, http.client.HTTPException):
                 continue
             for claim in checked["claims"][:2]:
-                notes.append({"text": claim["text"], "sources": [numbered[ref["passage"]] for ref in claim["citations"]]})
+                notes.append({"text": claim["text"], "sources": [ref["passage"] for ref in claim["citations"]]})
         return notes
 
 
@@ -423,23 +445,34 @@ def public_row(row):
 
 
 def answer_plan(question):
-    """Build at most three retrieval queries from terms explicitly present in the question."""
-    compound = SYNTHESIS_QUESTION.search(question)
+    """Build at most three retrieval queries around the question's topics and requested facts."""
     codes = list(dict.fromkeys(code.casefold() for code in PROJECT_CODE.findall(question)))
     if len(codes) > 1:
-        common = PROJECT_CODE.sub(" ", question)
-        return [f"{code} {' '.join(common.split())}".strip()[:450] for code in codes[:3]]
-    if compound is None:
-        return [question]
-    if TIMELINE_QUESTION.search(question):
-        topic = TIMELINE_QUESTION.sub(" ", question).strip()
-        if query_words(topic, fuzzy=True):
-            return [f"{topic} {phase}"[:450] for phase in ("요청 제안", "회신 변경", "확정 승인 취소")]
-    if re.search(r"비교|차이|각각", question):
+        common = compact_space(COMPARE_PARTS.sub(" ", PROJECT_CODE.sub(" ", question)))
+        return [f"{code} {common}".strip()[:450] for code in codes[:3]]
+    aspects = list(ANSWER_ASPECT.finditer(question))
+    for start, first in enumerate(aspects[:-1]):
+        coordinated = [first]
+        for match in aspects[start + 1:]:
+            separator = question[coordinated[-1].end():match.start()]
+            if not ASPECT_SEPARATOR.fullmatch(separator):
+                break
+            coordinated.append(match)
+        fields = list(dict.fromkeys(match.group() for match in coordinated))
+        if len(fields) >= 2:
+            tail = re.sub(r"^(?:을|를|이|가|은|는|도|만)", "", question[coordinated[-1].end():])
+            return [compact_space(f"{question[:first.start()]}{field} {tail}") for field in fields[:3]]
+    if COMPARISON_QUESTION.search(question):
         parts = [part.strip() for part in COMPARE_PARTS.split(question, maxsplit=2)]
         if 2 <= len(parts) <= 3 and all(query_words(part, fuzzy=True) for part in parts):
             shared = " ".join(query_words(parts[-1], fuzzy=True)[1:5])
-            return [f"{part} {shared}".strip()[:450] for part in parts[:-1]] + [parts[-1]]
+            queries = [f"{part} {shared}".strip()[:450] for part in parts[:-1]] + [parts[-1]]
+            if len({normalized(query) for query in queries}) == len(queries):
+                return queries
+    if SYNTHESIS_QUESTION.search(question) or COMPARISON_QUESTION.search(question):
+        phases = ("요청 제안", "회신 변경", "확정 승인 취소") if TIMELINE_QUESTION.search(question) else (
+            "제안 근거", "회신 결정 변경")
+        return [f"{question[:449 - len(phase)]} {phase}" for phase in phases]
     return [question]
 
 
@@ -458,8 +491,8 @@ class AnswerSessions:
             self.expire(time.monotonic())
 
     def begin(self, key):
-        now = time.monotonic()
         with self.lock:
+            now = time.monotonic()
             self.expire(now)
             if key in self.items:
                 _, turns = self.items[key]
@@ -477,8 +510,8 @@ class AnswerSessions:
             return
         ids = tuple(dict.fromkeys(ref["passage"] for claim in claims for ref in claim["citations"]))
         turn = (question, tuple(claim["text"] for claim in claims), ids)
-        now = time.monotonic()
         with self.lock:
+            now = time.monotonic()
             self.expire(now)
             current = self.items.get(key)
             if current and current[1] is handle:
@@ -495,14 +528,33 @@ class AnswerSessions:
 def follow_up_evidence(store, question, filters, turns):
     if not turns or not FOLLOW_UP.search(question):
         return "", []
-    ids = list(dict.fromkeys(passage for _, _, sources in reversed(turns) for passage in sources))[:12]
+    previous, _, ids = next((turn for turn in reversed(turns) if turn[2]), ("", (), ()))
+    ids = ids[:12]
     found = {row["passage"]: row for row in store.passages(ids, filters)}
     anchors = [found[passage] for passage in ids if passage in found][:6]
     if not anchors:
         return "", []
-    previous = turns[-1][0]
     subjects = list(dict.fromkeys(topic_key(row["subject"]) for row in anchors if row["subject"]))
     return (" ".join([*subjects[:2], previous])[:250], anchors)
+
+
+def follow_up_reply_sender(question):
+    match = FOLLOW_UP_REPLY.search(question) if FOLLOW_UP.search(question) else None
+    return compact_space(match["sender"]) if match else ""
+
+
+def follow_up_replies(store, anchors, filters, sender):
+    if not anchors:
+        return []
+    mails = list(dict.fromkeys(row["id"] for row in anchors))
+    scoped = {**filters, "tab": "mail"}
+    target = {**scoped, "sender": scoped.get("sender") or sender}
+    # Search both paths so a reply through an intervening sender can be found.
+    rows = [*anchors, *store.related(mails, target, hops=3), *store.related(mails, scoped, hops=3)]
+    visible = store.passages(list(dict.fromkeys(row["passage"] for row in rows)), scoped)
+    sender = normalized(sender).replace(" ", "")
+    replies = {row["passage"]: row for row in visible if sender in normalized(row["sender"]).replace(" ", "")}
+    return [replies.pop(row["passage"]) for row in rows if row["passage"] in replies]
 
 
 def combine_answer_evidence(pools, anchors=()):
@@ -512,7 +564,7 @@ def combine_answer_evidence(pools, anchors=()):
     for row in [*anchors, *(pool[index] for index in range(max(map(len, pools), default=0))
                             for pool in pools if index < len(pool))]:
         key = (row["fingerprint"], row["location"], row["attachment"], row["text"])
-        if key not in duplicates:
+        if row["passage"] not in found and key not in duplicates:
             found[row["passage"]] = row
             duplicates.add(key)
         if len(found) == ANSWER_EVIDENCE_LIMIT:

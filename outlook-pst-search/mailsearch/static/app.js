@@ -167,11 +167,19 @@ function showLocalControls() {
 }
 
 async function streamAnswer(payload, signal, progress) {
-  if (!globalThis.TextDecoderStream) return call("/api/answer", payload, signal);
-  const response = await fetch("/api/answer/stream", {
-    method: "POST", headers: { "X-Mail-Session": token, "Content-Type": "application/json" },
-    body: JSON.stringify(payload), signal, cache: "no-store",
-  });
+  if (!globalThis.ReadableStream?.prototype.getReader || !globalThis.TextDecoder) {
+    return call("/api/answer", payload, signal);
+  }
+  let response;
+  try {
+    response = await fetch("/api/answer/stream", {
+      method: "POST", headers: { "X-Mail-Session": token, "Content-Type": "application/json" },
+      body: JSON.stringify(payload), signal, cache: "no-store",
+    });
+  } catch (error) {
+    if (error instanceof TypeError) throw new Error(issueNames.app_disconnected);
+    throw error;
+  }
   if ([404, 405].includes(response.status)) return call("/api/answer", payload, signal);
   if (!response.ok) {
     const data = await response.json();
@@ -180,19 +188,21 @@ async function streamAnswer(payload, signal, progress) {
   if (!response.body || !response.headers.get("Content-Type")?.startsWith("text/event-stream")) {
     throw new Error(issueNames.app_disconnected);
   }
-  const reader = response.body.pipeThrough(new TextDecoderStream()).getReader();
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
   try {
     let buffer = "";
     for (;;) {
       const { value, done } = await reader.read();
       if (done) throw new Error(issueNames.app_disconnected);
-      buffer += value;
-      let end;
-      while ((end = buffer.indexOf("\n\n")) !== -1) {
-        const line = buffer.slice(0, end).split("\n").find((item) => item.startsWith("data: "));
-        buffer = buffer.slice(end + 2);
-        if (!line) continue;
-        const event = JSON.parse(line.slice(6));
+      buffer += decoder.decode(value, { stream: true });
+      let boundary;
+      while ((boundary = /\r?\n\r?\n/.exec(buffer))) {
+        const lines = buffer.slice(0, boundary.index).split(/\r?\n/);
+        buffer = buffer.slice(boundary.index + boundary[0].length);
+        const data = lines.filter((line) => line.startsWith("data:")).map((line) => line.slice(5).replace(/^ /, ""));
+        if (!data.length) continue;
+        const event = JSON.parse(data.join("\n"));
         if (event.stage === "done") return event;
         progress(event);
       }
@@ -573,6 +583,7 @@ function showAnswer(data) {
     ambiguous: data.claims.length ? "근거에 서로 다른 내용이 있습니다. 각 원문을 확인해 주세요." : "여러 건이 해당합니다. 품번이나 기간을 질문에 추가해 주세요.",
     insufficient: "검색된 자료에서 답을 확인하지 못했습니다.",
     model_busy: "로컬 AI가 다른 질문을 처리 중입니다. 잠시 후 다시 시도하세요.",
+    answer_unavailable: "답변 처리를 완료하지 못했습니다. 잠시 후 다시 시도하세요.",
     model_not_configured: "로컬 AI 모델을 연결하면 근거를 바탕으로 답변할 수 있습니다.",
     model_unavailable: "로컬 AI 모델을 열지 못했습니다. 아래 메일을 직접 확인할 수 있습니다.",
     index_unavailable: issueNames.index_unavailable,
@@ -661,11 +672,12 @@ element("reset-conversation").addEventListener("click", async () => {
   clearSearch();
   setQuestionContext("");
   element("query").focus();
+  const cleared = request;
   if (old) {
     try {
       await call("/api/answer/reset", { session_id: old });
     } catch (error) {
-      notice(error.message);
+      if (request === cleared) notice(error.message);
     }
   }
 });
