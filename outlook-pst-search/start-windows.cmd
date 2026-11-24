@@ -18,7 +18,16 @@ if defined GIT_PDFTOTEXT set "ARGS=%ARGS% --pdftotext "%GIT_PDFTOTEXT%""
 where py >nul 2>nul
 if errorlevel 1 goto use_python
 py -3 -m mailsearch %ARGS%
-exit /b %errorlevel%
+set "MAILSEARCH_EXIT_CODE=%errorlevel%"
+goto finished
 :use_python
 python -m mailsearch %ARGS%
-exit /b %errorlevel%
+set "MAILSEARCH_EXIT_CODE=%errorlevel%"
+
+:finished
+if defined OUTLOOK_MAILSEARCH_NO_PAUSE exit /b %MAILSEARCH_EXIT_CODE%
+echo(
+echo Mail search stopped. Exit code: %MAILSEARCH_EXIT_CODE%
+echo Check the messages above or app-runtime.log in the app data folder.
+pause
+exit /b %MAILSEARCH_EXIT_CODE%
