@@ -304,6 +304,19 @@ class Store:
             conn.execute("UPDATE mails SET kind=document_kind(subject) WHERE kind IN ('document','pcf') "
                          "AND kind<>document_kind(subject)")
             conn.execute("INSERT INTO terms(terms,rank) VALUES('secure-delete',1)")
+            if not conn.execute("SELECT 1 FROM sqlite_schema WHERE name='quick_terms'").fetchone():
+                # Build once from the saved index. The caller's transaction publishes
+                # the table and its contents together.
+                conn.execute("CREATE VIRTUAL TABLE quick_terms USING fts5(subject, people, label, tokenize='unicode61')")
+                conn.execute("INSERT INTO quick_terms(quick_terms,rank) VALUES('secure-delete',1)")
+                conn.execute('''CREATE TRIGGER quick_terms_remove AFTER DELETE ON mails BEGIN
+                    DELETE FROM quick_terms WHERE rowid=old.id;
+                END''')
+                conn.create_function("index_text", 1, index_text)
+                conn.execute('''INSERT INTO quick_terms(rowid,subject,people,label)
+                    SELECT m.id,index_text(m.subject),index_text(m.sender || ' ' || m.recipient),
+                           index_text(coalesce((SELECT group_concat(a.name, ' ') FROM attachments a WHERE a.mail=m.id),''))
+                    FROM mails m''')
 
     @contextlib.contextmanager
     def connection(self):
@@ -355,14 +368,15 @@ class Store:
                 ids.append(row["id"])
         return ids
 
-    def scope(self, filters, extra=()):
+    def scope(self, filters, extra=(), *, check_access=True):
         clauses = [VISIBLE_VERSION]
         params = []
         if filters.get("source"):
             clauses.append("m.source=?")
             params.append(filters["source"])
-        clauses.extend(("source_readable(s.path,s.kind)",
-                        "CASE WHEN m.kind<>'mail' THEN document_readable(s.path,m.item) ELSE 1 END"))
+        if check_access:
+            clauses.extend(("source_readable(s.path,s.kind)",
+                            "CASE WHEN m.kind<>'mail' THEN document_readable(s.path,m.item) ELSE 1 END"))
         if filters.get("regular_only"):
             clauses.append("m.kind IN ('mail','document')")
         for name, col in {"sender": "m.sender", "recipient": "m.recipient", "subject": "m.subject"}.items():
@@ -414,7 +428,17 @@ class Store:
                 "INSERT INTO attachments(mail,name,status) VALUES(?,?,'대기')", (mail_id, name)
             ).lastrowid
             self.add_passage(conn, mail_id, mail, attachment_id, name, "파일명", 0, name)
+        self.add_quick_terms(conn, mail_id, mail)
         return mail_id
+
+    @staticmethod
+    def add_quick_terms(conn, mail_id, mail):
+        names = " ".join(name for name, _ in mail["attachments"])
+        conn.execute(
+            "INSERT INTO quick_terms(rowid,subject,people,label) VALUES(?,?,?,?)",
+            (mail_id, index_text(mail["subject"]), index_text(mail["sender"] + " " + mail["recipient"]),
+             index_text(names)),
+        )
 
     def add_passage(self, conn, mail_id, mail, attachment, name, location, start, text, search_label=None):
         passage_id = conn.execute(
@@ -462,6 +486,7 @@ class Store:
             for begin, end in zip(offsets, [*offsets[1:], len(text)]):
                 for start, segment in sections(text[begin:end]):
                     self.add_passage(conn, mail_id, mail, attachment_id, doc["name"], location, begin + start, segment)
+        self.add_quick_terms(conn, mail_id, mail)
         return mail_id
 
     def adopt_mail(self, conn, version, old_id):
@@ -471,6 +496,10 @@ class Store:
                SELECT source,?,item,fingerprint,folder,subject,sender,recipient,sent,message_id,topic,body,kind
                FROM mails WHERE id=?""", (version, old_id)
         ).lastrowid
+        conn.execute(
+            "INSERT INTO quick_terms(rowid,subject,people,label) SELECT ?,subject,people,label FROM quick_terms WHERE rowid=?",
+            (new_id, old_id),
+        )
         conn.execute("INSERT INTO replies(mail,parent) SELECT ?,parent FROM replies WHERE mail=?", (new_id, old_id))
         conn.execute("INSERT INTO pcf_documents SELECT ?,data FROM pcf_documents WHERE mail=?", (new_id, old_id))
         attachments = {}
@@ -524,6 +553,63 @@ class Store:
     def save_pst_files(self, conn, source, signatures):
         conn.execute("DELETE FROM pst_files WHERE source=?", (source,))
         conn.executemany("INSERT INTO pst_files VALUES(?,?,?)", ((source, *item) for item in signatures.items()))
+
+    def quick_search(self, question, filters, limit=20):
+        """Search one metadata row per message, then verify access to ranked results."""
+        where, params = self.scope(filters, check_access=False)
+        if question:
+            words = query_words(question)
+            if not words:
+                return []
+            expressions = dict.fromkeys(fts_query(words, mode) for mode in ("terms", "grams"))
+            from_clause = f"quick_terms JOIN mails m ON m.id=quick_terms.rowid {JOIN}"
+            where = "quick_terms MATCH ? AND " + where
+            params = [" OR ".join(expressions), *params]
+            order = "bm25(quick_terms,7.0,3.0,5.0),m.sent DESC,m.id DESC"
+        else:
+            words = []
+            from_clause = f"mails m {JOIN}"
+            order = "m.sent DESC,m.id DESC"
+
+        with self.connection() as conn:
+            candidates = conn.execute(
+                f"""SELECT {MAIL_COLUMNS},s.kind source_kind FROM {from_clause}
+                    WHERE {where} ORDER BY {order}""", params,
+            )
+            results = []
+            seen = set()
+            available = {}
+            try:
+                for candidate in candidates:
+                    key = candidate["fingerprint"]
+                    if key in seen:
+                        continue
+                    source = candidate["source"]
+                    path = candidate["path"]
+                    if source not in available:
+                        available[source] = source_readable(path, candidate["source_kind"])
+                    if not available[source]:
+                        continue
+                    if candidate["kind"] != "mail" and not document_readable(path, candidate["item"]):
+                        continue
+                    parts = conn.execute(
+                        """SELECT p.id passage,p.text,p.location,p.start,a.name attachment
+                           FROM passages p LEFT JOIN attachments a ON a.id=p.attachment
+                           WHERE p.mail=? AND (p.id=(SELECT min(id) FROM passages WHERE mail=?)
+                                               OR p.location='파일명')
+                           ORDER BY p.id""", (candidate["id"], candidate["id"]),
+                    ).fetchall()
+                    if not parts:
+                        continue
+                    part = next((row for row in parts if row["location"] == "파일명"
+                                 and any(word in normalized(row["text"]) for word in words)), parts[0])
+                    seen.add(key)
+                    results.append({**dict(candidate), **dict(part)})
+                    if len(results) == limit:
+                        break
+            finally:
+                candidates.close()
+        return results
 
     def lexical(self, question, filters, fuzzy=False, limit=100):
         where, params = self.scope(filters)
