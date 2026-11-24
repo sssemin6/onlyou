@@ -1282,6 +1282,61 @@ class Integration(unittest.TestCase):
         self.assertFalse((Path(run.call_args.kwargs["cwd"]).parent / "export-complete").exists())
         self.assertEqual(run.call_args.args[0][-3:], ["-o", ".", str(pst)])
 
+    def test_pst_embedding_reports_committed_batches_and_reuses_them_after_disconnect(self):
+        target = self.mail / "progress.pst"
+        target.write_bytes(b"!BDN" + bytes(4) + b"SM" + bytes(2))
+        extracted = Path(self.workspace.name) / "pst-export"
+        extracted.mkdir()
+        for item in range(1, 31):
+            message = EmailMessage()
+            message["Subject"] = f"PST progress fixture {item}"
+            message["Message-ID"] = f"<fixture-{item}@example.invalid>"
+            message.set_content(f"Sample data for embedding progress item {item}.")
+            (extracted / str(item)).write_bytes(message.as_bytes())
+
+        second_batch = threading.Event()
+        release = threading.Event()
+        sizes = []
+
+        def embed(texts, timeout):
+            sizes.append(len(texts))
+            if len(sizes) == 2:
+                second_batch.set()
+                release.wait(timeout=8)
+                error = ConnectionAbortedError("private diagnostic text")
+                error.winerror = 10053
+                raise error
+            return [[1., .05, .12] for _ in texts]
+
+        with (patch.object(self.indexer, "export", return_value=extracted),
+              patch.object(self.ai, "embed", side_effect=embed),
+              self.assertLogs("mailsearch.gateway", level="ERROR") as logs):
+            status, result = self.call("/api/sources", {"path": str(target)})
+            self.assertEqual(status, 202)
+            source = result["source"]
+            try:
+                self.assertTrue(second_batch.wait(timeout=8))
+                status, result = self.call("/api/sources")
+                self.assertEqual(status, 200)
+                row = next(item for item in result["sources"] if item["id"] == source)
+                self.assertEqual((row["state"], row["embedding_done"], row["embedding_total"]), ("embeddings", 24, 30))
+            finally:
+                release.set()
+            row = await_source(self.store, source, {"ready", "error"})
+            self.assertEqual((row["state"], row["issue"]), ("ready", "embedding_connection_aborted"))
+            self.assertEqual((row["embedding_done"], row["embedding_total"]), (24, 30))
+            self.assertTrue(self.call("/api/search", {"query": '"Sample data"', "filters": {"source": source}})[1]["results"])
+            self.assertIn("winerror=10053", logs.output[0])
+            self.assertNotIn("private diagnostic text", logs.output[0])
+            deadline = time.monotonic() + 3
+            while source in self.indexer.events and time.monotonic() < deadline:
+                time.sleep(.01)
+            self.assertEqual(self.call("/api/source-action", {"source": source, "action": "refresh"})[0], 202)
+            row = await_source(self.store, source, {"ready", "error"})
+            self.assertEqual((row["state"], row["issue"], row["embedding_done"], row["embedding_total"]),
+                             ("ready", None, 30, 30))
+            self.assertEqual(sizes, [24, 6, 6])
+
     def test_pst_numbered_exports_index_and_empty_refresh_keeps_previous_index(self):
         pst = self.mail / "archive.pst"
         pst.write_bytes(b"!BDN" + bytes(4) + b"SM" + bytes(2))
