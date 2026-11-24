@@ -2,6 +2,7 @@
 import datetime
 import hashlib
 import http.client
+import logging
 import os
 import shutil
 import sqlite3
@@ -20,6 +21,7 @@ from .store import buckets, document_kind, document_identity, now, pack_vector, 
 
 NO_MAIL = {"pst_no_mail", "eml_no_mail"}
 PST_PROGRESS_INTERVAL = 5
+runtime_logger = logging.getLogger("mailsearch.runtime")
 
 
 def pst_access_error(exc):
@@ -50,7 +52,12 @@ class Indexer:
         self.worker = None
         self.stopping = False
         with store.connection() as conn:
-            conn.execute("UPDATE sources SET state='paused',issue='interrupted' WHERE state IN ('extracting','headers','attachments','embeddings')")
+            recovered = conn.execute(
+                "UPDATE sources SET state='queued',issue=NULL WHERE pending IS NOT NULL "
+                "AND state IN ('extracting','headers','attachments','embeddings')"
+            ).rowcount
+            if recovered:
+                runtime_logger.info("Recovered %d interrupted indexing job(s)", recovered)
             # Older versions completed an import even when no message was indexed.
             conn.execute("""
                 UPDATE sources SET active=NULL, updated=NULL,
@@ -159,6 +166,10 @@ class Indexer:
                 self.worker = threading.Thread(target=self.run, name="archive-indexer", daemon=True)
                 self.worker.start()
 
+    def has_work(self):
+        worker = self.worker
+        return worker is not None and worker.is_alive()
+
     def stop(self):
         with self.lock:
             self.stopping = True
@@ -171,8 +182,20 @@ class Indexer:
     def run(self):
         while True:
             with self.lock:
-                task = next((row for row in self.store.sources() if row["state"] in {"queued", "removing"}), None)
-                if self.stopping or task is None:
+                if self.stopping:
+                    self.worker = None
+                    return
+                try:
+                    with self.store.connection() as conn:
+                        task = conn.execute(
+                            "SELECT * FROM sources WHERE state IN ('queued','removing') ORDER BY id LIMIT 1"
+                        ).fetchone()
+                except sqlite3.Error as exc:
+                    runtime_logger.error("Cannot read indexing queue (%s, sqlite=%s)",
+                                         type(exc).__name__, getattr(exc, "sqlite_errorname", None))
+                    self.worker = None
+                    return
+                if task is None:
                     self.worker = None
                     return
                 source = task["id"]
@@ -191,26 +214,46 @@ class Indexer:
                         conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
                 else:
                     self.process(task, event)
-            except (Paused, ImportIssue, OSError, sqlite3.Error) as exc:
-                code = "disk_or_source"
+            except Paused:
+                # A manual pause already changed the row. During shutdown, retain
+                # the current revision and queue it for the next process.
+                try:
+                    with self.store.connection() as conn:
+                        saved = conn.execute(
+                            "UPDATE sources SET state='queued',issue=NULL "
+                            "WHERE id=? AND state IN ('extracting','headers','attachments','embeddings')",
+                            (source,),
+                        ).rowcount
+                    if saved:
+                        runtime_logger.info("Saved index progress at shutdown (source=%d)", source)
+                except sqlite3.Error as exc:
+                    runtime_logger.error("Cannot save index status (source=%d, sqlite=%s)",
+                                         source, getattr(exc, "sqlite_errorname", None))
+            except Exception as exc:
                 if isinstance(exc, ImportIssue):
                     code = str(exc)
-                elif isinstance(exc, Paused):
-                    code = "interrupted"
+                elif isinstance(exc, (OSError, sqlite3.Error)):
+                    code = "disk_or_source"
+                else:
+                    code = "index_unexpected"
+                runtime_logger.error(
+                    "Indexing job failed (source=%d, issue=%s, type=%s, errno=%s, winerror=%s, sqlite=%s)",
+                    source, code, type(exc).__name__, getattr(exc, "errno", None),
+                    getattr(exc, "winerror", None), getattr(exc, "sqlite_errorname", None),
+                )
                 try:
                     with self.store.connection() as conn:
                         if task["state"] == "removing":
                             conn.execute("UPDATE sources SET state='remove_failed',issue=? WHERE id=?", (code, source))
                         else:
-                            if isinstance(exc, Paused):
-                                state = "paused"
-                            else:
-                                state = "empty" if code in NO_MAIL else "error"
+                            state = "empty" if code in NO_MAIL else "error"
                             conn.execute(
-                                "UPDATE sources SET state=?,issue=? WHERE id=? AND state NOT IN ('removing','ready')",
+                                "UPDATE sources SET state=?,issue=? WHERE id=? AND state NOT IN ('removing','ready','paused')",
                                 (state, code, source),
                             )
-                except sqlite3.Error:
+                except sqlite3.Error as write_error:
+                    runtime_logger.error("Cannot record index failure (source=%d, sqlite=%s)",
+                                         source, getattr(write_error, "sqlite_errorname", None))
                     # The last committed index remains available even if the disk is full.
                     with self.lock:
                         self.worker = None
@@ -297,6 +340,14 @@ class Indexer:
                 with stable_input(pst):
                     if not self.pst_header(pst):
                         raise ImportIssue("pst_invalid")
+                    checkpoint = slot / "pst-signature"
+                    if checkpoint.exists():
+                        if checkpoint.read_text(encoding="ascii") != signature:
+                            raise ImportIssue("changed")
+                    else:
+                        temporary = slot / "pst-signature.tmp"
+                        temporary.write_text(signature, encoding="ascii")
+                        temporary.replace(checkpoint)
                     output = self.export(pst, slot, event, source)
                     if read_signature(pst) != signature:
                         raise ImportIssue("changed")
@@ -421,12 +472,25 @@ class Indexer:
             if path.is_dir():
                 extras, carried, skipped_psts, signatures, deferred = self.import_folder_psts(
                     path, stage, event, self.store.pst_files(source), source)
-                if skipped_psts or deferred:
-                    with self.store.connection() as conn:
-                        conn.executemany("INSERT INTO problems VALUES(?,?,?,'pst_in_use')",
-                                         ((source, version, item) for item in deferred))
-                        conn.execute("UPDATE sources SET omitted=omitted+? WHERE id=?",
-                                     (skipped_psts + len(deferred), source))
+                with self.store.connection() as conn:
+                    conn.execute("DELETE FROM problems WHERE source=? AND version=? AND code='pst_in_use'",
+                                 (source, version))
+                    conn.executemany("INSERT INTO problems VALUES(?,?,?,'pst_in_use')",
+                                     ((source, version, item) for item in deferred))
+                    # The same folder may be scanned again after a restart. Rebuild
+                    # the count from the current PST scan and committed items.
+                    omitted_documents = conn.execute(
+                        "SELECT COUNT(*) FROM problems WHERE source=? AND version=? "
+                        "AND code NOT IN ('parse','pst_in_use')", (source, version),
+                    ).fetchone()[0]
+                    omitted_attachments = conn.execute(
+                        "SELECT COUNT(*) FROM attachments a JOIN mails m ON m.id=a.mail "
+                        "WHERE m.source=? AND m.version=? AND a.status NOT IN ('대기','완료') "
+                        "AND NOT EXISTS(SELECT 1 FROM passages p WHERE p.mail=m.id AND p.attachment=a.id)",
+                        (source, version),
+                    ).fetchone()[0]
+                    omitted = skipped_psts + len(deferred) + omitted_documents + omitted_attachments
+                    conn.execute("UPDATE sources SET omitted=? WHERE id=?", (omitted, source))
         self.check(event)
         self.state(source, "headers")
         self.index_headers(root, source, version, event, numbered=is_pst, extras=extras,
