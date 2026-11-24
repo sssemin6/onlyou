@@ -9,11 +9,13 @@ import sys
 import re
 import sqlite3
 import struct
+import time
 import unicodedata
-from collections import defaultdict
+from collections import defaultdict, OrderedDict
+from threading import Lock, local
 from datetime import datetime, timezone
-from pathlib import Path
 from functools import lru_cache
+from pathlib import Path
 
 from .pcf import COMMENT_HEADER, PCF_CELL, PCF_FIELDS, case_key, cell_location, pcf_field_value
 
@@ -56,6 +58,7 @@ CREATE TABLE IF NOT EXISTS pcf_documents (
     mail INTEGER PRIMARY KEY REFERENCES mails(id) ON DELETE CASCADE, data TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS passages_mail ON passages(mail);
+CREATE INDEX IF NOT EXISTS passages_filenames ON passages(mail) WHERE location='파일명';
 CREATE INDEX IF NOT EXISTS passages_attachment ON passages(attachment) WHERE attachment IS NOT NULL;
 CREATE VIRTUAL TABLE IF NOT EXISTS terms USING fts5(subject, people, label, text, tokenize='unicode61');
 CREATE TRIGGER IF NOT EXISTS passage_remove AFTER DELETE ON passages BEGIN
@@ -80,8 +83,32 @@ CREATE TABLE IF NOT EXISTS vector_buckets (
     PRIMARY KEY(model, bucket, passage)
 ) WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS bucket_passage ON vector_buckets(passage);
+CREATE TABLE IF NOT EXISTS attachment_extracts (
+    digest BLOB PRIMARY KEY, locations TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS embedding_values (
+    model TEXT NOT NULL, digest BLOB NOT NULL, value BLOB NOT NULL,
+    PRIMARY KEY(model,digest)
+) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS embedding_refs (
+    model TEXT NOT NULL, passage INTEGER NOT NULL REFERENCES passages(id) ON DELETE CASCADE,
+    digest BLOB NOT NULL, PRIMARY KEY(model,passage),
+    FOREIGN KEY(model,digest) REFERENCES embedding_values(model,digest)
+) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS embedding_ref_passage ON embedding_refs(passage);
+CREATE INDEX IF NOT EXISTS embedding_ref_value ON embedding_refs(model,digest);
+CREATE TRIGGER IF NOT EXISTS embedding_ref_remove AFTER DELETE ON embedding_refs BEGIN
+    DELETE FROM embedding_values WHERE model=old.model AND digest=old.digest
+      AND NOT EXISTS(SELECT 1 FROM embedding_refs r WHERE r.model=old.model AND r.digest=old.digest);
+END;
+CREATE VIEW IF NOT EXISTS searchable_vectors AS
+    SELECT model,passage,value FROM vectors
+    UNION ALL
+    SELECT r.model,r.passage,v.value FROM embedding_refs r
+    JOIN embedding_values v ON v.model=r.model AND v.digest=r.digest;
+
 """
-MAIL_COLUMNS = "m.id,m.source,m.fingerprint,m.folder,m.subject,m.sender,m.recipient,m.sent,m.kind,m.item,s.path,s.updated"
+MAIL_COLUMNS = "m.id,m.source,m.fingerprint,m.folder,m.subject,m.sender,m.recipient,m.sent,m.kind,m.item,s.path,s.updated,s.kind source_kind"
 JOIN = "JOIN sources s ON s.id=m.source"
 VISIBLE_VERSION = """m.version=coalesce(s.active,s.pending)
     AND (s.active IS NOT NULL OR coalesce(s.issue,'')<>'changed')"""
@@ -243,6 +270,37 @@ def sections(text, size=1100):
         position = end - 120
 
 
+REPLY_START = re.compile(
+    r"^\s*(?:-{2,}\s*(?:original message|원본 메시지|original appointment)\s*-{2,}|"
+    r"on .+ wrote:)\s*$", re.I,
+)
+REPLY_FROM = re.compile(r"^\s*(?:From|보낸\s*사람)\s*:", re.I)
+REPLY_SENT = re.compile(r"^\s*(?:Sent|Date|보낸\s*날짜)\s*:", re.I)
+QUOTED_LINE = re.compile(r"^\s*>+(?=\s|\w|$)")
+SIGN_OFF = re.compile(r"^\s*(?:best regards|kind regards|sincerely|감사합니다)[,.!]?\s*$", re.I)
+CONTACT = re.compile(r"(?:\b(?:tel|mobile|fax|email)\s*[:.]|[\w.+-]+@[\w.-]+\.[\w]+|\d{2,4}[- ]\d{3,4}[- ]\d{4})", re.I)
+
+
+def mail_sections(body):
+    """Yield raw offsets while excluding recognized reply and signature blocks."""
+    lines = body.splitlines(keepends=True)
+    offset = start = 0
+    for i, line in enumerate(lines):
+        boundary = (REPLY_START.match(line.rstrip("\r\n")) or line.rstrip("\r\n") == "-- "
+                    or (REPLY_FROM.match(line) and any(REPLY_SENT.match(item) for item in lines[i + 1:i + 5]))
+                    or (0 < len(lines) - i <= 7 and SIGN_OFF.match(line)
+                        and any(CONTACT.search(item) for item in lines[i + 1:])))
+        if boundary or QUOTED_LINE.match(line):
+            if body[start:offset].strip():
+                yield from ((start + pos, text) for pos, text in sections(body[start:offset]))
+            if boundary:
+                return
+            start = offset + len(line)
+        offset += len(line)
+    if body[start:offset].strip():
+        yield from ((start + pos, text) for pos, text in sections(body[start:offset]))
+
+
 def pack_vector(values):
     if not isinstance(values, list) or not 1 <= len(values) <= 4096:
         raise ValueError("vector")
@@ -258,6 +316,15 @@ def vector_array(blob):
     if sys.byteorder != "little":
         result.byteswap()
     return result
+
+
+@lru_cache(maxsize=1)
+def optional_numpy():
+    try:
+        import numpy
+        return numpy
+    except (ImportError, OSError):
+        return None
 
 
 def buckets(vector):
@@ -283,6 +350,10 @@ class Store:
         if os.name != "nt":
             self.root.chmod(0o700)
         self.db = self.root / "mail.sqlite"
+        self.local = local()
+        self.vector_index = None
+        self.access_cache = OrderedDict()
+        self.access_cache_lock = Lock()
         with self.connection() as conn:
             conn.execute("PRAGMA journal_mode=WAL")
             conn.executescript(SCHEMA)
@@ -300,6 +371,15 @@ class Store:
                 suffixes = ("pdf", "docx", "xlsx", "txt", "doc", "xls")
                 conn.execute("UPDATE mails SET kind='document' WHERE " +
                              " OR ".join("item LIKE '%.' || ?" for _ in suffixes), suffixes)
+            for table, column in (("attachments", "content_key"), ("passages", "embedding_key")):
+                if column not in {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}:
+                    conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} BLOB")
+            conn.execute("CREATE INDEX IF NOT EXISTS attachment_content_key ON attachments(content_key)")
+            conn.execute("""CREATE TRIGGER IF NOT EXISTS attachment_extract_remove AFTER DELETE ON attachments
+                WHEN old.content_key IS NOT NULL BEGIN
+                    DELETE FROM attachment_extracts WHERE digest=old.content_key
+                      AND NOT EXISTS(SELECT 1 FROM attachments WHERE content_key=old.content_key);
+                END""")
             conn.create_function("document_kind", 1, document_kind)
             conn.execute("UPDATE mails SET kind=document_kind(subject) WHERE kind IN ('document','pcf') "
                          "AND kind<>document_kind(subject)")
@@ -319,19 +399,112 @@ class Store:
                     FROM mails m''')
 
     @contextlib.contextmanager
-    def connection(self):
+    def thread_connection(self):
+        if getattr(self.local, "connection_state", None) is not None:
+            yield
+            return
+        state = {"connection": None}
+        self.local.connection_state = state
+        try:
+            yield
+        finally:
+            if state["connection"] is not None:
+                state["connection"].close()
+            self.local.connection_state = None
+
+    @contextlib.contextmanager
+    def search_session(self, profile=None, defer_access=False):
+        previous = getattr(self.local, "search", None)
+        self.local.search = {"profile": profile, "defer": defer_access}
+        try:
+            with self.thread_connection():
+                yield
+        finally:
+            self.local.search = previous
+
+    def measure(self, stage):
+        state = getattr(self.local, "search", None)
+        profile = state["profile"] if state else None
+        return profile.measure(stage) if profile else contextlib.nullcontext()
+
+    def deferred_access(self):
+        state = getattr(self.local, "search", None)
+        return bool(state and state["defer"])
+
+    def cached_access(self, key):
+        with self.access_cache_lock:
+            cached = self.access_cache.get(key)
+            if cached and cached[0] > time.monotonic():
+                self.access_cache.move_to_end(key)
+                return cached[1]
+            self.access_cache.pop(key, None)
+            return None
+
+    def result_access(self, row, sources, documents, *, cached_only=False, refresh=False):
+        source_key = ("source", row["source"], row["path"], row["source_kind"])
+        doc_key = ("document", row["source"], row["path"], row["item"])
+
+        def verify(key, memo, check, *args):
+            if key not in memo:
+                decision = None if refresh else self.cached_access(key)
+                if decision is None and not cached_only:
+                    with self.measure("access"):
+                        decision = check(*args)
+                    # A short positive lease applies only to rendering search
+                    # results. Opening or sending evidence always rechecks.
+                    with self.access_cache_lock:
+                        self.access_cache[key] = (time.monotonic() + (10 if decision else 2), decision)
+                        self.access_cache.move_to_end(key)
+                        if len(self.access_cache) > 2048:
+                            self.access_cache.popitem(last=False)
+                memo[key] = decision
+            return memo[key]
+
+        readable = verify(source_key, sources, source_readable, row["path"], row["source_kind"])
+        if readable is not True or row["kind"] == "mail":
+            return readable
+        return verify(doc_key, documents, document_readable, row["path"], row["item"])
+
+    def readable(self, row, sources, documents):
+        return self.deferred_access() or self.result_access(row, sources, documents, refresh=True)
+
+    def visible_rows(self, rows, limit=None):
+        sources, documents = {}, {}
+        visible = []
+        for row in rows:
+            if self.readable(row, sources, documents):
+                visible.append(dict(row))
+                if len(visible) == limit:
+                    break
+        return visible
+
+    def open_connection(self):
         conn = sqlite3.connect(self.db, timeout=10)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys=ON")
         conn.execute("PRAGMA secure_delete=ON")
-        conn.create_function("source_readable", 2, lru_cache(maxsize=2048)(source_readable))
-        conn.create_function("document_readable", 2, lru_cache(maxsize=2048)(document_readable))
+        conn.execute("PRAGMA cache_size=-131072")
+        conn.execute("PRAGMA mmap_size=536870912")
+        conn.execute("PRAGMA temp_store=MEMORY")
+
         conn.create_function("pcf_field_matches", 4, pcf_field_value)
+        return conn
+
+    @contextlib.contextmanager
+    def connection(self):
+        state = getattr(self.local, "connection_state", None)
+        if state is None:
+            conn = self.open_connection()
+        else:
+            if state["connection"] is None:
+                state["connection"] = self.open_connection()
+            conn = state["connection"]
         try:
             with conn:
                 yield conn
         finally:
-            conn.close()
+            if state is None:
+                conn.close()
 
     def source(self, source):
         with self.connection() as conn:
@@ -368,15 +541,12 @@ class Store:
                 ids.append(row["id"])
         return ids
 
-    def scope(self, filters, extra=(), *, check_access=True):
+    def scope(self, filters, extra=()):
         clauses = [VISIBLE_VERSION]
         params = []
         if filters.get("source"):
             clauses.append("m.source=?")
             params.append(filters["source"])
-        if check_access:
-            clauses.extend(("source_readable(s.path,s.kind)",
-                            "CASE WHEN m.kind<>'mail' THEN document_readable(s.path,m.item) ELSE 1 END"))
         if filters.get("regular_only"):
             clauses.append("m.kind IN ('mail','document')")
         for name, col in {"sender": "m.sender", "recipient": "m.recipient", "subject": "m.subject"}.items():
@@ -421,8 +591,13 @@ class Store:
         mail_id = cursor.lastrowid
         parents = list(dict.fromkeys(re.findall(r"<[^<>\s]+>", mail["reply_ids"])))[:100]
         conn.executemany("INSERT INTO replies(mail,parent) VALUES(?,?)", ((mail_id, x) for x in parents))
-        for start, text in sections(mail["body"] or mail["subject"] or "본문 없음"):
-            self.add_passage(conn, mail_id, mail, None, "", "본문" if mail["body"] else "제목", start, text)
+        wrote_body = False
+        for start, text in mail_sections(mail["body"]):
+            self.add_passage(conn, mail_id, mail, None, "", "본문", start, text)
+            wrote_body = True
+        if not wrote_body:
+            for start, text in sections(mail["subject"] or "본문 없음"):
+                self.add_passage(conn, mail_id, mail, None, "", "제목", start, text)
         for name, _ in mail["attachments"]:
             attachment_id = conn.execute(
                 "INSERT INTO attachments(mail,name,status) VALUES(?,?,'대기')", (mail_id, name)
@@ -440,10 +615,11 @@ class Store:
              index_text(names)),
         )
 
-    def add_passage(self, conn, mail_id, mail, attachment, name, location, start, text, search_label=None):
+    def add_passage(self, conn, mail_id, mail, attachment, name, location, start, text,
+                    search_label=None, embedding_key=None):
         passage_id = conn.execute(
-            "INSERT INTO passages(mail,attachment,location,start,text) VALUES(?,?,?,?,?)",
-            (mail_id, attachment, location, start, text),
+            "INSERT INTO passages(mail,attachment,location,start,text,embedding_key) VALUES(?,?,?,?,?,?)",
+            (mail_id, attachment, location, start, text, embedding_key),
         ).lastrowid
         conn.execute(
             "INSERT INTO terms(rowid,subject,people,label,text) VALUES(?,?,?,?,?)",
@@ -503,23 +679,27 @@ class Store:
         conn.execute("INSERT INTO replies(mail,parent) SELECT ?,parent FROM replies WHERE mail=?", (new_id, old_id))
         conn.execute("INSERT INTO pcf_documents SELECT ?,data FROM pcf_documents WHERE mail=?", (new_id, old_id))
         attachments = {}
-        for row in conn.execute("SELECT id,name,status FROM attachments WHERE mail=? ORDER BY id", (old_id,)):
+        for row in conn.execute("SELECT id,name,status,content_key FROM attachments WHERE mail=? ORDER BY id", (old_id,)):
             attachments[row["id"]] = conn.execute(
-                "INSERT INTO attachments(mail,name,status) VALUES(?,?,?)", (new_id, row["name"], row["status"])
+                "INSERT INTO attachments(mail,name,status,content_key) VALUES(?,?,?,?)", (new_id, row["name"], row["status"], row["content_key"])
             ).lastrowid
-        for row in conn.execute("SELECT id,attachment,location,start,text FROM passages WHERE mail=? ORDER BY id", (old_id,)):
+        for row in conn.execute("SELECT id,attachment,location,start,text,embedding_key FROM passages WHERE mail=? ORDER BY id", (old_id,)):
             passage = conn.execute(
-                "INSERT INTO passages(mail,attachment,location,start,text) VALUES(?,?,?,?,?)",
-                (new_id, attachments.get(row["attachment"]), row["location"], row["start"], row["text"]),
+                "INSERT INTO passages(mail,attachment,location,start,text,embedding_key) VALUES(?,?,?,?,?,?)",
+                (new_id, attachments.get(row["attachment"]), row["location"], row["start"], row["text"], row["embedding_key"]),
             ).lastrowid
             conn.execute(
                 "INSERT INTO terms(rowid,subject,people,label,text) SELECT ?,subject,people,label,text FROM terms WHERE rowid=?",
                 (passage, row["id"]),
             )
             conn.execute("INSERT INTO vectors(passage,model,value) SELECT ?,model,value FROM vectors WHERE passage=?", (passage, row["id"]))
-            conn.executemany(
+            conn.execute(
+                "INSERT INTO embedding_refs(model,passage,digest) SELECT model,?,digest FROM embedding_refs WHERE passage=?",
+                (passage, row["id"]),
+            )
+            conn.execute(
                 "INSERT INTO vector_buckets(model,bucket,passage) SELECT model,bucket,? FROM vector_buckets WHERE passage=?",
-                ((passage, row["id"]),),
+                (passage, row["id"]),
             )
         return new_id
 
@@ -556,7 +736,7 @@ class Store:
 
     def quick_search(self, question, filters, limit=20):
         """Search one metadata row per message, then verify access to ranked results."""
-        where, params = self.scope(filters, check_access=False)
+        where, params = self.scope(filters)
         if question:
             words = query_words(question)
             if not words:
@@ -573,42 +753,46 @@ class Store:
 
         with self.connection() as conn:
             candidates = conn.execute(
-                f"""SELECT {MAIL_COLUMNS},s.kind source_kind FROM {from_clause}
+                f"""SELECT {MAIL_COLUMNS} FROM {from_clause}
                     WHERE {where} ORDER BY {order}""", params,
             )
-            results = []
+            selected = []
             seen = set()
-            available = {}
+            sources, documents = {}, {}
             try:
                 for candidate in candidates:
                     key = candidate["fingerprint"]
-                    if key in seen:
+                    if key in seen or not self.readable(candidate, sources, documents):
                         continue
-                    source = candidate["source"]
-                    path = candidate["path"]
-                    if source not in available:
-                        available[source] = source_readable(path, candidate["source_kind"])
-                    if not available[source]:
-                        continue
-                    if candidate["kind"] != "mail" and not document_readable(path, candidate["item"]):
-                        continue
-                    parts = conn.execute(
-                        """SELECT p.id passage,p.text,p.location,p.start,a.name attachment
-                           FROM passages p LEFT JOIN attachments a ON a.id=p.attachment
-                           WHERE p.mail=? AND (p.id=(SELECT min(id) FROM passages WHERE mail=?)
-                                               OR p.location='파일명')
-                           ORDER BY p.id""", (candidate["id"], candidate["id"]),
-                    ).fetchall()
-                    if not parts:
-                        continue
-                    part = next((row for row in parts if row["location"] == "파일명"
-                                 and any(word in normalized(row["text"]) for word in words)), parts[0])
-                    seen.add(key)
-                    results.append({**dict(candidate), **dict(part)})
-                    if len(results) == limit:
+                    if not self.deferred_access():
+                        seen.add(key)
+                    selected.append(candidate)
+                    if len(selected) == limit:
                         break
             finally:
                 candidates.close()
+            parts = defaultdict(list)
+            for row in conn.execute(
+                """WITH selected AS (SELECT value mail FROM json_each(?)),
+                          part_ids AS (
+                              SELECT (SELECT min(id) FROM passages WHERE mail=s.mail) id FROM selected s
+                              UNION
+                              SELECT p.id FROM selected s JOIN passages p ON p.mail=s.mail
+                              WHERE p.location='파일명'
+                          )
+                   SELECT p.mail mail_id,p.id passage,p.text,p.location,p.start,a.name attachment
+                   FROM part_ids JOIN passages p ON p.id=part_ids.id
+                   LEFT JOIN attachments a ON a.id=p.attachment
+                   ORDER BY p.id""", (json.dumps([row["id"] for row in selected]),),
+            ):
+                parts[row["mail_id"]].append(row)
+            results = []
+            for row in selected:
+                choices = parts[row["id"]]
+                if choices:
+                    part = next((item for item in choices if item["location"] == "파일명"
+                                 and any(word in normalized(item["text"]) for word in words)), choices[0])
+                    results.append({**dict(row), **dict(part)})
         return results
 
     def lexical(self, question, filters, fuzzy=False, limit=100):
@@ -619,9 +803,12 @@ class Store:
                 rows = conn.execute(
                     f"""SELECT {MAIL_COLUMNS},p.id passage,p.text,p.location,p.start,NULL attachment
                         FROM mails m {JOIN} JOIN passages p ON p.id=(SELECT min(id) FROM passages WHERE mail=m.id)
-                        WHERE {where} ORDER BY m.sent DESC,m.id DESC LIMIT ?""", (*params, limit)
-                ).fetchall()
-                return [dict(row) for row in rows]
+                        WHERE {where} ORDER BY m.sent DESC,m.id DESC""", params,
+                )
+                try:
+                    return self.visible_rows(rows, limit)
+                finally:
+                    rows.close()
         if not words:
             return []
         expanded = list(dict.fromkeys([*words, *(word for key, alternatives in SYNONYMS.items() if fuzzy and key in question for word in alternatives)]))
@@ -636,24 +823,71 @@ class Store:
             for position, (statement, weight) in enumerate(strategies):
                 if position and exact_identifier and ranked and not fuzzy:
                     break
-                rows = conn.execute(
-                    f"""SELECT {MAIL_COLUMNS},p.id passage,p.text,p.location,p.start,a.name attachment
-                        FROM terms JOIN passages p ON p.id=terms.rowid JOIN mails m ON m.id=p.mail
-                        {JOIN} LEFT JOIN attachments a ON a.id=p.attachment
-                        WHERE terms MATCH ? AND {where}
-                        ORDER BY bm25(terms,7.0,2.0,4.0,1.0) LIMIT ?""",
-                    (statement, *params, limit),
-                )
-                for rank, row in enumerate(rows):
-                    entry, score = ranked.get(row["passage"], (dict(row), 0))
-                    ranked[row["passage"]] = (entry, score + weight / (30 + rank))
-        ordered = sorted(ranked.values(), key=lambda entry: entry[1], reverse=True)
+                # Keep the rank sort narrow and hydrate only surviving IDs.
+                defer = self.deferred_access()
+                columns = "p.id" if defer else "p.id,m.source,m.kind,m.item,s.path,s.kind source_kind"
+                candidates = conn.execute(
+                    "SELECT rowid FROM terms WHERE terms MATCH ? ORDER BY bm25(terms,7.0,2.0,4.0,1.0) LIMIT ?",
+                    (statement, max(limit * 3, 256)),
+                ).fetchall()
+                candidate_ids = [row[0] for row in candidates]
+                scoped = conn.execute(
+                    f"""SELECT {columns} FROM json_each(?) ids JOIN passages p ON p.id=ids.value
+                        JOIN mails m ON m.id=p.mail {JOIN} WHERE {where}
+                        ORDER BY ids.key""",
+                    (json.dumps(candidate_ids), *params),
+                ).fetchall() if candidate_ids else []
+                sources, documents = {}, {}
+                top = []
+                for row in scoped:
+                    if self.readable(row, sources, documents):
+                        top.append(row)
+                    if len(top) == limit:
+                        break
+                if len(top) < limit and len(candidate_ids) == max(limit * 3, 256):
+                    # A narrow date, sender or source filter can exhaust the initial window.
+                    # Rank within the full scope in that case to retain the usual results.
+                    top = []
+                    cursor = conn.execute(
+                        f"""SELECT {columns} FROM terms JOIN passages p ON p.id=terms.rowid
+                            JOIN mails m ON m.id=p.mail {JOIN} WHERE terms MATCH ? AND {where}
+                            ORDER BY bm25(terms,7.0,2.0,4.0,1.0)""",
+                        (statement, *params),
+                    )
+                    try:
+                        for row in cursor:
+                            if self.readable(row, sources, documents):
+                                top.append(row)
+                            if len(top) == limit:
+                                break
+                    finally:
+                        cursor.close()
+                for rank, row in enumerate(top):
+                    passage = row["id"]
+                    ranked[passage] = ranked.get(passage, 0) + weight / (30 + rank)
+            ordered_ids = sorted(ranked, key=ranked.get, reverse=True)
+            if not exact_identifier or fuzzy:
+                ordered_ids = ordered_ids[:limit]
+            found = {row["passage"]: row for row in self.passages(ordered_ids, filters, conn, checked=True)}
+            ordered = [(found[item], ranked[item]) for item in ordered_ids if item in found]
         if fuzzy:
             return [row for row, _ in ordered[:limit]]
         exact = normalized(question.strip())
         return [row for row, _ in sorted(ordered, key=lambda entry: (
             exact_identifier and exact in WORD.findall(normalized(entry[0]["subject"] + " " + entry[0]["text"])), entry[1]
         ), reverse=True)[:limit]]
+
+    def snippets(self, question, passage_ids):
+        words = query_words(question)
+        if not words or not passage_ids:
+            return {}
+        expressions = dict.fromkeys(fts_query(words, mode) for mode in ("terms", "grams"))
+        with self.connection() as conn:
+            return dict(conn.execute(
+                """SELECT rowid,snippet(terms,3,'','','',24) FROM terms
+                   WHERE terms MATCH ? AND rowid IN (SELECT value FROM json_each(?))""",
+                (" OR ".join(expressions), json.dumps(passage_ids)),
+            ))
 
     def exact_search(self, plan, filters):
         """Search "quoted" terms as exact substrings; & within a group, or between groups."""
@@ -672,10 +906,12 @@ class Store:
                 verified = {}
                 for row in self.lexical(term, filters, fuzzy=False, limit=400):
                     if normalized(term) in normalized(f"{row['subject']} {row['text']}"):
-                        verified.setdefault(row["fingerprint"], row)
+                        key = (row["fingerprint"], row["source"]) if self.deferred_access() else row["fingerprint"]
+                        verified.setdefault(key, row)
                 matches = verified if matches is None else {key: row for key, row in matches.items() if key in verified}
             for row in (matches or {}).values():
-                selected.setdefault(row["fingerprint"], row)
+                key = (row["fingerprint"], row["source"]) if self.deferred_access() else row["fingerprint"]
+                selected.setdefault(key, row)
         return list(selected.values())
 
     def semantic(self, values, model, filters, limit=40):
@@ -684,52 +920,68 @@ class Store:
         with self.connection() as conn:
             # Exact cosine for small indexes. Limit comparisons for large archives.
             scoped = f"""FROM sources s JOIN mails m ON m.source=s.id CROSS JOIN passages p ON p.mail=m.id
-                         CROSS JOIN vectors v ON v.passage=p.id AND v.model=? WHERE {where}"""
-            ids = conn.execute("SELECT p.id " + scoped + " LIMIT 2001", (model, *params)).fetchall()
-            if len(ids) <= 2000:
-                chosen = [row[0] for row in ids]
-            else:
-                probes = [candidate for bucket in buckets(vector)
-                          for candidate in (bucket, *(bucket ^ (1 << n) for n in range(11)))]
-                ranked = conn.execute(
-                    f"""SELECT b.passage FROM vector_buckets b JOIN passages p ON p.id=b.passage
-                        JOIN mails m ON m.id=p.mail {JOIN}
-                        WHERE b.model=? AND b.bucket IN (SELECT value FROM json_each(?)) AND {where}
-                        GROUP BY b.passage ORDER BY count(*) DESC,b.passage DESC LIMIT 2400""",
-                    (model, json.dumps(probes), *params),
-                )
-                chosen = [row[0] for row in ranked]
+                         WHERE {where} AND (EXISTS(SELECT 1 FROM vectors v WHERE v.passage=p.id AND v.model=?)
+                            OR EXISTS(SELECT 1 FROM embedding_refs r WHERE r.passage=p.id AND r.model=?))"""
+            chosen = self.vector_index.candidates(conn, vector, model, filters, limit) if self.vector_index else None
+            if chosen is None:
+                ids = conn.execute("SELECT p.id " + scoped + " LIMIT 2001", (*params, model, model)).fetchall()
+                if len(ids) <= 2000:
+                    chosen = [row[0] for row in ids]
+                else:
+                    probes = [candidate for bucket in buckets(vector)
+                              for candidate in (bucket, *(bucket ^ (1 << n) for n in range(11)))]
+                    ranked = conn.execute(
+                        f"""SELECT b.passage FROM vector_buckets b JOIN passages p ON p.id=b.passage
+                            JOIN mails m ON m.id=p.mail {JOIN}
+                            WHERE b.model=? AND b.bucket IN (SELECT value FROM json_each(?)) AND {where}
+                            GROUP BY b.passage ORDER BY count(*) DESC,b.passage DESC LIMIT 2400""",
+                        (model, json.dumps(probes), *params),
+                    )
+                    chosen = [row[0] for row in ranked]
             vectors = conn.execute(
-                "SELECT passage,value FROM vectors WHERE model=? AND passage IN (SELECT value FROM json_each(?))",
+                "SELECT passage,value FROM searchable_vectors WHERE model=? AND passage IN (SELECT value FROM json_each(?))",
                 (model, json.dumps(chosen)),
             )
+            eligible = [(row["passage"], row["value"]) for row in vectors if len(row["value"]) == len(vector) * 4]
             scores = []
-            for row in vectors:
-                if len(row["value"]) != len(vector) * 4:
-                    continue
-                similarity = sum(a * b for a, b in zip(vector, vector_array(row["value"])))
-                if similarity >= .28:
-                    scores.append((similarity, row["passage"]))
-            ids = [passage for _, passage in sorted(scores, reverse=True)[:limit]]
-            found = {row["passage"]: row for row in self.passages(ids, filters, conn)}
-            weight = {passage: similarity for similarity, passage in scores}
-            return [{**found[pid], "similarity": weight[pid]} for pid in ids if pid in found]
+            if eligible:
+                numpy = self.vector_index.numpy if self.vector_index else optional_numpy()
+                if numpy is not None:
+                    passage_ids, values = zip(*eligible)
+                    matrix = numpy.frombuffer(b"".join(values), dtype="<f4").reshape(-1, len(vector))
+                    similarities = numpy.einsum("ij,j->i", matrix, numpy.asarray(vector, dtype="float32"))
+                    scores = [(float(score), passage) for passage, score in zip(passage_ids, similarities) if score >= .28]
+                else:
+                    scores = [(math.sumprod(vector, vector_array(value)), passage) for passage, value in eligible]
+                    scores = [(score, passage) for score, passage in scores if score >= .28]
+            ordered = sorted(scores, reverse=True)
+            results = []
+            for start in range(0, len(ordered), limit):
+                batch = ordered[start:start + limit]
+                found = {row["passage"]: row for row in self.passages([pid for _, pid in batch], filters, conn)}
+                results.extend({**found[pid], "similarity": similarity} for similarity, pid in batch if pid in found)
+                if len(results) >= limit:
+                    break
+            return results[:limit]
 
-    def passages(self, passages, filters=None, conn=None):
+    def passages(self, passages, filters=None, conn=None, *, checked=False):
+        if not passages:
+            return []
         if conn is None:
             with self.connection() as conn:
-                return self.passages(passages, filters, conn)
+                return self.passages(passages, filters, conn, checked=checked)
         where, params = self.scope(filters or {})
         rows = conn.execute(
             f"""SELECT {MAIL_COLUMNS},p.id passage,p.text,p.location,p.start,a.name attachment
-                FROM passages p JOIN mails m ON m.id=p.mail {JOIN}
+                FROM json_each(?) ids CROSS JOIN passages p ON p.id=ids.value
+                CROSS JOIN mails m ON m.id=p.mail CROSS JOIN sources s ON s.id=m.source
                 LEFT JOIN attachments a ON a.id=p.attachment
-                WHERE p.id IN (SELECT value FROM json_each(?)) AND {where}""",
+                WHERE {where}""",
             (json.dumps(passages), *params),
         )
-        return [dict(row) for row in rows]
+        return [dict(row) for row in rows] if checked else self.visible_rows(rows)
 
-    def related(self, seeds, filters):
+    def related(self, seeds, filters, *, hops=1):
         if not seeds:
             return []
         where, params = self.scope(filters)
@@ -747,26 +999,43 @@ class Store:
                     (placeholders, placeholders),
                 )
             ]
-            candidates = conn.execute(
-                f"""SELECT m.id,m.message_id,m.topic,m.sender,m.recipient,
-                           (SELECT min(id) FROM passages WHERE mail=m.id) passage
-                    FROM mails m {JOIN} WHERE {where} AND
-                    (m.message_id IN (SELECT value FROM json_each(?))
-                     OR m.id IN (SELECT mail FROM replies WHERE parent IN (SELECT value FROM json_each(?)))
-                     OR m.topic IN (SELECT value FROM json_each(?)))
-                    ORDER BY m.sent DESC LIMIT 60""",
-                (*params, json.dumps(identifiers), json.dumps(identifiers), json.dumps(list(refs))),
-            ).fetchall()
+            candidates = {}
+            frontier = set(identifiers)
+            for hop in range(max(1, min(hops, 3))):
+                hits = conn.execute(
+                    f"""SELECT m.id,m.message_id,m.topic,m.sender,m.recipient,
+                               (SELECT min(id) FROM passages WHERE mail=m.id) passage
+                        FROM mails m {JOIN} WHERE {where} AND
+                        (m.message_id IN (SELECT value FROM json_each(?))
+                         OR m.id IN (SELECT mail FROM replies WHERE parent IN (SELECT value FROM json_each(?)))
+                         OR m.topic IN (SELECT value FROM json_each(?)))
+                        ORDER BY m.sent DESC LIMIT 60""",
+                    (*params, json.dumps(list(frontier)), json.dumps(list(frontier)),
+                     json.dumps(list(refs) if hop == 0 else [])),
+                ).fetchall()
+                new = [row for row in hits if row["id"] not in candidates and row["id"] not in seeds]
+                candidates.update((row["id"], row) for row in new)
+                if hop + 1 >= hops or not new:
+                    break
+                parents = conn.execute(
+                    "SELECT parent FROM replies WHERE mail IN (SELECT value FROM json_each(?))",
+                    (json.dumps([row["id"] for row in new]),),
+                )
+                next_ids = {row[0] for row in parents} | {row["message_id"] for row in new if row["message_id"]}
+                frontier = next_ids - set(identifiers)
+                if not frontier:
+                    break
+                identifiers.extend(frontier)
             reply_ids = {row[0] for row in conn.execute(
                 "SELECT mail FROM replies WHERE parent IN (SELECT value FROM json_each(?))", (json.dumps(identifiers),)
             )}
         linked = []
-        for row in candidates:
+        for row in candidates.values():
             emails = set(re.findall(r"[\w.+-]+@[\w.-]+", (row["sender"] + " " + row["recipient"]).lower()))
             if row["id"] not in seeds and (row["message_id"] in identifiers or row["id"] in reply_ids or refs[row["topic"]] & emails):
                 linked.append(row["passage"])
-        found = {row["passage"]: row for row in self.passages(linked[:6], filters)}
-        return [found[item] for item in linked[:6] if item in found]
+        found = {row["passage"]: row for row in self.passages(linked[:24], filters)}
+        return [found[item] for item in linked[:24] if item in found][:6]
 
     def evidence_context(self, row, filters):
         """Fetch reviewable context from the same mail part or worksheet."""
@@ -816,7 +1085,7 @@ class Store:
                     FROM passages p JOIN mails m ON m.id=p.mail {JOIN}
                     LEFT JOIN attachments a ON a.id=p.attachment WHERE p.id=? AND {where}""", (passage, *params)
             ).fetchone()
-            if row is None:
+            if row is None or not self.result_access(row, {}, {}, refresh=True):
                 return None
             result = dict(row)
             result["attachments"] = [dict(item) for item in conn.execute(
@@ -827,14 +1096,19 @@ class Store:
 
     def original_attachment(self, attachment):
         with self.connection() as conn:
-            return conn.execute(
+            row = conn.execute(
                 f"""SELECT a.name,m.item,m.folder,m.fingerprint,m.version,m.source,s.kind,s.path,
                            s.active,s.pending,s.signature,s.active_signature,
                            (SELECT COUNT(*) FROM attachments earlier WHERE earlier.mail=m.id AND earlier.id<a.id) position
                     FROM attachments a JOIN mails m ON m.id=a.mail {JOIN}
-                    WHERE a.id=? AND m.kind='mail' AND {VISIBLE_VERSION} AND source_readable(s.path,s.kind)""",
+                    WHERE a.id=? AND m.kind='mail' AND {VISIBLE_VERSION}""",
                 (attachment,),
             ).fetchone()
+        if row is not None:
+            with self.measure("access"):
+                if source_readable(row["path"], row["kind"]):
+                    return row
+        return None
 
     def pcf_case(self, seed, filters=None):
         """Resolve a cell to its full case in the visible indexed document version."""
@@ -884,4 +1158,4 @@ class Store:
                     ORDER BY m.sent DESC LIMIT 20""",
                 (*params, f"PCF T* · No. {number} · T*"),
             )
-            return [dict(row) for row in rows]
+            return self.visible_rows(rows)
