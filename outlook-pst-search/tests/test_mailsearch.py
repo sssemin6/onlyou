@@ -2256,11 +2256,15 @@ class Integration(unittest.TestCase):
                 self.assertEqual(status, 200)
                 row = next(item for item in result["sources"] if item["id"] == source)
                 self.assertEqual((row["state"], row["embedding_done"], row["embedding_total"]), ("embeddings", 24, 30))
+                self.assertEqual(row["index_stage"], "embeddings")
+                self.assertEqual(row["index_counts"], {"mail": 30})
+                self.assertTrue(row["embedding_model_current"])
             finally:
                 release.set()
             row = await_source(self.store, source, {"ready", "error"})
             self.assertEqual((row["state"], row["issue"]), ("ready", "embedding_connection_aborted"))
             self.assertEqual((row["embedding_done"], row["embedding_total"]), (24, 30))
+            self.assertEqual(row["index_stage"], "complete")
             self.assertTrue(self.call("/api/search", {"query": '"Sample data"', "filters": {"source": source}})[1]["results"])
             self.assertIn("winerror=10053", logs.output[0])
             self.assertNotIn("private diagnostic text", logs.output[0])
@@ -2272,6 +2276,92 @@ class Integration(unittest.TestCase):
             self.assertEqual((row["state"], row["issue"], row["embedding_done"], row["embedding_total"]),
                              ("ready", None, 30, 30))
             self.assertEqual(sizes, [24, 6, 6])
+            self.ai.configure_embedding("another-model", None)
+            status, result = self.call("/api/sources?scan=0")
+            self.assertEqual(status, 200)
+            self.assertFalse(result["sources"][0]["embedding_model_current"])
+
+    def test_source_status_reports_header_and_attachment_progress_by_revision(self):
+        from mailsearch.indexer import extract_attachment, parse_mail
+
+        folder = Path(self.workspace.name) / "index-progress"
+        folder.mkdir()
+        for number in range(40):
+            message = EmailMessage()
+            message["Subject"] = f"Progress fixture {number}"
+            message.set_content("Fixture mail body.")
+            message.add_attachment(f"Attachment {number}.", filename=f"{number}.txt")
+            (folder / f"{number:02d}.eml").write_bytes(message.as_bytes())
+
+        header_waiting, release_headers = threading.Event(), threading.Event()
+        attachment_waiting, release_attachments = threading.Event(), threading.Event()
+        seen = 0
+
+        def read(path, *args, **kwargs):
+            if path.name == "32.eml" and not release_headers.is_set():
+                header_waiting.set()
+                release_headers.wait(5)
+            return parse_mail(path, *args, **kwargs)
+
+        def extract(*args, **kwargs):
+            nonlocal seen
+            seen += 1
+            if seen == 25:
+                attachment_waiting.set()
+                release_attachments.wait(5)
+            return extract_attachment(*args, **kwargs)
+
+        def status():
+            code, data = self.call("/api/sources?scan=0")
+            self.assertEqual(code, 200)
+            return data["sources"][0]
+
+        with (patch("mailsearch.indexer.parse_mail", side_effect=read),
+              patch("mailsearch.indexer.extract_attachment", side_effect=extract)):
+            source = self.indexer.register(folder)
+            try:
+                self.assertTrue(header_waiting.wait(5))
+                current = status()
+                self.assertEqual((current["index_stage"], current["index_done"], current["index_total"]),
+                                 ("headers", 32, 40))
+                self.assertEqual(current["index_counts"], {"mail": 32})
+                release_headers.set()
+                self.assertTrue(attachment_waiting.wait(5))
+                current = status()
+                self.assertEqual((current["index_stage"], current["index_done"], current["index_total"]),
+                                 ("attachments", 24, 40))
+            finally:
+                release_headers.set()
+                release_attachments.set()
+            self.assertEqual(await_source(self.store, source, {"ready", "error"})["state"], "ready")
+
+        message = EmailMessage()
+        message["Subject"] = "One new file"
+        message.set_content("New body.")
+        message.add_attachment("New attachment.", filename="new.txt")
+        (folder / "new.eml").write_bytes(message.as_bytes())
+        with (patch("mailsearch.indexer.extract_attachment", side_effect=OSError),
+              self.assertLogs("mailsearch.runtime", "ERROR")):
+            self.indexer.command(source, "refresh")
+            self.assertEqual(await_source(self.store, source, {"ready", "error"})["state"], "error")
+        current = status()
+        self.assertEqual((current["index_stage"], current["issue"], current["index_done"], current["index_total"]),
+                         ("attachments", "disk_or_source", 40, 41))
+        self.assertNotEqual(current["active"], current["pending"])
+        self.assertEqual(current["index_counts"], {"mail": 41})
+        self.assertEqual(current["counts"], {"mail": 81})
+
+    def test_source_status_lists_skipped_pst_reason_beside_successful_mail(self):
+        folder = Path(self.workspace.name) / "source-status"
+        folder.mkdir()
+        (folder / "mail.eml").write_text("Subject: A readable mail\n\nFixture body.", encoding="utf-8")
+        (folder / "invalid.pst").write_bytes(b"invalid PST")
+        source = self.indexer.register(folder)
+        row = await_source(self.store, source, {"ready", "error"})
+        self.assertEqual((row["state"], row["done"], row["omitted"]), ("ready", 1, 1))
+        status, result = self.call("/api/sources?scan=0")
+        self.assertEqual(status, 200)
+        self.assertIn({"item": "invalid.pst", "code": "pst_invalid"}, result["sources"][0]["problems"])
 
     def test_background_embedding_uses_configured_timeout_and_reduces_timed_out_batch(self):
         folder = Path(self.workspace.name) / "embedding-batches"

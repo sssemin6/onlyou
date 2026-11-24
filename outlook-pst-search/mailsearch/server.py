@@ -451,8 +451,10 @@ class Handler(BaseHTTPRequestHandler):
             external = self.server.external
             embedding = self.server.ai.embedding_api
             use_gateway = embedding and embedding.index_key
+            embedding_key = self.server.ai.embedding_index
             self.send_json(200, {
                 "sources": [{**row, "available": row["id"] in ids if scan else None,
+                             "embedding_model_current": row["embedding_model_key"] in (None, embedding_key),
                              "updates": self.server.indexer.pending_updates(row) if scan else [],
                              "pst_read": self.server.indexer.pst_progress(row)} for row in sources],
                 "model": self.server.ai.model,

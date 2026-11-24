@@ -21,11 +21,13 @@ const TAB_FILTERS = {
 };
 const ALL_FILTERS = ["source", ...new Set(Object.values(TAB_FILTERS).flat())];
 const dateFormat = new Intl.DateTimeFormat("ko-KR", { dateStyle: "medium", timeStyle: "short" });
-const stateNames = {
-  queued: "대기", extracting: "가져올 자료 확인 중", headers: "자료 색인 중", attachments: "첨부 색인 중",
-  embeddings: "의미 검색 준비 중", ready: "검색 가능", paused: "일시정지", error: "오류", empty: "가져온 자료 없음",
-  removing: "삭제 중", remove_failed: "삭제 재시도 필요",
+const indexStages = {
+  extracting: "원본 확인·PST 읽기", headers: "메일·문서 색인", attachments: "첨부파일 본문 추출",
+  embeddings: "임베딩 생성", finalizing: "색인 저장·전환",
 };
+const workingIndexStates = new Set(["extracting", "headers", "attachments", "embeddings"]);
+const indexingNumber = new Intl.NumberFormat("ko-KR");
+const indexingPercent = new Intl.NumberFormat("ko-KR", { maximumFractionDigits: 2 });
 const issueNames = {
   readpst_missing: "PST 추출 도구(readpst)를 설치하거나 실행 경로를 지정하세요.",
   pst_in_use: "Outlook에서 사용 중이거나 접근할 수 없는 PST입니다. Outlook을 닫거나 사본을 등록하세요.",
@@ -37,6 +39,7 @@ const issueNames = {
   eml_no_mail: "읽을 수 있는 PST·EML 또는 지원 문서가 있는지 확인하세요.",
   document_extract_failed: "문서 내용을 가져오지 못했습니다. 아래 누락 사유를 확인하고 다시 색인하세요.",
   mail_parse_failed: "가져온 메일을 읽을 수 없습니다. 아래 실패 건수를 확인하고 다시 색인해 보세요.",
+  parse: "메일 읽기 실패",
   readpst_dependencies: "readpst가 시작되지 않았습니다. MSYS2에서 함께 설치된 DLL이 있는지 확인하세요.",
   disk_or_source: "파일 접근 권한과 저장 공간을 확인하세요.",
   changed: "색인 중 원본 파일이나 폴더가 변경되었습니다. 경로 확인 후 다시 색인하세요.",
@@ -237,7 +240,7 @@ function showFilterCount() {
 }
 
 function kindCountLine(source) {
-  const counts = source.counts || {};
+  const counts = source.index_counts ?? source.counts ?? {};
   const parts = [["mail", "메일"], ["document", "문서"], ["pcf", "PCF"]]
     .filter(([kind]) => counts[kind])
     .map(([kind, label]) => label + " " + counts[kind].toLocaleString("ko-KR") + "건");
@@ -248,6 +251,88 @@ function elapsedTime(seconds) {
   const hours = Math.floor(seconds / 3600);
   const minutes = Math.floor(seconds / 60) % 60;
   return [hours && hours + "시간", minutes && minutes + "분", seconds % 60 + "초"].filter(Boolean).join(" ");
+}
+
+function sourceProgress(done, total, unit) {
+  if (!Number.isFinite(done) || !Number.isFinite(total) || total <= 0) return null;
+  const value = Math.min(Math.max(0, done), total);
+  const percent = value === total ? 100 : Math.min(99.99, value / total * 100);
+  return { done: value, total, text: indexingPercent.format(percent) + "% · " +
+    indexingNumber.format(value) + " / " + indexingNumber.format(total) + unit };
+}
+
+function sourceIndexStatuses(source, embeddingEnabled) {
+  const { state, issue, pst_read: pst } = source;
+  const running = workingIndexStates.has(state);
+  const stopped = state === "paused" ? "일시정지" : state === "queued" ? "대기 중" : "";
+  const failed = state === "error" || state === "empty";
+  const embeddingIssue = issue?.startsWith("embedding_");
+  const embeddingProgress = sourceProgress(source.embedding_done, source.embedding_total, "구간");
+  const stage = source.index_stage || (running ? state : embeddingProgress ? "embeddings" :
+    /^pst_|^readpst_/.test(issue || "") ? "extracting" :
+    ["mail_parse_failed", "document_extract_failed"].includes(issue) ? "headers" : "");
+  const stageName = indexStages[stage] || "일반 색인";
+  const generalComplete = state === "ready" || stage === "embeddings";
+  const gaps = source.failed || source.omitted || source.partial;
+  const ordinaryProgress = stage === "headers" || stage === "attachments"
+    ? sourceProgress(source.index_done, source.index_total, "건") : null;
+  let general;
+
+  if (failed && stage !== "embeddings") {
+    general = { mark: "X", status: stageName + " 실패", progress: ordinaryProgress, detail: issueNames[issue] || issue };
+  } else if (generalComplete) {
+    general = gaps ? { mark: "X", status: "처리 종료 · 일부 자료 미완료" } : { mark: "O", status: "완료 · 100%" };
+  } else if (running) {
+    const progress = stage === "extracting" && pst ? sourceProgress(pst.position - 1, pst.total, "개 확인")
+      : ordinaryProgress;
+    const waitingForTotal = !progress && source.index_total == null && !pst && stage !== "finalizing";
+    general = { mark: "△", status: stageName + " 진행 중", progress, showBar: true,
+      detail: waitingForTotal ? "전체 대상 집계 중" : stage === "finalizing" ? "처리 결과 반영 중" : "" };
+  } else {
+    general = { mark: "—", status: [stopped, stage && stageName].filter(Boolean).join(" · "), progress: ordinaryProgress };
+  }
+
+  let semantic;
+  if (!embeddingEnabled && !(running && state === "embeddings")) {
+    semantic = { mark: "—", status: "미사용" };
+  } else if (source.embedding_model_current === false) {
+    semantic = { mark: "—", status: state === "ready" ? "현재 모델의 의미 색인 미완료 · 갱신 필요"
+      : "현재 모델의 의미 색인 대기", detail: embeddingProgress ? "이전 모델 · " + embeddingProgress.text : "" };
+  } else if (embeddingIssue || (failed && stage === "embeddings")) {
+    semantic = { mark: "X", status: "임베딩 실패", progress: embeddingProgress, detail: issueNames[issue] || issue };
+  } else if (running && state === "embeddings" && stage !== "finalizing") {
+    semantic = { mark: "△", status: "임베딩 생성 진행 중", progress: embeddingProgress, showBar: true,
+      detail: embeddingProgress ? "" : "전체 구간 집계 중" };
+  } else if (embeddingProgress && embeddingProgress.done === embeddingProgress.total && !stopped) {
+    semantic = { mark: "O", status: "완료", progress: embeddingProgress };
+  } else if (source.embedding_total === 0 && state === "ready") {
+    semantic = { mark: "—", status: "대상 구간 없음" };
+  } else {
+    const status = state === "ready" ? "미완료 · 갱신 필요" :
+      failed ? "일반 색인 실패로 대기" : stopped || "일반 색인 후 시작";
+    semantic = { mark: "—", status, progress: embeddingProgress };
+  }
+  return [general, semantic];
+}
+
+function sourceIndexRow(title, status) {
+  const row = node("div", "", "index-stage");
+  const summary = node("p", "", "index-stage-label");
+  const mark = node("span", status.mark, "index-mark");
+  mark.setAttribute("aria-hidden", "true");
+  summary.append(mark, node("strong", title));
+  row.append(summary, node("p", [status.status, status.progress?.text].filter(Boolean).join(" · "), "index-stage-value"));
+  if (status.showBar) {
+    const progress = node("progress", "", "source-progress");
+    progress.setAttribute("aria-label", title + " 진행률");
+    if (status.progress) {
+      progress.max = status.progress.total;
+      progress.value = status.progress.done;
+    }
+    row.append(progress);
+  }
+  if (status.detail) row.append(node("p", status.detail, status.mark === "X" ? "issue" : ""));
+  return row;
 }
 
 async function showSources() {
@@ -276,55 +361,48 @@ async function showSources() {
     sourceSelect.append(new Option(source.path, source.id));
     const name = source.path.split(/[\\/]/).pop();
     const entry = node("div", "", "source-card");
-    entry.dataset.state = source.state;
     const heading = node("h3", name, "source-name");
     heading.title = source.path;
     const pstRead = source.pst_read;
-    const stateLabel = pstRead ? "PST 읽는 중" : (stateNames[source.state] || source.state);
-    const countLine = source.state === "extracting" ? "" : " · " + kindCountLine(source);
-    entry.append(heading, node("p", stateLabel + countLine, "source-state"));
-    if (source.state === "extracting") {
+    entry.append(heading);
+    if (source.state === "removing" || source.state === "remove_failed") {
+      const removing = source.state === "removing";
+      entry.append(node("p", removing ? "△ 등록 해제 진행 중" : "X 등록 해제 실패", "source-state"));
+      if (source.issue) entry.append(node("p", issueNames[source.issue] || source.issue, "issue"));
+    } else {
+      const [general, semantic] = sourceIndexStatuses(source, Boolean(data.embedding));
+      const stages = node("div", "", "index-stages");
+      const generalRow = sourceIndexRow("일반 색인", general);
       if (pstRead) {
         const position = source.kind === "eml_dir" ? "PST " + pstRead.position + " / " + pstRead.total + " · " : "";
-        entry.append(node("p", position + pstRead.item));
-        entry.append(node("p", "경과 " + elapsedTime(pstRead.elapsed) + " · 추출 파일 " + pstRead.files.toLocaleString("ko-KR") + "개"));
+        generalRow.append(node("p", position + pstRead.item));
+        generalRow.append(node("p", "경과 " + elapsedTime(pstRead.elapsed) + " · 추출 " + indexingNumber.format(pstRead.files) + "개"));
+        generalRow.append(node("p", "진행률은 PST 파일 수 기준입니다."));
         if (pstRead.idle >= 60) {
-          entry.append(node("p", "최근 " + elapsedTime(pstRead.idle) + " 동안 새 추출 파일이 확인되지 않았습니다."));
+          generalRow.append(node("p", "최근 " + elapsedTime(pstRead.idle) + " 동안 새 추출 파일이 확인되지 않았습니다."));
         }
       }
-      const progress = node("progress", "", "source-progress");
-      progress.setAttribute("aria-label", name + " " + stateLabel);
-      entry.append(progress);
-    }
-    if (source.embedding_total > 0) {
-      const done = source.embedding_done;
-      const total = source.embedding_total;
-      const percent = ((done / total) * 100).toLocaleString("ko-KR", { maximumFractionDigits: 2 });
-      const count = done.toLocaleString("ko-KR") + " / " + total.toLocaleString("ko-KR");
-      entry.append(node("p", "임베딩 " + count + " 구간 · " + percent + "%", "embedding-count"));
-      if (source.state === "embeddings" || done < total) {
-        const progress = node("progress", "", "source-progress");
-        progress.max = total;
-        progress.value = done;
-        progress.setAttribute("aria-label", name + " 임베딩 진행률");
-        entry.append(progress);
-      }
+      stages.append(generalRow, sourceIndexRow("의미 색인 (임베딩)", semantic));
+      entry.append(stages, node("p", "이번 색인 · " + kindCountLine(source)));
     }
     if (source.failed || source.omitted || source.partial) {
-      entry.append(node("p", "실패 " + source.failed + " · 누락 " + source.omitted + " · 일부 색인 " + source.partial));
+      const issues = node("ul", "", "source-issues");
+      const counts = [[source.failed, "실패"], [source.omitted, "누락"], [source.partial, "일부 색인"]]
+        .filter(([value]) => value > 0).map(([value, label]) => label + " " + indexingNumber.format(value) + "건");
+      entry.append(node("p", "X " + counts.join(" · "), "issue"));
       if (source.deferred_psts) {
-        entry.append(node("p", "잠김·접근 불가로 보류된 PST " + source.deferred_psts + "개", "issue"));
+        entry.append(node("p", "X 잠김·접근 불가로 보류된 PST " + indexingNumber.format(source.deferred_psts) + "개", "issue"));
       }
       for (const problem of source.problems || []) {
         const reason = problem.code === "pst_in_use" ? "잠김 또는 읽기 권한 없음" : issueNames[problem.code] || problem.code;
-        entry.append(node("p", problem.item + " · " + reason, "issue"));
+        issues.append(node("li", problem.item + " · " + reason));
       }
+      if (issues.childElementCount) entry.append(issues);
     }
     if (source.updated) {
       const existing = source.active !== null && source.pending !== null;
-      entry.append(node("p", (existing ? "이전 색인 사용 중 · " : "색인 기준 ") + formatDate(source.updated)));
+      entry.append(node("p", (existing ? "검색은 이전 색인 사용 중 · " : "검색용 색인 기준 · ") + formatDate(source.updated)));
     }
-    if (source.issue) entry.append(node("p", issueNames[source.issue] || source.issue, "issue"));
     const actions = node("div", "", "source-actions");
     const choices = ["queued", "extracting", "headers", "attachments", "embeddings"].includes(source.state)
       ? [["pause", "일시정지"]]

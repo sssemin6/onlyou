@@ -166,7 +166,8 @@ class Indexer:
                         self.discard_pending(conn, row)
                         conn.execute(
                             """UPDATE sources SET pending=revision+1,revision=revision+1,signature=NULL,
-                               done=0,failed=0,omitted=0,partial=0,embedding_done=NULL,embedding_total=NULL
+                               done=0,failed=0,omitted=0,partial=0,embedding_done=NULL,embedding_total=NULL,embedding_model_key=NULL,
+                               index_stage=NULL,index_done=NULL,index_total=NULL
                                WHERE id=?""", (source,)
                         )
                     conn.execute("UPDATE sources SET state='queued',issue=NULL WHERE id=?", (source,))
@@ -303,7 +304,8 @@ class Indexer:
 
     def state(self, source, state, issue=None):
         with self.store.connection() as conn:
-            conn.execute("UPDATE sources SET state=?,issue=? WHERE id=? AND state NOT IN ('paused','removing')", (state, issue, source))
+            conn.execute("""UPDATE sources SET state=?,issue=?,index_stage=?,index_done=NULL,index_total=NULL
+                            WHERE id=? AND state NOT IN ('paused','removing')""", (state, issue, state, source))
 
     @staticmethod
     def pst_header(path):
@@ -339,7 +341,7 @@ class Indexer:
         and signature so the next refresh still sees it as pending.
         """
         extras, carried = [], []
-        skipped = 0
+        skipped = {}
         signatures = {}
         deferred = dict(already_deferred)
         files = sorted(path for path in folder.rglob("*")
@@ -418,7 +420,7 @@ class Indexer:
                         signatures[label] = known[label]
                     continue
                 if str(exc) in {"pst_no_mail", "pst_export", "pst_invalid"}:
-                    skipped += 1
+                    skipped[item] = str(exc)
                     if label in outdated and known.get(label) == signature:
                         # A failed migration must not drop results from an unchanged PST.
                         carried.append(label)
@@ -611,6 +613,8 @@ class Indexer:
 
     def process(self, row, event):
         source, version, previous = row["id"], row["pending"], row["active"]
+        self.state(source, "extracting")
+        self.check(event)
         path = Path(row["path"])
         stage = self.spool / str(source) / str(version)
         stage.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -626,7 +630,7 @@ class Indexer:
         if saved and signature != saved:
             raise ImportIssue("changed")
         with self.store.connection() as conn:
-            conn.execute("UPDATE sources SET signature=?,state='extracting' WHERE id=? AND state='queued'", (signature, source))
+            conn.execute("UPDATE sources SET signature=? WHERE id=? AND state='extracting'", (signature, source))
         self.check(event)
         is_pst = row["kind"] == "pst"
         extras, carried, signatures, deferred = (), (), None, ()
@@ -662,15 +666,17 @@ class Indexer:
                 extras, carried, skipped_psts, signatures, deferred = self.import_folder_psts(
                     path, stage, event, known, source, already_deferred, outdated)
                 with self.store.connection() as conn:
-                    conn.execute("DELETE FROM problems WHERE source=? AND version=? AND code IN (?,?)",
-                                 (source, version, *PST_DEFERRED))
+                    conn.execute("""DELETE FROM problems WHERE source=? AND version=?
+                                    AND code IN ('pst_in_use','pst_changed','pst_no_mail','pst_export','pst_invalid')""",
+                                 (source, version))
                     conn.executemany("INSERT INTO problems VALUES(?,?,?,?)",
-                                     ((source, version, item, code) for item, code in deferred.items()))
+                                     ((source, version, item, code) for item, code in (deferred | skipped_psts).items()))
                     # The same folder may be scanned again after a restart. Rebuild
                     # the count from the current PST scan and committed items.
                     omitted_documents = conn.execute(
                         "SELECT COUNT(*) FROM problems WHERE source=? AND version=? "
-                        "AND code NOT IN ('parse','pst_in_use','pst_changed','mail_original_changed')", (source, version),
+                        "AND code NOT IN ('parse','pst_in_use','pst_changed','pst_no_mail','pst_export',"
+                        "'pst_invalid','mail_original_changed')", (source, version),
                     ).fetchone()[0]
                     omitted_attachments = conn.execute(
                         "SELECT COUNT(*) FROM attachments a JOIN mails m ON m.id=a.mail "
@@ -678,7 +684,7 @@ class Indexer:
                         "AND NOT EXISTS(SELECT 1 FROM passages p WHERE p.attachment=a.id AND p.location<>'파일명')",
                         (source, version),
                     ).fetchone()[0]
-                    omitted = skipped_psts + len(deferred) + omitted_documents + omitted_attachments
+                    omitted = len(skipped_psts) + len(deferred) + omitted_documents + omitted_attachments
                     conn.execute("UPDATE sources SET omitted=? WHERE id=?", (omitted, source))
         self.check(event)
         self.state(source, "headers")
@@ -691,7 +697,9 @@ class Indexer:
         if not progress["done"] and progress["omitted"] and not is_pst:
             with self.store.connection() as conn:
                 missing_document = conn.execute(
-                    "SELECT 1 FROM problems WHERE source=? AND version=? AND code NOT IN ('parse','pst_in_use','pst_changed','mail_original_changed') LIMIT 1",
+                    """SELECT 1 FROM problems WHERE source=? AND version=? AND code NOT IN
+                       ('parse','pst_in_use','pst_changed','pst_no_mail','pst_export','pst_invalid','mail_original_changed')
+                       LIMIT 1""",
                     (source, version),
                 ).fetchone()
             if missing_document:
@@ -706,17 +714,21 @@ class Indexer:
             issue = self.index_embeddings(source, version, event)
         else:
             with self.store.connection() as conn:
-                conn.execute("""UPDATE sources SET embedding_done=NULL,embedding_total=NULL
+                conn.execute("""UPDATE sources SET embedding_done=NULL,embedding_total=NULL,embedding_model_key=NULL
                                 WHERE id=? AND pending=?""", (source, version))
         self.check(event)
+        with self.store.connection() as conn:
+            conn.execute("UPDATE sources SET index_stage='finalizing' WHERE id=? AND pending=?", (source, version))
         if source_signature(path, kind) != signature:
             raise ImportIssue("changed")
         with self.lock:
             self.check(event)
             with self.store.connection() as conn:
                 conn.execute(
-                    "UPDATE sources SET active=?,active_signature=?,pending=NULL,state=?,updated=?,issue=? WHERE id=?",
-                    (version, signature, "empty" if empty_eml else "ready", now(), "eml_no_mail" if empty_eml else issue, source),
+                    """UPDATE sources SET active=?,active_signature=?,pending=NULL,state=?,updated=?,issue=?,
+                       index_stage=? WHERE id=?""",
+                    (version, signature, "empty" if empty_eml else "ready", now(), "eml_no_mail" if empty_eml else issue,
+                     "headers" if empty_eml else "complete", source),
                 )
                 conn.execute("DELETE FROM mails WHERE source=? AND version<>?", (source, version))
                 conn.execute("DELETE FROM problems WHERE source=? AND version<>?", (source, version))
@@ -772,17 +784,25 @@ class Indexer:
 
     def index_headers(self, root, source, version, event, *, numbered=False, extras=(), previous=None, carried=(), temp=None):
         with self.store.connection() as conn:
-            batch = 0
             for prefix in carried:
                 self.check(event)
                 adopted = self.store.carry_prefix(conn, source, previous, version, prefix)
                 if adopted:
                     conn.execute("UPDATE sources SET done=done+? WHERE id=?", (adopted, source))
-                    batch += adopted
                     conn.commit()
             workspace = temp or self.spool
-            for path, item, folder in self.scan_entries(root, numbered=numbered, extras=extras):
+            total = 0
+            for _ in self.scan_entries(root, numbered=numbered, extras=extras):
                 self.check(event)
+                total += 1
+            conn.execute("UPDATE sources SET index_done=0,index_total=? WHERE id=? AND pending=?", (total, source, version))
+            conn.commit()
+            done = 0
+            for done, (path, item, folder) in enumerate(self.scan_entries(root, numbered=numbered, extras=extras), 1):
+                self.check(event)
+                if done > 1 and (done - 1) % 32 == 0:
+                    conn.execute("UPDATE sources SET index_done=? WHERE id=? AND pending=?", (done - 1, source, version))
+                    conn.commit()
                 if conn.execute("SELECT 1 FROM mails WHERE source=? AND version=? AND item=?", (source, version, item)).fetchone():
                     continue
                 if conn.execute("SELECT 1 FROM problems WHERE source=? AND version=? AND item=?", (source, version, item)).fetchone():
@@ -810,9 +830,6 @@ class Indexer:
                             self.store.add_document(conn, source, version, item, doc)
                         conn.execute("UPDATE sources SET done=done+1,partial=partial+? WHERE id=?",
                                      (int(status.startswith("일부 색인")), source))
-                    batch += 1
-                    if batch % 32 == 0:
-                        conn.commit()
                     continue
                 try:
                     mail = parse_mail(path, folder)
@@ -823,15 +840,20 @@ class Indexer:
                     if previous is None or not self.store.try_adopt(conn, source, previous, version, item, mail):
                         self.store.add_mail(conn, source, version, item, mail)
                     conn.execute("UPDATE sources SET done=done+1 WHERE id=?", (source,))
-                batch += 1
-                if batch % 32 == 0:
-                    conn.commit()
+            conn.execute("UPDATE sources SET index_done=?,index_total=? WHERE id=? AND pending=?", (done, done, source, version))
 
     def index_attachments(self, root, temp, source, version, event, extras=()):
         with self.store.connection() as conn:
             last = 0
             extracted = []
             new_extracts = {}
+            total, done = conn.execute(
+                """SELECT COUNT(*),COALESCE(SUM(a.status<>'대기'),0)
+                   FROM mails m JOIN attachments a ON a.mail=m.id WHERE m.source=? AND m.version=? AND m.kind='mail'""",
+                (source, version),
+            ).fetchone()
+            conn.execute("UPDATE sources SET index_done=?,index_total=? WHERE id=? AND pending=?", (done, total, source, version))
+            conn.commit()
 
             def load_extract(key, extract):
                 if key in new_extracts:
@@ -846,6 +868,7 @@ class Indexer:
                 return status, locations, None
 
             def save_extracted():
+                nonlocal done
                 with conn:
                     conn.executemany(
                         "INSERT OR IGNORE INTO attachment_extracts VALUES(?,?)",
@@ -871,6 +894,8 @@ class Indexer:
                                   for _, _, status, locations, _ in extracted)
                     conn.execute("UPDATE sources SET omitted=omitted+?,partial=partial+? WHERE id=?",
                                  (omitted, partial, source))
+                    done += len(extracted)
+                    conn.execute("UPDATE sources SET index_done=? WHERE id=? AND pending=?", (done, source, version))
                 extracted.clear()
                 new_extracts.clear()
 
@@ -932,9 +957,10 @@ class Indexer:
                    LEFT JOIN embedding_refs r ON r.passage=p.id AND r.model=?
                    WHERE m.source=? AND m.version=?""", (model, model, source, version),
             ).fetchone()
-            conn.execute("""UPDATE sources SET state='embeddings',embedding_done=?,embedding_total=?
+            conn.execute("""UPDATE sources SET state='embeddings',index_stage='embeddings',embedding_done=?,
+                            embedding_total=?,embedding_model_key=?
                             WHERE id=? AND pending=? AND state NOT IN ('paused','removing')""",
-                         (done, total, source, version))
+                         (done, total, model, source, version))
         last = 0
         while True:
             self.check(event)

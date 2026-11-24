@@ -27,7 +27,8 @@ CREATE TABLE IF NOT EXISTS sources (
     state TEXT NOT NULL DEFAULT 'queued', signature TEXT, updated TEXT,
     done INTEGER NOT NULL DEFAULT 0, failed INTEGER NOT NULL DEFAULT 0,
     omitted INTEGER NOT NULL DEFAULT 0, partial INTEGER NOT NULL DEFAULT 0, issue TEXT,
-    embedding_done INTEGER, embedding_total INTEGER
+    embedding_done INTEGER, embedding_total INTEGER, embedding_model_key TEXT,
+    index_stage TEXT, index_done INTEGER, index_total INTEGER
 );
 CREATE TABLE IF NOT EXISTS mails (
     id INTEGER PRIMARY KEY AUTOINCREMENT, source INTEGER NOT NULL REFERENCES sources(id),
@@ -467,9 +468,10 @@ class Store:
             conn.execute("PRAGMA journal_mode=WAL")
             conn.executescript(SCHEMA)
             source_columns = {row[1] for row in conn.execute("PRAGMA table_info(sources)")}
-            for column in ("embedding_done", "embedding_total"):
+            for column, datatype in (("embedding_done", "INTEGER"), ("embedding_total", "INTEGER"), ("embedding_model_key", "TEXT"),
+                                     ("index_stage", "TEXT"), ("index_done", "INTEGER"), ("index_total", "INTEGER")):
                 if column not in source_columns:
-                    conn.execute(f"ALTER TABLE sources ADD COLUMN {column} INTEGER")
+                    conn.execute(f"ALTER TABLE sources ADD COLUMN {column} {datatype}")
             if "active_signature" not in source_columns:
                 conn.execute("ALTER TABLE sources ADD COLUMN active_signature TEXT")
                 conn.execute("UPDATE sources SET active_signature=signature WHERE active IS NOT NULL AND pending IS NULL")
@@ -690,11 +692,13 @@ class Store:
     def sources(self):
         with self.connection() as conn:
             # Per-kind item counts feed the sidebar's mail/document/PCF sections.
-            counts = defaultdict(dict)
+            counts = defaultdict(lambda: defaultdict(int))
+            revision_counts = defaultdict(dict)
             for row in conn.execute(
-                f"SELECT m.source source,m.kind kind,COUNT(*) n FROM mails m {JOIN} GROUP BY m.source,m.kind"
+                "SELECT source,version,kind,COUNT(*) n FROM mails GROUP BY source,version,kind"
             ):
-                counts[row["source"]][row["kind"]] = row["n"]
+                counts[row["source"]][row["kind"]] += row["n"]
+                revision_counts[row["source"], row["version"]][row["kind"]] = row["n"]
             sources = []
             for row in conn.execute("SELECT * FROM sources ORDER BY id"):
                 version = row["pending"] or row["active"]
@@ -703,6 +707,7 @@ class Store:
                 deferred_psts = conn.execute("""SELECT COUNT(*) FROM problems WHERE source=? AND version=?
                     AND code='pst_in_use'""", (row["id"], version)).fetchone()[0]
                 sources.append({**dict(row), "counts": counts.get(row["id"], {}),
+                                "index_counts": revision_counts.get((row["id"], version), {}),
                                 "deferred_psts": deferred_psts, "problems": [dict(problem) for problem in problems]})
             return sources
 
