@@ -485,8 +485,8 @@ class Indexer:
                     ).fetchone()[0]
                     omitted_attachments = conn.execute(
                         "SELECT COUNT(*) FROM attachments a JOIN mails m ON m.id=a.mail "
-                        "WHERE m.source=? AND m.version=? AND a.status NOT IN ('대기','완료') "
-                        "AND NOT EXISTS(SELECT 1 FROM passages p WHERE p.mail=m.id AND p.attachment=a.id)",
+                        "WHERE m.source=? AND m.version=? AND m.kind='mail' AND a.status NOT IN ('대기','완료') "
+                        "AND NOT EXISTS(SELECT 1 FROM passages p WHERE p.attachment=a.id AND p.location<>'파일명')",
                         (source, version),
                     ).fetchone()[0]
                     omitted = skipped_psts + len(deferred) + omitted_documents + omitted_attachments
@@ -630,40 +630,60 @@ class Indexer:
 
     def index_attachments(self, root, temp, source, version, event, extras=()):
         with self.store.connection() as conn:
-            pending = conn.execute(
-                """SELECT m.item,m.folder,m.id FROM mails m WHERE m.source=? AND m.version=? AND
-                   EXISTS(SELECT 1 FROM attachments a WHERE a.mail=m.id AND a.status='대기') ORDER BY m.id""", (source, version)
-            )
-            batch = pending.fetchmany(128)
-            while batch:
+            last = 0
+            extracted = []
+
+            def save_extracted():
+                with conn:
+                    for attachment, mail, status, locations in extracted:
+                        for location, text in locations:
+                            for start, segment in sections(text):
+                                self.store.add_passage(conn, attachment["mail"], mail, attachment["id"],
+                                                       attachment["name"], location, start, segment)
+                        conn.execute("UPDATE attachments SET status=? WHERE id=?", (status, attachment["id"]))
+                    omitted = sum(not locations for _, _, _, locations in extracted)
+                    partial = sum(bool(locations) and status.startswith("일부 색인")
+                                  for _, _, status, locations in extracted)
+                    conn.execute("UPDATE sources SET omitted=omitted+?,partial=partial+? WHERE id=?",
+                                 (omitted, partial, source))
+                extracted.clear()
+
+            while True:
+                self.check(event)
+                batch = conn.execute(
+                    """SELECT m.item,m.folder,m.id FROM mails m WHERE m.source=? AND m.version=? AND m.id>?
+                       AND EXISTS(SELECT 1 FROM attachments a WHERE a.mail=m.id AND a.status='대기')
+                       ORDER BY m.id LIMIT 128""", (source, version, last),
+                ).fetchall()
+                if not batch:
+                    break
                 for row in batch:
                     self.check(event)
                     path = self.locate(root, extras, row["item"])
+                    attachments = conn.execute(
+                        "SELECT id,mail,name,status FROM attachments WHERE mail=? ORDER BY id", (row["id"],),
+                    ).fetchall()
                     try:
                         mail = parse_mail(path, row["folder"])
                     except (ValueError, OSError, LookupError, TypeError, RecursionError):
-                        count = conn.execute("UPDATE attachments SET status='추출 실패' WHERE mail=? AND status='대기'", (row["id"],)).rowcount
-                        conn.execute("UPDATE sources SET omitted=omitted+? WHERE id=?", (count, source))
-                        conn.commit()
-                        continue
-                    attachments = conn.execute("SELECT id,name,status FROM attachments WHERE mail=? ORDER BY id", (row["id"],)).fetchall()
-                    if [a["name"] for a in attachments] != [name for name, _ in mail["attachments"]]:
+                        mail = None
+                    if mail and [a["name"] for a in attachments] != [name for name, _ in mail["attachments"]]:
                         raise ImportIssue("changed")
-                    for attachment, (name, part) in zip(attachments, mail["attachments"]):
+                    for position, attachment in enumerate(attachments):
                         if attachment["status"] != "대기":
                             continue
                         self.check(event)
-                        status, locations = extract_attachment(name, part, temp, self.pdf, check=lambda: self.check(event))
-                        for location, text in locations:
-                            for start, segment in sections(text):
-                                self.store.add_passage(conn, row["id"], mail, attachment["id"], name, location, start, segment)
-                        conn.execute("UPDATE attachments SET status=? WHERE id=?", (status, attachment["id"]))
-                        conn.execute(
-                            "UPDATE sources SET omitted=omitted+?,partial=partial+? WHERE id=?",
-                            (int(not locations), int(bool(locations) and status.startswith("일부 색인")), source),
-                        )
-                        conn.commit()
-                batch = pending.fetchmany(128)
+                        if mail is None:
+                            status, locations = "추출 실패", []
+                        else:
+                            name, part = mail["attachments"][position]
+                            status, locations = extract_attachment(name, part, temp, self.pdf, check=lambda: self.check(event))
+                        extracted.append((attachment, mail, status, locations))
+                        if len(extracted) == 24:
+                            save_extracted()
+                last = batch[-1]["id"]
+            if extracted:
+                save_extracted()
 
     def index_embeddings(self, source, version, event):
         model = self.ai.embedding_index
