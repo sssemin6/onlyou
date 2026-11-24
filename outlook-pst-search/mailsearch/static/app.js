@@ -29,6 +29,8 @@ const stateNames = {
 const issueNames = {
   readpst_missing: "PST 추출 도구(readpst)를 설치하거나 실행 경로를 지정하세요.",
   pst_in_use: "Outlook에서 사용 중이거나 접근할 수 없는 PST입니다. Outlook을 닫거나 사본을 등록하세요.",
+  attachment_missing: "첨부 원본을 읽을 수 없습니다. 원본 메일과 보관함 경로를 확인하세요.",
+  attachment_changed: "색인할 때와 원본이 달라졌습니다. 보관함을 갱신한 뒤 다시 시도하세요.",
   pst_export: "PST 추출에 실패했습니다. Outlook에서 해당 파일이 열리는지, 로컬 디스크에 여유 공간이 있는지 확인하세요.",
   pst_invalid: "Outlook PST 헤더를 읽을 수 없습니다. Outlook에서 만든 .pst 파일인지 확인하세요.",
   pst_no_mail: "추출된 메일이 없습니다. Outlook에서 이 PST를 열어 받은 편지함이나 하위 폴더에 메일이 있는지 확인하세요.",
@@ -186,7 +188,7 @@ function elapsedTime(seconds) {
 
 async function showSources() {
   const version = ++sourceRequest;
-  const data = await call("/api/sources", undefined, AbortSignal.timeout(10000)).catch((error) => {
+  const data = await call("/api/sources?scan=0", undefined, AbortSignal.timeout(10000)).catch((error) => {
     if (version === sourceRequest && !element("source-connection")) {
       const status = node("p", "작업 상태 연결이 지연되고 있습니다. 다시 확인하는 중입니다.", "source-empty");
       status.id = "source-connection";
@@ -259,10 +261,6 @@ async function showSources() {
       entry.append(node("p", (existing ? "이전 색인 사용 중 · " : "색인 기준 ") + formatDate(source.updated)));
     }
     if (source.issue) entry.append(node("p", issueNames[source.issue] || source.issue, "issue"));
-    if (source.updates?.length && ["ready", "empty", "error"].includes(source.state)) {
-      entry.append(node("p", "갱신 대상 PST " + source.updates.length + "개", "issue"));
-    }
-    if (!source.available && source.state !== "removing") entry.append(node("p", "원본 경로 접근 불가", "issue"));
     const actions = node("div", "", "source-actions");
     const choices = ["queued", "extracting", "headers", "attachments", "embeddings"].includes(source.state)
       ? [["pause", "일시정지"]]
@@ -293,6 +291,26 @@ async function showSources() {
         }
       });
       actions.append(button);
+    }
+    if (source.kind === "eml_dir" && ["ready", "empty", "error"].includes(source.state)) {
+      const check = node("button", "변경 확인", "text-button");
+      const info = node("p", "", "issue");
+      check.type = "button";
+      check.addEventListener("click", async () => {
+        check.disabled = true;
+        info.textContent = "폴더를 확인하는 중입니다.";
+        try {
+          const data = await call("/api/source-updates/" + source.id, undefined, AbortSignal.timeout(10000));
+          info.textContent = !data.available ? "원본 경로 접근 불가"
+            : data.updates.length ? "갱신 대상 PST " + data.updates.length + "개" : "갱신 대상 PST 없음";
+        } catch (error) {
+          info.textContent = error.name === "TimeoutError" ? "폴더 응답이 지연되고 있습니다." : error.message;
+        } finally {
+          check.disabled = false;
+        }
+      });
+      actions.append(check);
+      entry.append(info);
     }
     entry.append(actions);
     sourcesList.append(entry);
@@ -333,6 +351,39 @@ function highlight(text, quote) {
     container.append(text.slice(0, start), node("mark", quote), text.slice(start + quote.length));
   }
   return container;
+}
+
+async function downloadAttachment(attachment, button, status) {
+  button.disabled = true;
+  status.textContent = "";
+  try {
+    while (button.isConnected && element("viewer").open) {
+      const response = await fetch("/api/attachment/" + attachment.id, {
+        headers: { "X-Mail-Session": token }, cache: "no-store", signal: AbortSignal.timeout(20000),
+      });
+      if (response.status === 202) {
+        status.textContent = "PST에서 원본을 준비하는 중입니다.";
+        await new Promise((resolve) => setTimeout(resolve, 2000));
+        continue;
+      }
+      if (!response.ok) {
+        const data = await response.json();
+        throw new Error(issueNames[data.error] || issueNames.attachment_missing);
+      }
+      const url = URL.createObjectURL(await response.blob());
+      const save = node("a");
+      save.href = url;
+      save.download = attachment.name.split(/[\\/]/).pop();
+      if (button.isConnected && element("viewer").open) save.click();
+      setTimeout(() => URL.revokeObjectURL(url), 30000);
+      status.textContent = "";
+      return;
+    }
+  } catch (error) {
+    status.textContent = error.name === "TimeoutError" ? "원본 응답이 지연되고 있습니다. 다시 시도하세요." : error.message;
+  } finally {
+    button.disabled = false;
+  }
 }
 
 let viewerRequest = 0;
@@ -384,13 +435,22 @@ async function openEvidence(id, quote) {
       const attachments = node("ul");
       body.append(node("h3", "첨부"), attachments);
       for (const attachment of item.attachments) {
-        const row = node("li");
+        const row = node("li", "", "attachment-row");
+        const state = attachment.status === "미지원 형식" ? "본문 색인 미지원" : attachment.status;
+        row.append(node("span", attachment.name + " · " + state));
+        const download = node("button", "원본 받기", "text-button");
+        const status = node("span", "", "attachment-download-status");
+        status.setAttribute("role", "status");
+        download.type = "button";
+        download.addEventListener("click", () => downloadAttachment(attachment, download, status));
+        row.append(download);
         if (attachment.passage) {
-          const link = node("button", attachment.name, "text-button");
-          link.type = "button";
-          link.addEventListener("click", () => openEvidence(attachment.passage));
-          row.append(link, " · " + attachment.status);
-        } else row.textContent = attachment.name + " · " + attachment.status;
+          const text = node("button", "색인 텍스트", "text-button");
+          text.type = "button";
+          text.addEventListener("click", () => openEvidence(attachment.passage));
+          row.append(text);
+        }
+        row.append(status);
         attachments.append(row);
       }
     }
@@ -788,6 +848,7 @@ async function applyGatewayDefaults() {
       ...fields, ...preset, key: sameAddress ? fields.key : "",
       ca_file: preset.ca_file || (sameAddress ? fields.ca_file : ""),
       runtime_unverified: sameAddress && fields.runtime_unverified,
+      rerank_unverified: sameAddress && fields.rerank_unverified,
     };
     renderSettings();
     settingsMessage("기본값을 불러왔습니다. 연결에 반영하려면 아래 적용 버튼을 누르세요.");
@@ -810,6 +871,7 @@ function readSettingsFields(gateway) {
     answer_models: element("gateway-answer-models").value, ca_file: element("gateway-ca-file").value,
     test_unverified: element("gateway-test-unverified").checked,
     runtime_unverified: element("gateway-runtime-unverified").checked,
+    rerank_unverified: element("gateway-rerank-unverified").checked,
     selections: Object.fromEntries(Object.keys(gatewayRoles).map(role => [role, element("gateway-" + role).value])),
   };
 }
@@ -819,6 +881,7 @@ settingsForm.addEventListener("input", (event) => {
     if (event.target.id === "gateway-url") {
       element("gateway-test-unverified").checked = false;
       element("gateway-runtime-unverified").checked = false;
+      element("gateway-rerank-unverified").checked = false;
     }
     if (event.target.id === "gateway-runtime-unverified" && event.target.checked) {
       element("gateway-test-unverified").checked = false;
@@ -852,12 +915,16 @@ function renderSettings() {
     element("gateway-ca-file").value = fields.ca_file;
     element("gateway-test-unverified").checked = Boolean(fields.test_unverified && !fields.runtime_unverified);
     element("gateway-runtime-unverified").checked = fields.runtime_unverified ?? false;
+    element("gateway-rerank-unverified").checked = fields.rerank_unverified ?? false;
     element("settings-current").textContent = gatewaySettings.configured
       ? (gatewaySettings.active_answer ? "사내 답변 모델 사용 중" : "사내 API 키 등록됨")
       : (fields.gateway_url ? "사내 API를 선택한 기능에만 키가 필요합니다."
         : "사내 API를 사용하려면 고급 설정에 HTTPS 주소를 입력하세요.");
     if (gatewaySettings.runtime_unverified) {
       element("settings-current").textContent += " · 답변·임베딩 인증서 검증 생략 중";
+    }
+    if (gatewaySettings.rerank_unverified) {
+      element("settings-current").textContent += " · 재정렬 인증서 검증 생략 중";
     }
     element("settings-remove").hidden = !gatewaySettings.configured;
     element("settings-key").placeholder = gatewaySettings.configured ? "등록된 사내 키를 쓰려면 비워 두세요" : "";
@@ -963,9 +1030,9 @@ async function changeSettings(action) {
     Object.assign(payload, readSettingsFields(gateway));
     payload.key = payload.key.trim();
     if (gateway) {
-      payload.test_unverified = action === "test" && payload.test_unverified && !payload.runtime_unverified;
+      payload.test_unverified = action === "test" && payload.test_unverified;
       const { answer, embedding, rerank } = payload.selections;
-      if (!payload.gateway_url.trim() && (payload.key || payload.runtime_unverified || answer || rerank || (embedding && embedding !== localEmbedding))) {
+      if (!payload.gateway_url.trim() && (payload.key || payload.runtime_unverified || payload.rerank_unverified || answer || rerank || (embedding && embedding !== localEmbedding))) {
         gatewayAdvanced.open = true;
         element("gateway-url").focus();
         settingsMessage(issueNames.gateway_url);
@@ -995,6 +1062,9 @@ async function changeSettings(action) {
           : gatewayCheckReasons[result.reason];
         return gatewayRoles[role][0] + " (" + model + ") " + (result.ok ? "성공" : "실패" + (reason ? " — " + reason : ""));
       }) : [];
+      if (payload.rerank_unverified && payload.selections.rerank) {
+        checks.push("재정렬의 인증서 검증을 생략했습니다.");
+      }
       if (payload.runtime_unverified && (payload.selections.answer || payload.selections.embedding === "bge-m3")) {
         checks.push("답변·사내 임베딩의 인증서 검증을 생략했습니다.");
       } else if (payload.test_unverified && checks.length) {
