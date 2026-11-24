@@ -313,10 +313,13 @@ class Store:
                 counts[row["source"]][row["kind"]] = row["n"]
             sources = []
             for row in conn.execute("SELECT * FROM sources ORDER BY id"):
+                version = row["pending"] or row["active"]
                 problems = conn.execute("""SELECT item,code FROM problems WHERE source=? AND version=?
-                    ORDER BY item LIMIT 5""", (row["id"], row["pending"] or row["active"])).fetchall()
+                    ORDER BY code='pst_in_use' DESC,item LIMIT 5""", (row["id"], version)).fetchall()
+                deferred_psts = conn.execute("""SELECT COUNT(*) FROM problems WHERE source=? AND version=?
+                    AND code='pst_in_use'""", (row["id"], version)).fetchone()[0]
                 sources.append({**dict(row), "counts": counts.get(row["id"], {}),
-                                "problems": [dict(problem) for problem in problems]})
+                                "deferred_psts": deferred_psts, "problems": [dict(problem) for problem in problems]})
             return sources
 
     def allowed_sources(self, source=None, *, sources=None):
@@ -488,10 +491,11 @@ class Store:
         return True
 
     def carry_prefix(self, conn, source, previous, version, prefix):
-        """Adopt every previous-version mail under an unchanged PST's item prefix."""
+        """Adopt previous-version mails under a PST prefix once per pending version."""
         rows = conn.execute(
-            "SELECT id FROM mails WHERE source=? AND version=? AND item LIKE ? ESCAPE '\\'",
-            (source, previous, like_prefix(prefix)),
+            """SELECT old.id FROM mails old WHERE old.source=? AND old.version=? AND old.item LIKE ? ESCAPE '\\'
+               AND NOT EXISTS (SELECT 1 FROM mails new WHERE new.source=old.source AND new.version=? AND new.item=old.item)""",
+            (source, previous, like_prefix(prefix), version),
         ).fetchall()
         for row in rows:
             self.adopt_mail(conn, version, row["id"])
