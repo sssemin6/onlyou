@@ -22,6 +22,7 @@ ANSWER_CLAIM_LIMIT = 8
 ANSWER_TEXT_LIMIT = 720
 ANSWER_EVIDENCE_LIMIT = 18
 DEFAULT_ANSWER_NUM_CTX = 16384
+QUERY_EMBEDDING_TIMEOUT = 6
 SYNTHESIS_QUESTION = re.compile(r"종합|비교|타임라인|시간\s*순|경과|흐름|이력|각각|항목별|쟁점별|상충")
 MAX_HTTP_BODY = 8 * 1024 * 1024
 MODEL_NAME = re.compile(r"[A-Za-z0-9][\w./:-]{0,149}", re.ASCII)
@@ -250,7 +251,7 @@ class LocalAI:
             return []
         if cached is None:
             with store.measure("embed"):
-                cached = embed([query], 6)[0]
+                cached = embed([query], QUERY_EMBEDDING_TIMEOUT)[0]
                 pack_vector(cached)
             with self.query_cache_lock:
                 if self.embedding_config is configuration:
