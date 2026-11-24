@@ -1,3 +1,4 @@
+import errno
 import hashlib
 import http.client
 import io
@@ -12,7 +13,7 @@ import time
 import unittest
 import zipfile
 import zlib
-from contextlib import nullcontext
+from contextlib import nullcontext, redirect_stderr, redirect_stdout
 from unittest.mock import MagicMock, patch
 from email.message import EmailMessage
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -28,7 +29,8 @@ from mailsearch.intranet import CHAT_PATH, IntranetAI, LOCAL_EMBEDDING
 from mailsearch.indexer import ImportIssue, Indexer
 from mailsearch.ollama_setup import (InstallCommandError, install_ollama, package_progress,
                                     pull_model, run_install_command, winget_binary)
-from mailsearch.server import App, gateway_defaults, gateway_diagnostics
+from mailsearch.server import (App, INSTANCE_FILE, SessionLock, existing_origin, gateway_defaults,
+                               gateway_diagnostics, main, publish_instance)
 from mailsearch.store import Store, read_signature
 from tools.demo import generate
 
@@ -1299,6 +1301,31 @@ class Integration(unittest.TestCase):
         self.assertEqual(evidence["attachments"][1]["status"], "미지원 형식")
         self.assertEqual(self.call("/api/search", {"query": "납품", "filters": {"after": "2027-01-01"}})[1]["results"], [])
         self.assertEqual(self.call("/api/search", {"query": 123})[0], 400)
+
+    def test_already_running_reopens_only_the_matching_app(self):
+        path = self.store.root / INSTANCE_FILE
+        self.assertIsNone(existing_origin(self.store.root))
+        with SessionLock(self.store.root), publish_instance(self.store.root, self.app):
+            with (patch("mailsearch.server.webbrowser.open") as browser,
+                  redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO())):
+                self.assertEqual(main(["--data", str(self.store.root), "--port", "0"]), 0)
+                browser.assert_called_once_with(self.app.origin)
+                self.assertEqual(main(["--data", str(self.store.root), "--port", "0", "--no-browser"]), 1)
+                browser.assert_called_once()
+                path.write_text(json.dumps({"port": self.app.server_port, "id": "0" * 32}), encoding="ascii")
+                self.assertEqual(main(["--data", str(self.store.root), "--port", "0"]), 1)
+                browser.assert_called_once()
+        self.assertFalse(path.exists())
+
+    def test_startup_reports_the_stage_for_actual_permission_errors(self):
+        failure = PermissionError(errno.EACCES, "fixture permission error")
+        with (patch("mailsearch.server.SessionLock.__enter__", side_effect=failure),
+              redirect_stderr(io.StringIO()) as stderr):
+            self.assertEqual(main(["--data", str(self.store.root), "--port", "0", "--no-browser"]), 1)
+        message = stderr.getvalue()
+        self.assertIn("세션 잠금 파일 열기", message)
+        self.assertIn("errno=13", message)
+        self.assertNotIn("다른 실행이", message)
 
     def test_status_poll_and_unrelated_keyword_query_do_not_probe_other_roots(self):
         source = self.import_mail()
