@@ -14,16 +14,19 @@ import threading
 import time
 from pathlib import Path
 
-from .embedding import logger
+from .embedding import GatewayRequestError, logger
 from .extract import CREATE_FLAGS, DOCUMENT_SUFFIXES, extract_attachment, extract_document, parse_mail
 from .filesystem import source_path, stable_input
 from .pcf import WORD_SUFFIXES
-from .store import buckets, document_kind, document_identity, fingerprint, now, pack_vector, read_signature, sections, vector_array
+from .store import (buckets, document_kind, document_identity, matches_fingerprint, now, pack_vector, read_signature,
+                    sections, vector_array)
 
 
 NO_MAIL = {"pst_no_mail", "eml_no_mail"}
 PST_DEFERRED = ("pst_in_use", "pst_changed")
 PST_PROGRESS_INTERVAL = 5
+EMBEDDING_BATCH_SIZE = 24
+EMBEDDING_BATCH_TIMEOUT = 60
 runtime_logger = logging.getLogger("mailsearch.runtime")
 
 
@@ -61,8 +64,13 @@ class ImportIssue(Exception):
 
 
 class Indexer:
-    def __init__(self, store, readpst="readpst", pdf="pdftotext", ai=None):
+    def __init__(self, store, readpst="readpst", pdf="pdftotext", ai=None, *,
+                 embedding_batch_size=EMBEDDING_BATCH_SIZE, embedding_batch_timeout=EMBEDDING_BATCH_TIMEOUT):
         self.store, self.readpst, self.pdf, self.ai = store, readpst, pdf, ai
+        if not 24 <= embedding_batch_size <= 64 or not 30 <= embedding_batch_timeout <= 60:
+            raise ValueError("embedding_batch_settings")
+        self.embedding_batch_size = embedding_batch_size
+        self.embedding_batch_timeout = embedding_batch_timeout
         self.lock = threading.RLock()
         self.events = {}
         self.pst_reads = {}
@@ -322,7 +330,7 @@ class Indexer:
             return {**{key: read[key] for key in ("item", "position", "total", "files")},
                     "elapsed": int(age - read["started"]), "idle": int(age - read["last_output"])}
 
-    def import_folder_psts(self, folder, stage, event, known, source, already_deferred):
+    def import_folder_psts(self, folder, stage, event, known, source, already_deferred, outdated):
         """Also import PST files kept inside a registered mail folder.
 
         PSTs whose signature matches the last committed import are carried over
@@ -366,7 +374,7 @@ class Indexer:
                         carried.append(label)
                         signatures[label] = known[label]
                     continue
-                if known.get(label) == signature:
+                if known.get(label) == signature and label not in outdated:
                     carried.append(label)
                     signatures[label] = signature
                     continue
@@ -389,7 +397,9 @@ class Indexer:
                         temporary = slot / "pst-signature.tmp"
                         temporary.write_text(signature, encoding="ascii")
                         temporary.replace(checkpoint)
-                    output = self.cached_export(pst, slot, event, source, label, signature)
+                    cached = self.original_cache(source, label, signature)
+                    output = (cached if label in outdated and cached.is_dir() else
+                              self.cached_export(pst, slot, event, source, label, signature))
                     if read_signature(pst) != signature:
                         raise ImportIssue("changed")
             except OSError as exc:
@@ -409,6 +419,9 @@ class Indexer:
                     continue
                 if str(exc) in {"pst_no_mail", "pst_export", "pst_invalid"}:
                     skipped += 1
+                    if label in outdated and known.get(label) == signature:
+                        # A failed migration must not drop results from an unchanged PST.
+                        carried.append(label)
                     # Remember the signature so an unchanged unusable PST is not
                     # flagged as an update target on every later refresh.
                     signatures[label] = signature
@@ -489,7 +502,7 @@ class Indexer:
 
         mail = parse_mail(path, row["folder"])
         position = row["position"]
-        if fingerprint(mail, item) != row["fingerprint"] or position >= len(mail["attachments"]):
+        if not matches_fingerprint(mail, item, row["fingerprint"]) or position >= len(mail["attachments"]):
             raise ImportIssue("attachment_changed")
         name, part = mail["attachments"][position]
         if name != row["name"]:
@@ -625,7 +638,9 @@ class Indexer:
                         raise ImportIssue("changed")
                     if not self.pst_header(path):
                         raise ImportIssue("pst_invalid")
-                    root = self.cached_export(path, stage, event, source, "", signature)
+                    outdated = self.store.outdated_pst_labels(source, previous, ("",))
+                    cached = self.original_cache(source, "", signature)
+                    root = cached if outdated and cached.is_dir() else self.cached_export(path, stage, event, source, "", signature)
                     if read_signature(path) != signature:
                         raise ImportIssue("changed")
             except OSError as exc:
@@ -642,8 +657,10 @@ class Indexer:
                             "SELECT item,code FROM problems WHERE source=? AND version=? AND code IN (?,?)",
                             (source, version, *PST_DEFERRED),
                         ).fetchall())
+                known = self.store.pst_files(source)
+                outdated = self.store.outdated_pst_labels(source, previous, known)
                 extras, carried, skipped_psts, signatures, deferred = self.import_folder_psts(
-                    path, stage, event, self.store.pst_files(source), source, already_deferred)
+                    path, stage, event, known, source, already_deferred, outdated)
                 with self.store.connection() as conn:
                     conn.execute("DELETE FROM problems WHERE source=? AND version=? AND code IN (?,?)",
                                  (source, version, *PST_DEFERRED))
@@ -715,11 +732,12 @@ class Indexer:
                     shutil.rmtree(folder, ignore_errors=True)
 
     def pending_updates(self, row):
-        """PST files under a registered folder that changed since the last import."""
+        """PST files that changed or use an older index format."""
         if row["kind"] != "eml_dir" or row["state"] not in {"ready", "empty", "error"}:
             return []
         path = Path(row["path"])
         known = self.store.pst_files(row["id"])
+        outdated = self.store.outdated_pst_labels(row["id"], row["active"], known)
         changed = []
         try:
             files = sorted(item for item in path.rglob("*") if item.suffix.lower() == ".pst")
@@ -728,7 +746,9 @@ class Indexer:
         for pst in files:
             item = pst.relative_to(path).as_posix()
             try:
-                if not pst.is_symlink() and stat.S_ISREG(pst.stat().st_mode) and known.get(item + "/") != read_signature(pst):
+                label = item + "/"
+                if (not pst.is_symlink() and stat.S_ISREG(pst.stat().st_mode)
+                        and (label in outdated or known.get(label) != read_signature(pst))):
                     changed.append(item)
             except OSError as exc:
                 if pst_access_error(exc):
@@ -781,7 +801,7 @@ class Indexer:
                         doc = {"name": path.name, "folder": folder, "sent": document_date(path),
                                "status": status, "sections": locations, "pcf": structured}
                         adopted = previous is not None and self.store.try_adopt(
-                            conn, source, previous, version, item, document_identity(doc))
+                            conn, source, previous, version, item, document_identity(doc), index_format=None)
                         if adopted:
                             conn.execute("""UPDATE attachments SET status=? WHERE mail IN (
                                 SELECT id FROM mails WHERE source=? AND version=? AND item=?)""",
@@ -874,7 +894,7 @@ class Indexer:
                         mail = parse_mail(path, row["folder"])
                     except (ValueError, OSError, LookupError, TypeError, RecursionError):
                         mail = None
-                    changed = mail is not None and fingerprint(mail, row["item"]) != row["fingerprint"]
+                    changed = mail is not None and not matches_fingerprint(mail, row["item"], row["fingerprint"])
                     if changed and (root.is_file() or not path.is_relative_to(root)):
                         raise ImportIssue("changed")
                     for position, attachment in enumerate(attachments):
@@ -901,6 +921,8 @@ class Indexer:
 
     def index_embeddings(self, source, version, event):
         model = self.ai.embedding_index
+        batch_size = self.embedding_batch_size
+        timeout = self.embedding_batch_timeout
         self.check(event)
         with self.store.connection() as conn:
             total, done = conn.execute(
@@ -922,7 +944,7 @@ class Indexer:
                        LEFT JOIN attachments a ON a.id=p.attachment WHERE m.source=? AND m.version=? AND p.id>?
                        AND NOT EXISTS(SELECT 1 FROM vectors v WHERE v.passage=p.id AND v.model=?)
                        AND NOT EXISTS(SELECT 1 FROM embedding_refs r WHERE r.passage=p.id AND r.model=?)
-                       ORDER BY p.id LIMIT 24""", (source, version, last, model, model)
+                       ORDER BY p.id LIMIT ?""", (source, version, last, model, model, batch_size)
                 ).fetchall()
                 shared = {}
                 inputs = {}
@@ -941,13 +963,24 @@ class Indexer:
             if not rows:
                 return None
             try:
-                encoded = [pack_vector(v) for v in self.ai.embed(list(inputs.values()), timeout=45)] if inputs else []
+                if self.ai.embedding_index != model:
+                    return "embedding_unavailable"
+                encoded = [pack_vector(v) for v in self.ai.embed(list(inputs.values()), timeout=timeout)] if inputs else []
                 if len(encoded) != len(inputs):
                     raise ValueError("embeddings")
+                if self.ai.embedding_index != model:
+                    return "embedding_unavailable"
                 shared.update(zip(inputs, encoded))
             except (OSError, ValueError, RuntimeError, KeyError, TypeError, http.client.HTTPException) as exc:
                 winerror = getattr(exc, "winerror", None)
                 backend = "gateway" if self.ai.embedding_api and self.ai.embedding_api.index_key else "Ollama"
+                retryable = isinstance(exc, TimeoutError) or (
+                    isinstance(exc, GatewayRequestError) and exc.status in {408, 413, 504})
+                if retryable and len(inputs) > 1:
+                    batch_size = max(1, len(inputs) // 2)
+                    logger.warning("Embedding batch retry (backend=%s, completed=%d/%d, timeout=%ds, next_batch=%d): %s",
+                                   backend, done, total, timeout, batch_size, type(exc).__name__)
+                    continue
                 logger.error("Embedding batch failed (backend=%s, completed=%d/%d): %s (errno=%s, winerror=%s)",
                              backend, done, total, type(exc).__name__, getattr(exc, "errno", None), winerror)
                 if isinstance(exc, ConnectionAbortedError) or winerror == 10053:
