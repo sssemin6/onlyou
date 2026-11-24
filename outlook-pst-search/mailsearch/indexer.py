@@ -8,6 +8,7 @@ import sqlite3
 import stat
 import subprocess
 import threading
+import time
 from pathlib import Path
 
 from .embedding import logger
@@ -18,6 +19,7 @@ from .store import buckets, document_kind, document_identity, now, pack_vector, 
 
 
 NO_MAIL = {"pst_no_mail", "eml_no_mail"}
+PST_PROGRESS_INTERVAL = 5
 
 
 def pst_access_error(exc):
@@ -44,6 +46,7 @@ class Indexer:
         self.store, self.readpst, self.pdf, self.ai = store, readpst, pdf, ai
         self.lock = threading.RLock()
         self.events = {}
+        self.pst_reads = {}
         self.worker = None
         self.stopping = False
         with store.connection() as conn:
@@ -215,6 +218,7 @@ class Indexer:
             finally:
                 with self.lock:
                     self.events.pop(source, None)
+                    self.pst_reads.pop(source, None)
 
     @staticmethod
     def check(event):
@@ -231,7 +235,26 @@ class Indexer:
             header = stream.read(12)
         return len(header) == 12 and header[:4] == b"!BDN" and header[8:10] == b"SM"
 
-    def import_folder_psts(self, folder, stage, event, known):
+    def start_pst_read(self, source, item, position, total):
+        started = time.monotonic()
+        with self.lock:
+            self.pst_reads[source] = {
+                "item": item, "position": position, "total": total, "files": 0,
+                "started": started, "last_output": started,
+            }
+
+    def pst_progress(self, row):
+        if row["state"] != "extracting":
+            return None
+        with self.lock:
+            read = self.pst_reads.get(row["id"])
+            if read is None:
+                return None
+            age = time.monotonic()
+            return {**{key: read[key] for key in ("item", "position", "total", "files")},
+                    "elapsed": int(age - read["started"]), "idle": int(age - read["last_output"])}
+
+    def import_folder_psts(self, folder, stage, event, known, source):
         """Also import PST files kept inside a registered mail folder.
 
         PSTs whose signature matches the last committed import are carried over
@@ -245,9 +268,10 @@ class Indexer:
         deferred = []
         files = sorted(path for path in folder.rglob("*")
                        if path.suffix.lower() == ".pst")
-        for pst in files:
+        for position, pst in enumerate(files, 1):
             self.check(event)
             item = pst.relative_to(folder).as_posix()
+            self.start_pst_read(source, item, position, len(files))
             label = item + "/"
             try:
                 if pst.is_symlink() or not stat.S_ISREG(pst.stat().st_mode):
@@ -273,7 +297,7 @@ class Indexer:
                 with stable_input(pst):
                     if not self.pst_header(pst):
                         raise ImportIssue("pst_invalid")
-                    output = self.export(pst, slot, event)
+                    output = self.export(pst, slot, event, source)
                     if read_signature(pst) != signature:
                         raise ImportIssue("changed")
             except OSError as exc:
@@ -296,7 +320,7 @@ class Indexer:
             signatures[label] = signature
         return extras, carried, skipped, signatures, deferred
 
-    def export(self, path, stage, event):
+    def export(self, path, stage, event, source):
         output = stage / "eml"
         if (stage / "export-complete").is_file():
             return output
@@ -312,9 +336,21 @@ class Indexer:
             creationflags=CREATE_FLAGS,
         ) as process:
             try:
+                next_sample = time.monotonic() + PST_PROGRESS_INTERVAL
                 while process.poll() is None:
                     if event.wait(.2):
                         raise Paused()
+                    started = time.monotonic()
+                    if started >= next_sample:
+                        # Count output files by name, without opening mail or rechecking the source share.
+                        count = sum(1 for _, _, files in os.walk(output) for name in files
+                                    if name.lower().endswith(".eml") or (name.isascii() and name.isdecimal()))
+                        sampled = time.monotonic()
+                        with self.lock:
+                            read = self.pst_reads[source]
+                            if count > read["files"]:
+                                read.update(files=count, last_output=sampled)
+                        next_sample = sampled + max(PST_PROGRESS_INTERVAL, (sampled - started) * 10)
             finally:
                 if process.poll() is None:
                     process.terminate()
@@ -366,13 +402,14 @@ class Indexer:
         is_pst = row["kind"] == "pst"
         extras, carried, signatures, deferred = (), (), None, ()
         if is_pst:
+            self.start_pst_read(source, path.name, 1, 1)
             try:
                 with stable_input(path):
                     if read_signature(path) != signature:
                         raise ImportIssue("changed")
                     if not self.pst_header(path):
                         raise ImportIssue("pst_invalid")
-                    root = self.export(path, stage, event)
+                    root = self.export(path, stage, event, source)
                     if read_signature(path) != signature:
                         raise ImportIssue("changed")
             except OSError as exc:
@@ -383,7 +420,7 @@ class Indexer:
             root = path
             if path.is_dir():
                 extras, carried, skipped_psts, signatures, deferred = self.import_folder_psts(
-                    path, stage, event, self.store.pst_files(source))
+                    path, stage, event, self.store.pst_files(source), source)
                 if skipped_psts or deferred:
                     with self.store.connection() as conn:
                         conn.executemany("INSERT INTO problems VALUES(?,?,?,'pst_in_use')",
@@ -436,7 +473,7 @@ class Indexer:
 
     def pending_updates(self, row):
         """PST files under a registered folder that changed since the last import."""
-        if row["kind"] != "eml_dir":
+        if row["kind"] != "eml_dir" or row["state"] not in {"ready", "empty", "error"}:
             return []
         path = Path(row["path"])
         known = self.store.pst_files(row["id"])
