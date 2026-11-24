@@ -1,5 +1,6 @@
 """Extract searchable text and preserve attachment locations."""
 import hashlib
+import hashlib
 import io
 import os
 import re
@@ -383,8 +384,12 @@ def extract_document(path, temporary, pdf_command, *, check=lambda: None, struct
     return status, locations
 
 
-def extract_attachment(name, part, temporary, pdf_command, *, check=lambda: None):
+def extract_attachment(name, part, temporary, pdf_command, *, check=lambda: None, cache=None):
     suffix = Path(name).suffix.lower()
     if suffix not in TEXT_EXTRACTION_SUFFIXES:
         return "미지원 형식", []
-    return extract_bytes(part.get_payload(decode=True), suffix, temporary, pdf_command, check=check)
+    payload = part.get_payload(decode=True)
+    if cache is None or not payload or len(payload) > MAX_ATTACHMENT:
+        return extract_bytes(payload, suffix, temporary, pdf_command, check=check)
+    key = hashlib.sha256(suffix.encode("ascii") + b"\0" + payload).digest()
+    return cache(key, lambda: extract_bytes(payload, suffix, temporary, pdf_command, check=check))
