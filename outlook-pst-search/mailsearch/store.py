@@ -1191,6 +1191,16 @@ class Store:
         )
         return [dict(row) for row in rows] if checked else self.visible_rows(rows)
 
+    def reply_links(self, mails):
+        if not mails:
+            return []
+        with self.connection() as conn:
+            return conn.execute(
+                """SELECT m.id,m.source,m.message_id,r.parent FROM mails m
+                   LEFT JOIN replies r ON r.mail=m.id WHERE m.id IN (SELECT value FROM json_each(?))""",
+                (json.dumps(sorted(mails)),),
+            ).fetchall()
+
     def related(self, seeds, filters, *, hops=1):
         if not seeds:
             return []
