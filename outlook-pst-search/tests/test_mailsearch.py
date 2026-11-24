@@ -25,11 +25,11 @@ from mailsearch.external import ExternalAI, Excerpt, Reviews, pcf_batches
 from mailsearch.extract import convert_legacy, extract_attachment
 from mailsearch.filesystem import DRIVE_REMOTE, is_unc_share, local_path, source_path
 from mailsearch.intranet import CHAT_PATH, IntranetAI, LOCAL_EMBEDDING
-from mailsearch.indexer import Indexer
+from mailsearch.indexer import ImportIssue, Indexer
 from mailsearch.ollama_setup import (InstallCommandError, install_ollama, package_progress,
                                     pull_model, run_install_command, winget_binary)
 from mailsearch.server import App, gateway_defaults, gateway_diagnostics
-from mailsearch.store import Store
+from mailsearch.store import Store, read_signature
 from tools.demo import generate
 
 
@@ -1403,6 +1403,52 @@ class Integration(unittest.TestCase):
         self.indexer.command(source, "resume")
         latest = await_source(self.store, source, {"ready", "error"})
         self.assertEqual((latest["state"], latest["done"], latest["omitted"]), ("ready", 4, 1))
+
+    def test_folder_mtime_change_during_embedding_keeps_completed_index(self):
+        embed = self.indexer.index_embeddings
+
+        def change_folder(source, revision, event):
+            result = embed(source, revision, event)
+            (self.mail / "unrelated.tmp").touch()
+            return result
+
+        self.indexer.index_embeddings = change_folder
+        source = self.indexer.register(self.mail)
+        row = await_source(self.store, source, {"ready", "error"})
+        self.assertEqual((row["state"], row["done"], row["omitted"]), ("ready", 4, 1))
+        self.assertEqual(row["embedding_done"], row["embedding_total"])
+        self.assertGreater(row["embedding_done"], 0)
+
+    def test_resume_legacy_folder_changed_with_locked_pst_keeps_vectors(self):
+        (self.mail / "locked.pst").write_bytes(b"!BDN" + bytes(4) + b"SM" + bytes(2))
+        legacy_signature = read_signature(self.mail)
+        embed = self.indexer.index_embeddings
+
+        def previous_version(source, revision, event):
+            embed(source, revision, event)
+            with self.store.connection() as conn:
+                conn.execute("UPDATE sources SET signature=? WHERE id=?", (legacy_signature, source))
+            info = self.mail.stat()
+            os.utime(self.mail, ns=(info.st_atime_ns, info.st_mtime_ns - 10**9))
+            raise ImportIssue("changed")
+
+        with patch("mailsearch.indexer.stable_input", side_effect=PermissionError("simulated lock")):
+            self.indexer.index_embeddings = previous_version
+            source = self.indexer.register(self.mail)
+            interrupted = await_source(self.store, source, {"error"})
+        self.assertEqual((interrupted["issue"], interrupted["done"], interrupted["omitted"]), ("changed", 4, 2))
+        self.assertGreater(interrupted["embedding_done"], 0)
+        deadline = time.monotonic() + 5
+        while source in self.indexer.events and time.monotonic() < deadline:
+            time.sleep(.01)
+        self.indexer.index_embeddings = embed
+        with patch.object(self.ai, "embed", side_effect=AssertionError("already embedded")):
+            self.assertEqual(self.call("/api/source-action", {"source": source, "action": "resume"})[0], 202)
+            ready = await_source(self.store, source, {"ready", "error"})
+        self.assertEqual((ready["state"], ready["active"], ready["omitted"], ready["embedding_done"]),
+                         ("ready", interrupted["pending"], 2, interrupted["embedding_done"]))
+        visible = self.call("/api/sources?scan=0")[1]["sources"][0]
+        self.assertEqual(visible["deferred_psts"], 1)
 
     def test_restart_recovers_committed_index_work_and_keeps_manual_pause(self):
         started, release = threading.Event(), threading.Event()
