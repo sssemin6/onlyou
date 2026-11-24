@@ -1269,6 +1269,21 @@ class Integration(unittest.TestCase):
         self.assertEqual(self.call("/api/search", {"query": "납품", "filters": {"after": "2027-01-01"}})[1]["results"], [])
         self.assertEqual(self.call("/api/search", {"query": 123})[0], 400)
 
+    def test_keyword_search_bypasses_ai_while_hybrid_search_uses_it(self):
+        self.import_mail()
+        with (patch.object(self.ai, "semantic_search", return_value=[]) as semantic,
+              patch.object(self.ai, "rerank_candidates", side_effect=lambda _, rows: rows) as rerank):
+            query = {"query": "A-17", "filters": {"tab": "mail"}}
+            status, found = self.call("/api/search", {**query, "mode": "keyword"})
+            self.assertEqual(status, 200)
+            self.assertTrue(found["results"])
+            semantic.assert_not_called()
+            rerank.assert_not_called()
+            status, hybrid = self.call("/api/search", {**query, "mode": "hybrid"})
+            self.assertEqual((status, hybrid), (200, found))
+            semantic.assert_called_once()
+            rerank.assert_called_once()
+
     def test_quoted_exact_search_with_and_or(self):
         self.import_mail()
         exact = self.call("/api/search", {"query": '"A-17"', "filters": {}})[1]["results"]
