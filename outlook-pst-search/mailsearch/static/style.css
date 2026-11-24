@@ -378,6 +378,8 @@ dialog::backdrop { background: #21160cad; }
 .viewer-content pre { margin: 0; padding: 12px 14px; border: 1px solid var(--line); border-radius: 8px; background: #fbf5e9; font: inherit; white-space: pre-wrap; overflow-wrap: anywhere; }
 .viewer-content blockquote { margin: 13px 0; padding: 9px 12px; border-left: 4px solid var(--accent); background: #f7e5be; white-space: pre-wrap; overflow-wrap: anywhere; }
 .viewer-content h3 { margin: 16px 0 5px; font-size: .94rem; }
+.attachment-row .text-button { margin-left: 8px; }
+.attachment-download-status { margin-left: 8px; color: var(--muted); font-size: .8rem; }
 .viewer-content ul { margin: 0; padding-left: 20px; overflow-wrap: anywhere; }
 mark { color: var(--ink); background: #f2cf84; }
 
