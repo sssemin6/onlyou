@@ -112,7 +112,8 @@ def request_gateway_json(origin, path, payload, headers, *, timeout, max_bytes, 
                      destination, type(exc).__name__, exc.library, exc.reason)
         raise
     except (OSError, http.client.HTTPException) as exc:
-        logger.error("POST %s: %s (errno=%s)", destination, type(exc).__name__, getattr(exc, "errno", None))
+        logger.error("POST %s: %s (errno=%s, winerror=%s)", destination, type(exc).__name__,
+                     getattr(exc, "errno", None), getattr(exc, "winerror", None))
         raise
     finally:
         connection.close()
