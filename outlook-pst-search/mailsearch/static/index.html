@@ -199,6 +199,8 @@
                 <label for="gateway-ca-file">CA 인증서 경로 (선택)</label>
                 <input id="gateway-ca-file" maxlength="2048" spellcheck="false" placeholder="C:\certs\company-ca.pem">
                 <label class="settings-checkbox"><input type="checkbox" id="gateway-test-unverified"> 연결 테스트에서만 인증서 검증 생략</label>
+                <label class="settings-checkbox"><input type="checkbox" id="gateway-runtime-unverified" aria-describedby="gateway-runtime-help"> 실제 답변·임베딩에서 인증서 검증 생략</label>
+                <p id="gateway-runtime-help">이 옵션을 켜면 해당 HTTPS 주소의 서버 신원을 확인하지 못하므로 API 키와 메일·문서 내용이 가로채일 수 있습니다.</p>
               </div>
             </details>
           </div>
