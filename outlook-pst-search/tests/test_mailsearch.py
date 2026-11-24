@@ -11,6 +11,7 @@ import time
 import unittest
 import zipfile
 import zlib
+from contextlib import nullcontext
 from unittest.mock import MagicMock, patch
 from email.message import EmailMessage
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -494,6 +495,85 @@ class Integration(unittest.TestCase):
         status, attachment = self.call("/api/search", {"query": "320000원", "filters": {}})
         self.assertEqual(status, 200)
         self.assertTrue(attachment["results"])
+
+    def test_folder_refresh_defers_locked_pst_and_updates_the_rest(self):
+        folder = Path(self.workspace.name) / "shared-archives"
+        folder.mkdir()
+        locked = folder / "a-locked.pst"
+        other = folder / "b-readable.pst"
+        header = b"!BDN" + bytes(4) + b"SM" + bytes(2)
+        for pst in (locked, other):
+            pst.write_bytes(header)
+        blocked = set()
+        exported = []
+
+        def lock_check(pst):
+            if pst in blocked:
+                error = OSError("Windows sharing violation")
+                error.winerror = 32
+                raise error
+            return nullcontext()
+
+        def export(pst, stage, _event):
+            exported.append(pst.name)
+            message = EmailMessage()
+            message["Subject"] = pst.stem
+            message["Message-ID"] = f"<{pst.stem}@example.invalid>"
+            suffix = pst.read_bytes()[len(header):].decode("ascii")
+            message.set_content(f"{pst.stem} {'updated' if suffix else 'original'} archive text.")
+            output = stage / "eml"
+            output.mkdir(parents=True)
+            (output / "1").write_bytes(message.as_bytes())
+            return output
+
+        def wait_for_result(source):
+            row = await_source(self.store, source, {"ready", "error", "empty"})
+            deadline = time.monotonic() + 3
+            while source in self.indexer.events and time.monotonic() < deadline:
+                time.sleep(.01)
+            return row
+
+        def listing(source):
+            return next(item for item in self.call("/api/sources")[1]["sources"] if item["id"] == source)
+
+        with (patch.object(Indexer, "export", side_effect=export),
+              patch("mailsearch.indexer.stable_input", side_effect=lock_check)):
+            blocked.update((locked, other))
+            status, payload = self.call("/api/sources", {"path": str(folder)})
+            self.assertEqual(status, 202)
+            source = payload["source"]
+            row = wait_for_result(source)
+            self.assertEqual((row["state"], row["issue"], row["omitted"]), ("error", "pst_in_use", 2))
+            self.assertEqual(listing(source)["deferred_psts"], 2)
+            blocked.clear()
+            self.assertEqual(self.call("/api/source-action", {"source": source, "action": "resume"})[0], 202)
+            row = wait_for_result(source)
+            self.assertEqual((row["state"], row["done"], row["omitted"]), ("ready", 2, 0))
+            known = self.store.pst_files(source)
+
+            for pst in (locked, other):
+                pst.write_bytes(header + b"new-data")
+            blocked.add(locked)
+            exported.clear()
+            self.assertEqual(self.call("/api/source-action", {"source": source, "action": "refresh"})[0], 202)
+            row = wait_for_result(source)
+            self.assertEqual((row["state"], row["done"], row["omitted"]), ("ready", 2, 1))
+            current = listing(source)
+            self.assertEqual(current["deferred_psts"], 1)
+            self.assertEqual(current["problems"], [{"item": locked.name, "code": "pst_in_use"}])
+            self.assertEqual(current["updates"], [locked.name])
+            self.assertEqual(exported, [other.name])
+            self.assertEqual(self.store.pst_files(source)[locked.name + "/"], known[locked.name + "/"])
+            for query in ('"a-locked original"', '"b-readable updated"'):
+                self.assertTrue(self.call("/api/search", {"query": query, "filters": {}})[1]["results"])
+
+            blocked.clear()
+            self.assertEqual(self.call("/api/source-action", {"source": source, "action": "refresh"})[0], 202)
+            row = wait_for_result(source)
+            self.assertEqual((row["state"], row["done"], row["omitted"]), ("ready", 2, 0))
+            self.assertEqual(exported, [other.name, locked.name])
+            self.assertEqual(listing(source)["updates"], [])
+            self.assertTrue(self.call("/api/search", {"query": '"a-locked updated"', "filters": {}})[1]["results"])
 
     def test_refresh_reindexes_and_embeds_only_new_mail(self):
         source = self.import_mail()
