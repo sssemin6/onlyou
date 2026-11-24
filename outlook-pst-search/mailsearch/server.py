@@ -15,6 +15,7 @@ import sys
 import threading
 import time
 import webbrowser
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from logging.handlers import RotatingFileHandler
@@ -33,6 +34,7 @@ from .indexer import ImportIssue, Indexer, runtime_logger
 from .intranet import CHAT_PATH, LOCAL_EMBEDDING, RERANK_PATH, IntranetAI, available_models, validate_selections
 from .ollama_setup import OllamaSetup
 from .pcf import PCF_CELL
+from .search_profile import SearchProfile, SearchTickets
 from .store import Store, normalized, pack_vector, query_words, quoted_plan
 
 STATIC = Path(__file__).with_name("static")
@@ -124,6 +126,8 @@ class App(ThreadingHTTPServer):
     def __init__(self, port, store, indexer, ai, external=None, *, api_settings=None, gateway_preset=None):
         super().__init__(("127.0.0.1", port), Handler)
         self.store, self.indexer, self.ai = store, indexer, ai
+        self.search_workers = ThreadPoolExecutor(max_workers=2, thread_name_prefix="semantic-search")
+        self.search_tickets = SearchTickets()
         self.ollama_setup = OllamaSetup(ai)
         self.external = external
         self.generic_answer = external
@@ -148,6 +152,13 @@ class App(ThreadingHTTPServer):
         self.last_seen = 0.0
 
         self.restore_api_settings()
+
+    def server_close(self):
+        super().server_close()
+        if hasattr(self, "search_workers"):
+            self.search_workers.shutdown(wait=True, cancel_futures=True)
+            if self.store.vector_index:
+                self.store.vector_index.close()
 
     def watch_page(self, stopped):
         last_busy = 0.0
@@ -348,6 +359,8 @@ def filters_from(get):
 
 
 class Handler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    disable_nagle_algorithm = True
     server_version = "PSTMailSearch"
     sys_version = ""
 
@@ -392,7 +405,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def handle(self):
         try:
-            super().handle()
+            with self.server.store.thread_connection():
+                super().handle()
         except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, TimeoutError):
             # The browser can close a local connection while a request is in flight.
             pass
@@ -501,14 +515,18 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         route = urlsplit(self.path).path
         if not self.authorized(route):
+            self.close_connection = True
             return
+        body_consumed = False
         try:
             if self.headers.get_content_type() != "application/json":
                 raise ValueError("content_type")
             size = int(self.headers.get("Content-Length", "0"))
             if not 0 < size <= MAX_REQUEST:
                 raise ValueError("content_length")
-            payload = json.loads(self.rfile.read(size))
+            raw = self.rfile.read(size)
+            body_consumed = True
+            payload = json.loads(raw)
             if not isinstance(payload, dict):
                 raise ValueError("body")
             if route == "/api/sources":
@@ -517,7 +535,16 @@ class Handler(BaseHTTPRequestHandler):
             elif route == "/api/source-action":
                 self.server.indexer.command(int(payload["source"]), payload["action"])
                 self.send_json(202, {})
-            elif route in {"/api/search", "/api/candidates", "/api/answer", "/api/external/preview", "/api/pcf/preview"}:
+            elif route == "/api/search-access":
+                self.verify_search(payload["ticket"])
+            elif route == "/api/answer":
+                profile = SearchProfile("answer")
+                try:
+                    with self.server.store.search_session(profile):
+                        self.query(route, payload)
+                finally:
+                    profile.log(runtime_logger, "answer")
+            elif route in {"/api/search", "/api/candidates", "/api/external/preview", "/api/pcf/preview"}:
                 self.query(route, payload)
             elif route in {"/api/external/send", "/api/pcf/send"}:
                 self.send_external(payload, pcf=route == "/api/pcf/send")
@@ -534,11 +561,131 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 self.send_json(404, {"error": "not_found"})
         except (ValueError, TypeError, KeyError, OverflowError):
+            if not body_consumed:
+                self.close_connection = True
             self.send_json(400, {"error": "invalid_input"})
         except ImportIssue as exc:
             self.send_json(409, {"error": str(exc)})
         except sqlite3.Error:
             self.send_json(503, {"error": "index_unavailable"})
+
+    def semantic_candidates(self, query, filters, profile, defer_access):
+        store = self.server.store
+        try:
+            with store.search_session(profile, defer_access):
+                return self.server.ai.semantic_search(store, query, filters)
+        except (OSError, ValueError, RuntimeError, KeyError, IndexError, TypeError, http.client.HTTPException):
+            return []
+
+    def search(self, query, filters, payload):
+        store, ai = self.server.store, self.server.ai
+        mode = payload.get("mode")
+        plan = quoted_plan(query)
+        quick = mode == "quick" and plan is None and not filters.get("body")
+        hybrid = plan is None and mode not in ("keyword", "quick")
+        rerank = hybrid and bool(query) and payload.get("rerank") is True
+        defer = payload.get("defer_access") is True
+        profile = SearchProfile("quick" if quick else "hybrid" if hybrid else "keyword")
+        with store.search_session(profile, defer):
+            future = None
+            if query and hybrid and ai.embedding_index:
+                future = self.server.search_workers.submit(self.semantic_candidates, query, filters, profile, defer)
+            with profile.measure("fts"):
+                if plan is not None:
+                    rows = store.exact_search(plan, filters)
+                elif quick:
+                    rows = store.quick_search(query, filters, limit=100 if defer else 20)
+                else:
+                    rows = store.lexical(query, filters, limit=180)
+            if future:
+                rows = merge_rows(rows, future.result(), limit=60)
+            if defer and rows:
+                sources, documents = {}, {}
+                allowed, unknown = [], False
+                for row in rows:
+                    decision = store.result_access(row, sources, documents, cached_only=True)
+                    if decision is None:
+                        unknown = True
+                    elif decision:
+                        allowed.append(row)
+                result = self.search_results(allowed, query, filters, quick, bool(plan))
+                if unknown or rerank:
+                    result["access_ticket"] = self.server.search_tickets.issue(
+                        (rows, query, filters, quick, bool(plan), rerank, profile)
+                    )
+                self.send_json(200, result)
+            else:
+                if rerank:
+                    with profile.measure("rerank"):
+                        rows = ai.rerank_candidates(query, rows)
+                self.send_json(200, self.search_results(rows, query, filters, quick, bool(plan)))
+        profile.log(runtime_logger, "query")
+
+    def verify_search(self, ticket):
+        pending = self.server.search_tickets.take(ticket) if isinstance(ticket, str) and len(ticket) <= 64 else None
+        if pending is None:
+            self.send_json(409, {"error": "search_expired"})
+            return
+        rows, query, filters, quick, exact, rerank, profile = pending
+        store = self.server.store
+        with store.search_session(profile, defer_access=True):
+            # Check that the results still refer to the current visible index.
+            current = {row["passage"]: row for row in store.passages([r["passage"] for r in rows], filters)}
+            files, documents = {}, {}
+            verified = []
+            distinct = set()
+            for row in rows:
+                live = current.get(row["passage"])
+                if live is None or not store.result_access(live, files, documents, refresh=rerank):
+                    continue
+                verified.append({**live, **({"similarity": row["similarity"]} if "similarity" in row else {})})
+                distinct.add(self.search_result_key(live, filters))
+                if len(distinct) == 20:
+                    break
+            still_visible = {row["passage"] for row in store.passages([row["passage"] for row in verified], filters)}
+            verified = [row for row in verified if row["passage"] in still_visible]
+            if rerank:
+                with profile.measure("rerank"):
+                    verified = self.server.ai.rerank_candidates(query, verified)
+            self.send_json(200, self.search_results(verified, query, filters, quick, exact))
+        profile.log(runtime_logger, "verify")
+
+    @staticmethod
+    def search_result_key(row, filters):
+        cell = PCF_CELL.fullmatch(row["location"]) if filters.get("tab") == "pcf" else None
+        return (row["id"], cell[1]) if cell else row["fingerprint"]
+
+    def search_results(self, rows, query, filters, quick, exact):
+        distinct = {}
+        for row in rows:
+            key = self.search_result_key(row, filters)
+            if key in distinct and "similarity" in row and "similarity" not in distinct[key]:
+                distinct[key] = {**distinct[key], "similarity": row["similarity"]}
+            elif key not in distinct and len(distinct) < 20:
+                distinct[key] = row
+        store = self.server.store
+        tokens = query_words(query, fuzzy=True)[:8]
+        with store.measure("fts"):
+            snippets = {} if quick or exact else store.snippets(query, [row["passage"] for row in distinct.values()])
+        results = []
+        for row in distinct.values():
+            shown = public_row(row)
+            if "similarity" in row:
+                shown["similarity"] = round(row["similarity"], 3)
+            haystack = normalized(f"{row['subject']} {row['text']}")
+            matched = [token for token in tokens if normalized(token) in haystack]
+            shown["matched"] = matched
+            snippet = snippets.get(row["passage"], "").strip()
+            # The FTS text includes generated Korean bigrams. Show an FTS
+            # excerpt only if it is also a substring of the source passage.
+            shown["snippet"] = (snippet if snippet and snippet in normalized(row["text"])
+                                and any(token in snippet for token in matched)
+                                else best_snippet(row["text"], matched))
+            results.append(shown)
+        result = {"results": results}
+        if quick:
+            result["mode"] = "quick"
+        return result
 
     def query(self, route, payload):
         query, context, options = payload.get("query", ""), payload.get("context", ""), payload.get("filters", {})
@@ -548,51 +695,7 @@ class Handler(BaseHTTPRequestHandler):
         filters = filters_from(options.get)
         store, ai = self.server.store, self.server.ai
         if route == "/api/search":
-            started = time.monotonic()
-            mode = payload.get("mode")
-            keyword_only = mode in ("keyword", "quick")
-            plan = quoted_plan(query)
-            quick = mode == "quick" and plan is None and not filters.get("body")
-            if plan is not None:
-                rows = store.exact_search(plan, filters)
-            elif quick:
-                rows = store.quick_search(query, filters)
-            else:
-                rows = store.lexical(query, filters, limit=180)
-                if query and not keyword_only and ai.embedding_index:
-                    try:
-                        nearby = ai.semantic_search(store, query, filters)
-                        rows = merge_rows(rows, nearby, limit=60)
-                    except (OSError, ValueError, RuntimeError, KeyError, IndexError, TypeError, http.client.HTTPException):
-                        pass
-            if query and not keyword_only and plan is None:
-                rows = ai.rerank_candidates(query, rows)
-            elapsed = time.monotonic() - started
-            if elapsed >= 1:
-                runtime_logger.info("Search took %.2fs (mode=%s, tab=%s, scoped=%s)", elapsed,
-                                    "quick" if quick else "keyword" if keyword_only or plan else "hybrid",
-                                    filters.get("tab", "all"), "source" in filters)
-            tokens = query_words(query, fuzzy=True)[:8]
-            distinct = {}
-            for row in rows:
-                cell = PCF_CELL.fullmatch(row["location"]) if filters.get("tab") == "pcf" else None
-                key = (row["id"], cell[1]) if cell else row["fingerprint"]
-                if key not in distinct:
-                    if len(distinct) == 20:
-                        continue
-                    distinct[key] = public_row(row)
-                shown = distinct[key]
-                if "similarity" in row and shown.get("similarity") is None:
-                    shown["similarity"] = round(row["similarity"], 3)
-                if shown.get("matched") is None:
-                    haystack = normalized(f"{row['subject']} {row['text']}")
-                    matched = [token for token in tokens if normalized(token) in haystack]
-                    shown["matched"] = matched
-                    shown["snippet"] = best_snippet(row["text"], matched)
-            result = {"results": list(distinct.values())}
-            if quick:
-                result["mode"] = "quick"
-            self.send_json(200, result)
+            self.search(query, filters, payload)
             return
         if not query:
             self.send_json(400, {"error": "question_required"})
@@ -614,7 +717,9 @@ class Handler(BaseHTTPRequestHandler):
         else:
             evidence, mode = evidence_for(store, ai, query, filters, context,
                                           semantic=(route in {"/api/answer", "/api/external/preview"}),
-                                          limit=MAX_INTERNAL_EXCERPTS if budget else 9, expand=bool(budget))
+                                          limit=MAX_INTERNAL_EXCERPTS if budget else 9,
+                                          expand=bool(budget) or route == "/api/answer",
+                                          thread_hops=3 if route == "/api/answer" else 1)
         if route in {"/api/external/preview", "/api/pcf/preview"}:
             token, review = self.server.reviews.create(query, evidence, external.review_generation, pcf=pcf, internal_budget=budget)
             by_passage = {row["passage"]: public_row(row) for row in evidence}
@@ -638,14 +743,16 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 full_question = f"{query} {context}"
                 direct = delivery_date_answer(query, evidence, context)
-                proposed = ai.answer(query, evidence, context) if direct is None else None
+                with store.measure("generation"):
+                    proposed = ai.answer(query, evidence, context) if direct is None else None
                 # Recheck visibility after inference, including source removal during generation.
                 visible = {r["passage"] for r in store.passages([r["passage"] for r in evidence], filters)}
                 evidence = [r for r in evidence if r["passage"] in visible]
                 rows = [public_row(row) for row in evidence]
                 result = delivery_date_answer(query, evidence, context) if direct is not None else None
                 if result is None:
-                    result = validate(proposed, evidence, full_question)
+                    with store.measure("validation"):
+                        result = validate(proposed, evidence, full_question)
             except (OSError, ValueError, RuntimeError, KeyError, TypeError, http.client.HTTPException):
                 result["status"] = "model_unavailable"
             finally:
@@ -1144,6 +1251,8 @@ def main(argv=None):
     parser.add_argument("--embedding-model", default="")
     parser.add_argument("--ollama-port", type=int, default=11435)
     parser.add_argument("--no-browser", action="store_true")
+    parser.add_argument("--vector-index", choices=("sqlite", "usearch"),
+                        default=os.environ.get("MAILSEARCH_VECTOR_INDEX", "sqlite"))
     args = parser.parse_args(argv)
     if not 0 < args.ollama_port < 65536 or not 0 <= args.port < 65536 or args.port == args.ollama_port:
         parser.error("Invalid port configuration")
@@ -1180,6 +1289,12 @@ def main(argv=None):
             try:
                 stage = "로컬 검색 DB 열기"
                 store = Store(root)
+                if args.vector_index == "usearch":
+                    try:
+                        from .vector_index import USearchIndex
+                        store.vector_index = USearchIndex(store)
+                    except (ImportError, OSError) as exc:
+                        runtime_logger.warning("USearch unavailable; using SQLite (%s)", type(exc).__name__)
                 indexer = Indexer(store, args.readpst, args.pdftotext, ai)
                 preset = Path(__file__).resolve().parent.parent / "gateway-defaults.json"
                 stage = f"로컬 포트 {args.port} 열기"
