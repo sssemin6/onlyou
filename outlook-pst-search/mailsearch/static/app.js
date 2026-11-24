@@ -491,12 +491,12 @@ function marked(text, words) {
   return parts;
 }
 
-function showResults(rows, title) {
+function showResults(rows, title, emptyMessage = "이 범위에서 일치하는 자료를 찾지 못했습니다.") {
   const result = element("results");
   result.replaceChildren();
   element("result-section").hidden = false;
   element("result-heading").textContent = title + " (" + rows.length + ")";
-  if (!rows.length) result.append(node("p", "이 범위에서 일치하는 자료를 찾지 못했습니다.", "result-empty"));
+  if (!rows.length) result.append(node("p", emptyMessage, "result-empty"));
   for (const row of rows) {
     const button = node("button", "", "result");
     button.type = "button";
@@ -648,8 +648,9 @@ form.addEventListener("submit", async (event) => {
   clearSearch();
   const active = request = new AbortController();
   const query = element("query").value.trim();
-  const ask = event.submitter?.value === "ask";
-  const semantic = event.submitter?.value === "semantic";
+  const intent = event.submitter?.value;
+  const ask = intent === "ask";
+  const mode = intent === "semantic" ? "hybrid" : intent === "body" ? "keyword" : "quick";
   const pcf = activeTab === "pcf";
   if (ask && !query) {
     element("query").focus();
@@ -659,14 +660,17 @@ form.addEventListener("submit", async (event) => {
   const filters = Object.fromEntries(["source", ...TAB_FILTERS[activeTab]].map((id) => [id, element(id).value]));
   filters.tab = activeTab;
   const payload = { query, filters, context: ask ? previousQuestion : "" };
-  notice(ask ? "답변에 쓸 근거를 찾고 있습니다." : semantic ? "의미 검색 중입니다." : "검색 중입니다.");
+  notice(ask ? "답변에 쓸 근거를 찾고 있습니다." : mode === "hybrid" ? "의미 검색 중입니다." : "검색 중입니다.");
   try {
     if (ask) {
       await previewAnswer(pcf ? "/api/pcf/preview" : "/api/external/preview", payload, active, pcf);
     } else {
-      const data = await call("/api/search", { ...payload, mode: semantic ? "hybrid" : "keyword" }, active.signal);
+      const data = await call("/api/search", { ...payload, mode }, active.signal);
       if (active.signal.aborted) return;
-      showResults(data.results, query ? "검색 결과" : recentTitle());
+      const quick = data.mode === "quick" && query;
+      const title = quick ? "빠른 검색 결과" : query ? "검색 결과" : recentTitle();
+      const emptyMessage = quick ? "제목·발신자·수신자·파일명에 일치하는 자료가 없습니다. 본문 검색으로 찾아보세요." : undefined;
+      showResults(data.results, title, emptyMessage);
       notice("");
     }
   } catch (error) {
