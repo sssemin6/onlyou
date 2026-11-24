@@ -8,6 +8,7 @@ import shutil
 import sqlite3
 import stat
 import subprocess
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -16,7 +17,7 @@ from .embedding import logger
 from .extract import CREATE_FLAGS, DOCUMENT_SUFFIXES, extract_attachment, extract_document, parse_mail
 from .filesystem import source_path, stable_input
 from .pcf import WORD_SUFFIXES
-from .store import buckets, document_kind, document_identity, now, pack_vector, read_signature, sections, vector_array
+from .store import buckets, document_kind, document_identity, fingerprint, now, pack_vector, read_signature, sections, vector_array
 
 
 NO_MAIL = {"pst_no_mail", "eml_no_mail"}
@@ -49,6 +50,9 @@ class Indexer:
         self.lock = threading.RLock()
         self.events = {}
         self.pst_reads = {}
+        self.original_thread = None
+        self.original_event = threading.Event()
+        self.original_failure = None
         self.worker = None
         self.stopping = False
         with store.connection() as conn:
@@ -167,17 +171,18 @@ class Indexer:
                 self.worker.start()
 
     def has_work(self):
-        worker = self.worker
-        return worker is not None and worker.is_alive()
+        return any(worker and worker.is_alive() for worker in (self.worker, self.original_thread))
 
     def stop(self):
         with self.lock:
             self.stopping = True
             for event in self.events.values():
                 event.set()
-            worker = self.worker
-        if worker is not None:
-            worker.join()
+            self.original_event.set()
+            workers = (self.worker, self.original_thread)
+        for worker in workers:
+            if worker is not None:
+                worker.join()
 
     def run(self):
         while True:
@@ -202,6 +207,12 @@ class Indexer:
                 event = self.events[source] = threading.Event()
             try:
                 if task["state"] == "removing":
+                    with self.lock:
+                        original = self.original_thread
+                        if original and original.is_alive():
+                            self.original_event.set()
+                    if original:
+                        original.join()
                     with self.store.connection() as conn:
                         conn.execute("DELETE FROM mails WHERE source=?", (source,))
                         conn.execute("DELETE FROM problems WHERE source=?", (source,))
@@ -348,7 +359,7 @@ class Indexer:
                         temporary = slot / "pst-signature.tmp"
                         temporary.write_text(signature, encoding="ascii")
                         temporary.replace(checkpoint)
-                    output = self.export(pst, slot, event, source)
+                    output = self.cached_export(pst, slot, event, source, label, signature)
                     if read_signature(pst) != signature:
                         raise ImportIssue("changed")
             except OSError as exc:
@@ -371,6 +382,120 @@ class Indexer:
             signatures[label] = signature
         return extras, carried, skipped, signatures, deferred
 
+    def original_cache(self, source, label, signature):
+        key = hashlib.sha256((label + "\0" + signature).encode()).hexdigest()
+        return self.spool / str(source) / "originals" / key / "eml"
+
+    def cached_export(self, path, stage, event, source, label, signature, *, progress=True):
+        cached = self.original_cache(source, label, signature)
+        completed = stage / "cached-export"
+        if cached.is_dir() and (not progress or completed.is_file()):
+            return cached
+        output = self.export(path, stage, event, source if progress else None)
+        if read_signature(path) != signature:
+            raise ImportIssue("changed")
+        if output != stage / "eml" or not (stage / "export-complete").is_file():
+            return output
+        with self.lock:
+            if not cached.is_dir():
+                cached.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+                output.replace(cached)
+            completed.touch()
+            (stage / "export-complete").unlink(missing_ok=True)
+        return cached
+
+    def contained_file(self, root, item):
+        root = root.resolve(strict=True)
+        file = (root / item).resolve(strict=True)
+        if file == root or not file.is_relative_to(root) or not file.is_file():
+            raise ImportIssue("attachment_missing")
+        return file
+
+    def attachment_bytes(self, row):
+        source, version, item = row["source"], row["version"], row["item"]
+        root = Path(row["path"])
+        if root.resolve(strict=True) != root:
+            raise ImportIssue("attachment_missing")
+        stage = self.spool / str(source) / str(version)
+        parts = Path(item).parts
+        split = next((i + 1 for i, part in enumerate(parts[:-1]) if part.lower().endswith(".pst")), 0)
+        if row["kind"] == "pst" or row["kind"] == "eml_dir" and split:
+            if row["kind"] == "pst":
+                pst, label, eml = root, "", item
+                signature = row["active_signature"] if version == row["active"] else row["signature"]
+            else:
+                label = Path(*parts[:split]).as_posix() + "/"
+                pst = self.contained_file(root, label)
+                eml = Path(*parts[split:]).as_posix()
+                stage = stage / ("pst-" + hashlib.sha1(label.encode("utf-8")).hexdigest()[:16])
+                snapshot = stage / "pst-signature"
+                signature = snapshot.read_text(encoding="ascii") if snapshot.is_file() else self.store.pst_files(source).get(label)
+                if not signature and (stage / "export-complete").is_file():
+                    signature = read_signature(pst)
+            if not signature:
+                raise ImportIssue("attachment_missing")
+            with pst.open("rb"):
+                pass
+            cached = self.original_cache(source, label, signature)
+            if not cached.is_dir():
+                if (stage / "export-complete").is_file() and (stage / "eml").is_dir():
+                    cached = stage / "eml"
+                else:
+                    if read_signature(pst) != signature:
+                        raise ImportIssue("attachment_changed")
+                    self.prepare_original(pst, source, label, signature)
+                    return None
+            path = self.contained_file(cached, eml)
+        elif row["kind"] == "eml_dir":
+            path = self.contained_file(root, item)
+        else:
+            path = root
+
+        mail = parse_mail(path, row["folder"])
+        position = row["position"]
+        if fingerprint(mail, item) != row["fingerprint"] or position >= len(mail["attachments"]):
+            raise ImportIssue("attachment_changed")
+        name, part = mail["attachments"][position]
+        if name != row["name"]:
+            raise ImportIssue("attachment_changed")
+        payload = part.get_payload(decode=True)
+        if payload is None and part.get_content_type() == "message/rfc822":
+            messages = part.get_payload()
+            payload = messages[0].as_bytes() if isinstance(messages, list) and messages else None
+        if payload is None:
+            raise ImportIssue("attachment_missing")
+        return payload
+
+    def prepare_original(self, path, source, label, signature):
+        key = (source, label, signature)
+        with self.lock:
+            row = self.store.source(source)
+            if self.stopping or row is None or row["state"] == "removing":
+                raise ImportIssue("attachment_missing")
+            if self.original_failure and self.original_failure[0] == key:
+                _, issue = self.original_failure
+                self.original_failure = None
+                raise ImportIssue(issue)
+            if self.original_thread and self.original_thread.is_alive():
+                return
+            self.original_event.clear()
+
+            def prepare():
+                try:
+                    with (stable_input(path), tempfile.TemporaryDirectory(dir=self.spool, prefix="original-") as scratch):
+                        if read_signature(path) != signature:
+                            raise ImportIssue("attachment_changed")
+                        self.cached_export(path, Path(scratch), self.original_event, source, label, signature, progress=False)
+                except Paused:
+                    pass
+                except (OSError, ImportIssue, ValueError) as exc:
+                    issue = str(exc) if isinstance(exc, ImportIssue) else "attachment_missing"
+                    with self.lock:
+                        self.original_failure = (key, issue)
+
+            self.original_thread = threading.Thread(target=prepare, name="pst-original", daemon=True)
+            self.original_thread.start()
+
     def export(self, path, stage, event, source):
         output = stage / "eml"
         if (stage / "export-complete").is_file():
@@ -392,7 +517,7 @@ class Indexer:
                     if event.wait(.2):
                         raise Paused()
                     started = time.monotonic()
-                    if started >= next_sample:
+                    if source is not None and started >= next_sample:
                         # Count output files by name, without opening mail or rechecking the source share.
                         count = sum(1 for _, _, files in os.walk(output) for name in files
                                     if name.lower().endswith(".eml") or (name.isascii() and name.isdecimal()))
@@ -460,7 +585,7 @@ class Indexer:
                         raise ImportIssue("changed")
                     if not self.pst_header(path):
                         raise ImportIssue("pst_invalid")
-                    root = self.export(path, stage, event, source)
+                    root = self.cached_export(path, stage, event, source, "", signature)
                     if read_signature(path) != signature:
                         raise ImportIssue("changed")
             except OSError as exc:
@@ -526,14 +651,21 @@ class Indexer:
             self.check(event)
             with self.store.connection() as conn:
                 conn.execute(
-                    "UPDATE sources SET active=?,pending=NULL,state=?,updated=?,issue=? WHERE id=?",
-                    (version, "empty" if empty_eml else "ready", now(), "eml_no_mail" if empty_eml else issue, source),
+                    "UPDATE sources SET active=?,active_signature=?,pending=NULL,state=?,updated=?,issue=? WHERE id=?",
+                    (version, signature, "empty" if empty_eml else "ready", now(), "eml_no_mail" if empty_eml else issue, source),
                 )
                 conn.execute("DELETE FROM mails WHERE source=? AND version<>?", (source, version))
                 conn.execute("DELETE FROM problems WHERE source=? AND version<>?", (source, version))
                 if signatures is not None:
                     self.store.save_pst_files(conn, source, signatures)
         shutil.rmtree(stage, ignore_errors=True)
+        if signatures is not None or is_pst:
+            retained = signatures if signatures is not None else {"": signature}
+            keep = {self.original_cache(source, label, value) for label, value in retained.items()}
+            cached = self.spool / str(source) / "originals"
+            for folder in cached.iterdir() if cached.is_dir() else ():
+                if folder / "eml" not in keep:
+                    shutil.rmtree(folder, ignore_errors=True)
 
     def pending_updates(self, row):
         """PST files under a registered folder that changed since the last import."""
