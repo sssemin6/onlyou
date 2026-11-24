@@ -142,6 +142,7 @@ svg { width: 21px; height: 21px; flex: none; stroke: currentColor; stroke-width:
 .source-card p { font-size: .77rem; color: var(--muted); margin-top: 4px; }
 .source-card .issue { color: var(--accent-dark); }
 .source-card .source-state { color: var(--ink); font-weight: 680; }
+.embedding-progress { display: block; width: 100%; height: 9px; margin-top: 4px; accent-color: var(--accent-dark); }
 .source-state::before, .model-dot {
   display: inline-block;
   width: 7px;
