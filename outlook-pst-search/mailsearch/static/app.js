@@ -42,6 +42,7 @@ const issueNames = {
   changed: "색인 중 원본 파일이나 폴더가 변경되었습니다. 경로 확인 후 다시 색인하세요.",
   pst_changed: "색인 중 PST가 변경되었습니다. 이 파일은 다음 갱신에서 다시 읽습니다.",
   mail_original_changed: "색인 중 메일 원본이 변경되어 첨부 본문을 건너뛰었습니다.",
+  search_expired: "검색 확인 시간이 지나 다시 검색해야 합니다.",
   app_disconnected: "검색 앱과 연결이 끊겼습니다. 앱이 실행 중인지 확인한 뒤 다시 시도하세요.",
   interrupted: "중단된 색인입니다. 재개를 누르면 저장된 작업부터 이어서 진행합니다.",
   index_unexpected: "색인 중 오류가 발생했습니다. 데이터 폴더의 app-runtime.log에서 오류 유형을 확인할 수 있습니다.",
@@ -665,12 +666,19 @@ form.addEventListener("submit", async (event) => {
     if (ask) {
       await previewAnswer(pcf ? "/api/pcf/preview" : "/api/external/preview", payload, active, pcf);
     } else {
-      const data = await call("/api/search", { ...payload, mode }, active.signal);
+      const data = await call("/api/search", { ...payload, mode, defer_access: true,
+        rerank: mode === "hybrid" && element("search-rerank").checked }, active.signal);
       if (active.signal.aborted) return;
       const quick = data.mode === "quick" && query;
       const title = quick ? "빠른 검색 결과" : query ? "검색 결과" : recentTitle();
       const emptyMessage = quick ? "제목·발신자·수신자·파일명에 일치하는 자료가 없습니다. 본문 검색으로 찾아보세요." : undefined;
-      showResults(data.results, title, emptyMessage);
+      showResults(data.results, title, data.access_ticket ? "원본 접근을 확인하는 중입니다." : emptyMessage);
+      if (data.access_ticket) {
+        notice("원본 접근을 확인하는 중입니다.");
+        const verified = await call("/api/search-access", { ticket: data.access_ticket }, active.signal);
+        if (active.signal.aborted) return;
+        showResults(verified.results, title, emptyMessage);
+      }
       notice("");
     }
   } catch (error) {
