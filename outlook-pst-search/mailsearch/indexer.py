@@ -2,6 +2,7 @@
 import datetime
 import hashlib
 import http.client
+import json
 import logging
 import os
 import shutil
@@ -21,12 +22,27 @@ from .store import buckets, document_kind, document_identity, fingerprint, now, 
 
 
 NO_MAIL = {"pst_no_mail", "eml_no_mail"}
+PST_DEFERRED = ("pst_in_use", "pst_changed")
 PST_PROGRESS_INTERVAL = 5
 runtime_logger = logging.getLogger("mailsearch.runtime")
 
 
 def pst_access_error(exc):
     return isinstance(exc, PermissionError) or getattr(exc, "winerror", None) in {5, 32, 33, 65, 86, 1326}
+
+
+def folder_identity(signature):
+    # Directory size and mtime change when unrelated entries are added or removed.
+    return json.dumps(json.loads(signature)[:2])
+
+
+def source_signature(path, kind):
+    signature = read_signature(path)
+    if kind == "eml_dir":
+        if not path.is_dir():
+            raise ImportIssue("changed")
+        return folder_identity(signature)
+    return signature
 
 
 def document_date(path):
@@ -136,11 +152,9 @@ class Indexer:
                         raise ImportIssue("source_action")
                     if action == "refresh" and row["state"] == "queued":
                         raise ImportIssue("source_busy")
-                    deferred_psts = conn.execute(
-                        "SELECT 1 FROM problems WHERE source=? AND version=? AND code='pst_in_use' LIMIT 1",
-                        (source, row["pending"]),
-                    ).fetchone()
-                    if action == "refresh" or deferred_psts or row["issue"] in NO_MAIL | {"changed", "mail_parse_failed"}:
+                    issue = row["issue"]
+                    restart = issue in NO_MAIL | {"mail_parse_failed", "pst_in_use", "pst_changed"}
+                    if action == "refresh" or restart or (issue == "changed" and row["kind"] != "eml_dir"):
                         self.discard_pending(conn, row)
                         conn.execute(
                             """UPDATE sources SET pending=revision+1,revision=revision+1,signature=NULL,
@@ -308,7 +322,7 @@ class Indexer:
             return {**{key: read[key] for key in ("item", "position", "total", "files")},
                     "elapsed": int(age - read["started"]), "idle": int(age - read["last_output"])}
 
-    def import_folder_psts(self, folder, stage, event, known, source):
+    def import_folder_psts(self, folder, stage, event, known, source, already_deferred):
         """Also import PST files kept inside a registered mail folder.
 
         PSTs whose signature matches the last committed import are carried over
@@ -319,7 +333,7 @@ class Indexer:
         extras, carried = [], []
         skipped = 0
         signatures = {}
-        deferred = []
+        deferred = dict(already_deferred)
         files = sorted(path for path in folder.rglob("*")
                        if path.suffix.lower() == ".pst")
         for position, pst in enumerate(files, 1):
@@ -327,10 +341,31 @@ class Indexer:
             item = pst.relative_to(folder).as_posix()
             self.start_pst_read(source, item, position, len(files))
             label = item + "/"
+            slot = stage / ("pst-" + hashlib.sha1(label.encode("utf-8")).hexdigest()[:16])
+            checkpoint = slot / "pst-signature"
+            if item in deferred:
+                if label in known:
+                    carried.append(label)
+                    signatures[label] = known[label]
+                continue
             try:
                 if pst.is_symlink() or not stat.S_ISREG(pst.stat().st_mode):
                     continue
                 signature = read_signature(pst)
+                previous_signature = checkpoint.read_text(encoding="ascii") if checkpoint.is_file() else None
+                if previous_signature and previous_signature != signature:
+                    cached = self.original_cache(source, label, previous_signature)
+                    if not cached.is_dir() and (slot / "export-complete").is_file():
+                        cached = slot / "eml"
+                    if cached.is_dir():
+                        extras.append((cached, label))
+                        signatures[label] = previous_signature
+                        continue
+                    deferred[item] = "pst_changed"
+                    if label in known:
+                        carried.append(label)
+                        signatures[label] = known[label]
+                    continue
                 if known.get(label) == signature:
                     carried.append(label)
                     signatures[label] = signature
@@ -340,22 +375,17 @@ class Indexer:
             except OSError as exc:
                 if not pst_access_error(exc):
                     raise
-                deferred.append(item)
+                deferred[item] = "pst_in_use"
                 if label in known:
                     carried.append(label)
                     signatures[label] = known[label]
                 continue
-            slot = stage / ("pst-" + hashlib.sha1(label.encode("utf-8")).hexdigest()[:16])
             slot.mkdir(parents=True, exist_ok=True, mode=0o700)
             try:
                 with stable_input(pst):
                     if not self.pst_header(pst):
                         raise ImportIssue("pst_invalid")
-                    checkpoint = slot / "pst-signature"
-                    if checkpoint.exists():
-                        if checkpoint.read_text(encoding="ascii") != signature:
-                            raise ImportIssue("changed")
-                    else:
+                    if not checkpoint.exists():
                         temporary = slot / "pst-signature.tmp"
                         temporary.write_text(signature, encoding="ascii")
                         temporary.replace(checkpoint)
@@ -365,12 +395,18 @@ class Indexer:
             except OSError as exc:
                 if not pst_access_error(exc):
                     raise
-                deferred.append(item)
+                deferred[item] = "pst_in_use"
                 if label in known:
                     carried.append(label)
                     signatures[label] = known[label]
                 continue
             except ImportIssue as exc:
+                if str(exc) == "changed":
+                    deferred[item] = "pst_changed"
+                    if label in known:
+                        carried.append(label)
+                        signatures[label] = known[label]
+                    continue
                 if str(exc) in {"pst_no_mail", "pst_export", "pst_invalid"}:
                     skipped += 1
                     # Remember the signature so an unchanged unusable PST is not
@@ -569,8 +605,12 @@ class Indexer:
         temp.mkdir(exist_ok=True, mode=0o700)
         for leftover in temp.glob("pdf-*"):
             shutil.rmtree(leftover, ignore_errors=True)
-        signature = read_signature(path)
-        if row["signature"] and signature != row["signature"]:
+        kind = row["kind"]
+        signature = source_signature(path, kind)
+        saved = row["signature"]
+        if saved and kind == "eml_dir":
+            saved = folder_identity(saved)
+        if saved and signature != saved:
             raise ImportIssue("changed")
         with self.store.connection() as conn:
             conn.execute("UPDATE sources SET signature=?,state='extracting' WHERE id=? AND state='queued'", (signature, source))
@@ -595,18 +635,25 @@ class Indexer:
         else:
             root = path
             if path.is_dir():
+                already_deferred = {}
+                if row["done"]:
+                    with self.store.connection() as conn:
+                        already_deferred = dict(conn.execute(
+                            "SELECT item,code FROM problems WHERE source=? AND version=? AND code IN (?,?)",
+                            (source, version, *PST_DEFERRED),
+                        ).fetchall())
                 extras, carried, skipped_psts, signatures, deferred = self.import_folder_psts(
-                    path, stage, event, self.store.pst_files(source), source)
+                    path, stage, event, self.store.pst_files(source), source, already_deferred)
                 with self.store.connection() as conn:
-                    conn.execute("DELETE FROM problems WHERE source=? AND version=? AND code='pst_in_use'",
-                                 (source, version))
-                    conn.executemany("INSERT INTO problems VALUES(?,?,?,'pst_in_use')",
-                                     ((source, version, item) for item in deferred))
+                    conn.execute("DELETE FROM problems WHERE source=? AND version=? AND code IN (?,?)",
+                                 (source, version, *PST_DEFERRED))
+                    conn.executemany("INSERT INTO problems VALUES(?,?,?,?)",
+                                     ((source, version, item, code) for item, code in deferred.items()))
                     # The same folder may be scanned again after a restart. Rebuild
                     # the count from the current PST scan and committed items.
                     omitted_documents = conn.execute(
                         "SELECT COUNT(*) FROM problems WHERE source=? AND version=? "
-                        "AND code NOT IN ('parse','pst_in_use')", (source, version),
+                        "AND code NOT IN ('parse','pst_in_use','pst_changed','mail_original_changed')", (source, version),
                     ).fetchone()[0]
                     omitted_attachments = conn.execute(
                         "SELECT COUNT(*) FROM attachments a JOIN mails m ON m.id=a.mail "
@@ -623,11 +670,11 @@ class Indexer:
         self.check(event)
         progress = self.store.source(source)
         if not progress["done"] and deferred and not progress["failed"]:
-            raise ImportIssue("pst_in_use")
+            raise ImportIssue("pst_in_use" if "pst_in_use" in deferred.values() else "pst_changed")
         if not progress["done"] and progress["omitted"] and not is_pst:
             with self.store.connection() as conn:
                 missing_document = conn.execute(
-                    "SELECT 1 FROM problems WHERE source=? AND version=? AND code NOT IN ('parse','pst_in_use') LIMIT 1",
+                    "SELECT 1 FROM problems WHERE source=? AND version=? AND code NOT IN ('parse','pst_in_use','pst_changed','mail_original_changed') LIMIT 1",
                     (source, version),
                 ).fetchone()
             if missing_document:
@@ -645,7 +692,7 @@ class Indexer:
                 conn.execute("""UPDATE sources SET embedding_done=NULL,embedding_total=NULL
                                 WHERE id=? AND pending=?""", (source, version))
         self.check(event)
-        if read_signature(path) != signature:
+        if source_signature(path, kind) != signature:
             raise ImportIssue("changed")
         with self.lock:
             self.check(event)
@@ -768,6 +815,11 @@ class Indexer:
             def save_extracted():
                 with conn:
                     for attachment, mail, status, locations in extracted:
+                        if status == "원본 변경":
+                            conn.execute(
+                                "INSERT OR IGNORE INTO problems VALUES(?,?,?,'mail_original_changed')",
+                                (source, version, attachment["item"]),
+                            )
                         for location, text in locations:
                             for start, segment in sections(text):
                                 self.store.add_passage(conn, attachment["mail"], mail, attachment["id"],
@@ -783,7 +835,7 @@ class Indexer:
             while True:
                 self.check(event)
                 batch = conn.execute(
-                    """SELECT m.item,m.folder,m.id FROM mails m WHERE m.source=? AND m.version=? AND m.id>?
+                    """SELECT m.item,m.folder,m.id,m.fingerprint FROM mails m WHERE m.source=? AND m.version=? AND m.id>?
                        AND EXISTS(SELECT 1 FROM attachments a WHERE a.mail=m.id AND a.status='대기')
                        ORDER BY m.id LIMIT 128""", (source, version, last),
                 ).fetchall()
@@ -793,19 +845,23 @@ class Indexer:
                     self.check(event)
                     path = self.locate(root, extras, row["item"])
                     attachments = conn.execute(
-                        "SELECT id,mail,name,status FROM attachments WHERE mail=? ORDER BY id", (row["id"],),
+                        "SELECT id,mail,name,status,? item FROM attachments WHERE mail=? ORDER BY id",
+                        (row["item"], row["id"]),
                     ).fetchall()
                     try:
                         mail = parse_mail(path, row["folder"])
                     except (ValueError, OSError, LookupError, TypeError, RecursionError):
                         mail = None
-                    if mail and [a["name"] for a in attachments] != [name for name, _ in mail["attachments"]]:
+                    changed = mail is not None and fingerprint(mail, row["item"]) != row["fingerprint"]
+                    if changed and (root.is_file() or not path.is_relative_to(root)):
                         raise ImportIssue("changed")
                     for position, attachment in enumerate(attachments):
                         if attachment["status"] != "대기":
                             continue
                         self.check(event)
-                        if mail is None:
+                        if changed:
+                            status, locations = "원본 변경", []
+                        elif mail is None:
                             status, locations = "추출 실패", []
                         else:
                             name, part = mail["attachments"][position]
@@ -834,7 +890,7 @@ class Indexer:
             self.check(event)
             with self.store.connection() as conn:
                 rows = conn.execute(
-                    """SELECT p.id,p.text,m.subject,a.name FROM passages p JOIN mails m ON m.id=p.mail
+                    """SELECT p.id,p.text,m.subject,a.name FROM passages p CROSS JOIN mails m ON m.id=p.mail
                        LEFT JOIN attachments a ON a.id=p.attachment WHERE m.source=? AND m.version=? AND p.id>?
                        AND NOT EXISTS(SELECT 1 FROM vectors v WHERE v.passage=p.id AND v.model=?)
                        ORDER BY p.id LIMIT 24""", (source, version, last, model)
