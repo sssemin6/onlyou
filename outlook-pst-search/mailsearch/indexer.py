@@ -811,10 +811,27 @@ class Indexer:
         with self.store.connection() as conn:
             last = 0
             extracted = []
+            new_extracts = {}
+
+            def load_extract(key, extract):
+                if key in new_extracts:
+                    return "완료", new_extracts[key], key
+                row = conn.execute("SELECT locations FROM attachment_extracts WHERE digest=?", (key,)).fetchone()
+                if row is not None:
+                    return "완료", json.loads(row["locations"]), key
+                status, locations = extract()
+                if status == "완료" and locations:
+                    new_extracts[key] = locations
+                    return status, locations, key
+                return status, locations, None
 
             def save_extracted():
                 with conn:
-                    for attachment, mail, status, locations in extracted:
+                    conn.executemany(
+                        "INSERT OR IGNORE INTO attachment_extracts VALUES(?,?)",
+                        ((key, json.dumps(locations, ensure_ascii=False)) for key, locations in new_extracts.items()),
+                    )
+                    for attachment, mail, status, locations, content_key in extracted:
                         if status == "원본 변경":
                             conn.execute(
                                 "INSERT OR IGNORE INTO problems VALUES(?,?,?,'mail_original_changed')",
@@ -822,15 +839,20 @@ class Indexer:
                             )
                         for location, text in locations:
                             for start, segment in sections(text):
+                                embedding_key = (hashlib.sha256(content_key + segment.encode()).digest()
+                                                 if content_key is not None else None)
                                 self.store.add_passage(conn, attachment["mail"], mail, attachment["id"],
-                                                       attachment["name"], location, start, segment)
-                        conn.execute("UPDATE attachments SET status=? WHERE id=?", (status, attachment["id"]))
-                    omitted = sum(not locations for _, _, _, locations in extracted)
+                                                       attachment["name"], location, start, segment,
+                                                       embedding_key=embedding_key)
+                        conn.execute("UPDATE attachments SET status=?,content_key=? WHERE id=?",
+                                     (status, content_key, attachment["id"]))
+                    omitted = sum(not locations for _, _, _, locations, _ in extracted)
                     partial = sum(bool(locations) and status.startswith("일부 색인")
-                                  for _, _, status, locations in extracted)
+                                  for _, _, status, locations, _ in extracted)
                     conn.execute("UPDATE sources SET omitted=omitted+?,partial=partial+? WHERE id=?",
                                  (omitted, partial, source))
                 extracted.clear()
+                new_extracts.clear()
 
             while True:
                 self.check(event)
@@ -859,14 +881,18 @@ class Indexer:
                         if attachment["status"] != "대기":
                             continue
                         self.check(event)
+                        cached = None
                         if changed:
                             status, locations = "원본 변경", []
                         elif mail is None:
                             status, locations = "추출 실패", []
                         else:
                             name, part = mail["attachments"][position]
-                            status, locations = extract_attachment(name, part, temp, self.pdf, check=lambda: self.check(event))
-                        extracted.append((attachment, mail, status, locations))
+                            result = extract_attachment(name, part, temp, self.pdf,
+                                                        check=lambda: self.check(event), cache=load_extract)
+                            status, locations = result[:2]
+                            cached = result[2] if len(result) == 3 else None
+                        extracted.append((attachment, mail, status, locations, cached))
                         if len(extracted) == 24:
                             save_extracted()
                 last = batch[-1]["id"]
@@ -878,9 +904,11 @@ class Indexer:
         self.check(event)
         with self.store.connection() as conn:
             total, done = conn.execute(
-                """SELECT COUNT(*),COUNT(v.passage) FROM mails m JOIN passages p ON p.mail=m.id
+                """SELECT COUNT(*),COALESCE(SUM(v.passage IS NOT NULL OR r.passage IS NOT NULL),0)
+                   FROM mails m JOIN passages p ON p.mail=m.id
                    LEFT JOIN vectors v ON v.passage=p.id AND v.model=?
-                   WHERE m.source=? AND m.version=?""", (model, source, version),
+                   LEFT JOIN embedding_refs r ON r.passage=p.id AND r.model=?
+                   WHERE m.source=? AND m.version=?""", (model, model, source, version),
             ).fetchone()
             conn.execute("""UPDATE sources SET state='embeddings',embedding_done=?,embedding_total=?
                             WHERE id=? AND pending=? AND state NOT IN ('paused','removing')""",
@@ -890,19 +918,33 @@ class Indexer:
             self.check(event)
             with self.store.connection() as conn:
                 rows = conn.execute(
-                    """SELECT p.id,p.text,m.subject,a.name FROM passages p CROSS JOIN mails m ON m.id=p.mail
+                    """SELECT p.id,p.text,m.subject,a.name,p.embedding_key FROM passages p CROSS JOIN mails m ON m.id=p.mail
                        LEFT JOIN attachments a ON a.id=p.attachment WHERE m.source=? AND m.version=? AND p.id>?
                        AND NOT EXISTS(SELECT 1 FROM vectors v WHERE v.passage=p.id AND v.model=?)
-                       ORDER BY p.id LIMIT 24""", (source, version, last, model)
+                       AND NOT EXISTS(SELECT 1 FROM embedding_refs r WHERE r.passage=p.id AND r.model=?)
+                       ORDER BY p.id LIMIT 24""", (source, version, last, model, model)
                 ).fetchall()
+                shared = {}
+                inputs = {}
+                for row in rows:
+                    key = row["embedding_key"]
+                    if key is None:
+                        inputs[row["id"]] = f"{row['subject']}\n{row['name'] or ''}\n{row['text']}"
+                    elif key not in inputs and key not in shared:
+                        existing = conn.execute(
+                            "SELECT value FROM embedding_values WHERE model=? AND digest=?", (model, key),
+                        ).fetchone()
+                        if existing:
+                            shared[key] = existing["value"]
+                        else:
+                            inputs[key] = row["text"]
             if not rows:
                 return None
             try:
-                encoded = [pack_vector(v) for v in self.ai.embed(
-                    [f"{r['subject']}\n{r['name'] or ''}\n{r['text']}" for r in rows], timeout=45
-                )]
-                if len(encoded) != len(rows):
+                encoded = [pack_vector(v) for v in self.ai.embed(list(inputs.values()), timeout=45)] if inputs else []
+                if len(encoded) != len(inputs):
                     raise ValueError("embeddings")
+                shared.update(zip(inputs, encoded))
             except (OSError, ValueError, RuntimeError, KeyError, TypeError, http.client.HTTPException) as exc:
                 winerror = getattr(exc, "winerror", None)
                 backend = "gateway" if self.ai.embedding_api and self.ai.embedding_api.index_key else "Ollama"
@@ -913,9 +955,15 @@ class Indexer:
                 return "embedding_unavailable"
             self.check(event)
             with self.store.connection() as conn:
-                for row, value in zip(rows, encoded):
+                for row in rows:
                     passage = row["id"]
-                    conn.execute("INSERT INTO vectors VALUES(?,?,?)", (passage, model, value))
+                    key = row["embedding_key"]
+                    value = shared[key if key is not None else passage]
+                    if key is None:
+                        conn.execute("INSERT INTO vectors VALUES(?,?,?)", (passage, model, value))
+                    else:
+                        conn.execute("INSERT OR IGNORE INTO embedding_values VALUES(?,?,?)", (model, key, value))
+                        conn.execute("INSERT INTO embedding_refs VALUES(?,?,?)", (model, passage, key))
                     conn.executemany(
                         "INSERT INTO vector_buckets VALUES(?,?,?)",
                         ((model, bucket, passage) for bucket in buckets(vector_array(value))),
