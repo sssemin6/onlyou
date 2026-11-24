@@ -11,7 +11,7 @@ Select-String -Path $searchLog -Pattern 'Search profile' | Select-Object -Last 3
 
 로그의 같은 id로 검색과 원본 확인을 연결합니다. phase=query는 최초 검색, phase=verify는 원본 확인, phase=answer는 로컬 생성 요청입니다. fts_ms는 키워드 검색과 결과 미리보기, embed_ms는 검색어 벡터 요청, vector_ms는 후보 조회와 비교, rerank_ms는 재정렬, access_ms는 실제 파일·폴더 접근 확인입니다. 로컬 답변에는 context_ms, generation_ms, validation_ms도 기록합니다. 병렬 구간과 별도 요청이 있으므로 구간을 더한 값은 전체 시간과 다를 수 있습니다. 검색어와 메일 내용은 계측 로그에 기록하지 않습니다.
 
-동일한 검색어·보관함 범위를 사용하고 처음 실행과 반복 실행을 구별해 비교하세요. 공유폴더의 첫 확인은 검색과 별도 요청으로 실행됩니다. 최근 확인이 성공한 결과는 최대 10초간 재사용합니다. 원문·첨부 열기와 답변 API 전송 전에는 접근을 다시 확인합니다. 기존 API 호출은 두 번째 요청 없이 접근 확인까지 마친 결과를 돌려줍니다. 브라우저는 defer_access를 지정해 분리된 경로를 씁니다.
+동일한 검색어·보관함 범위를 사용하고 처음 실행과 반복 실행을 구별해 비교하세요. 공유폴더의 첫 확인은 검색과 별도 요청으로 실행됩니다. 원본 보관함을 병렬로 검사하고, 확인된 결과를 먼저 돌려줍니다. 응답 기한을 넘긴 경로의 검사는 백그라운드에서 완료되면 캐시에 반영됩니다. 최근 확인이 성공한 결과는 최대 10초간 재사용합니다. 원문·첨부 열기와 답변 API 전송 전에는 접근을 다시 확인합니다. 기존 API 호출은 두 번째 요청 없이 접근 확인까지 마친 결과를 돌려줍니다. 브라우저는 defer_access를 지정해 분리된 경로를 씁니다.
 
 ## 2. 합성 데이터 전후 비교
 
@@ -49,7 +49,7 @@ py -3 -m tools.benchmark --semantic-scope --count 25000 --dimensions 1024 --repe
 
 ## 4. 회신과 인용 검증
 
-새로 처리하는 메일은 인식한 답장 인용·서명 구간을 본문 색인에서 제외합니다. 원문 보기는 전체 본문을 사용합니다. 동일 첨부는 파일 종류와 바이트가 같은 경우에 성공한 추출과 본문 임베딩을 공유하며 메일별 원문 링크는 유지합니다. 기존에 완성된 색인 항목은 자동으로 다시 쓰지 않습니다.
+메일은 인식한 답장 인용·서명 구간을 본문 색인에서 제외합니다. 원문 보기는 전체 본문을 사용합니다. 동일 첨부는 파일 종류와 바이트가 같은 경우에 성공한 추출과 본문 임베딩을 공유하며 메일별 원문 링크는 유지합니다. 기존 보관함에서 **갱신**을 실행하면 파일이 그대로인 PST도 구형 색인이면 새 형식으로 처리합니다. 저장해 둔 EML이 있으면 재사용합니다. 잠겼거나 다시 읽을 수 없는 PST는 이전 색인으로 검색할 수 있으며, 다음 갱신 때 다시 시도합니다.
 
 로컬 답변은 관련 부모·자식 회신과 인접 문맥을 더 가져온 뒤 모델에 발송 시각순으로 제공합니다. 인용은 공백과 줄바꿈 차이를 허용하고 화면에는 원문 표기를 제공합니다. 복수 출처가 필요한 문장은 각 독립 사실에 근거가 있을 때 통과합니다. 실제 메일로는 최종 승인·취소 구별, 주체·수량 일치, 출처 링크 열기, 근거 부족 시 보류를 기준으로 수동 검증할 수 있습니다.
 
@@ -64,3 +64,22 @@ py -3 -m tools.benchmark --semantic-scope --count 25000 --dimensions 1024 --repe
 ```
 
 환경 변수 `MAILSEARCH_ANSWER_NUM_CTX`로도 2,048~32,768토큰 사이의 상한을 지정할 수 있습니다. GUI의 사내 API 답변은 검토한 발췌문을 전송하는 기존 입력 예산을 사용합니다. 앱을 시작하면 `app-runtime.log`의 `Vector search backend=` 줄에서 선택된 벡터 백엔드와 NumPy 사용 여부를 확인할 수 있습니다. USearch가 로드된 경우 개별 보관함의 HNSW 준비 상태는 `Vector shard ready` 로그로 확인합니다.
+
+## 6. 백그라운드 임베딩과 벡터 실행 계획
+
+색인 중 한 번에 처리할 구간 수는 24~64개, 요청 타임아웃은 30~60초 사이에서 지정합니다. 기본값은 24개와 60초입니다. 배치가 시간 초과되면 같은 위치에서 더 작은 배치로 재시도합니다. 검색어의 임베딩 제한은 별도로 적용됩니다.
+
+```powershell
+.\start-windows.cmd --embedding-batch-size 32 --embedding-batch-timeout 60
+```
+
+환경 변수는 `MAILSEARCH_EMBEDDING_BATCH_SIZE`와 `MAILSEARCH_EMBEDDING_BATCH_TIMEOUT`입니다.
+
+SQLite에서 벡터 조회의 실행 계획을 확인하려면 아래를 실행합니다. `vectors`는 `(model, passage)` 기본 키를 사용합니다. 공유 벡터 조회에서 `embedding_refs`는 통계에 따라 `(model, passage)` 기본 키 또는 `embedding_ref_value` 커버링 인덱스를 사용하고, `embedding_values`는 `(model, digest)` 기본 키로 접근합니다.
+
+```sql
+EXPLAIN QUERY PLAN
+SELECT passage, value
+FROM searchable_vectors
+WHERE model = 'bge-m3' AND passage IN (SELECT value FROM json_each('[1,2,3]'));
+```
