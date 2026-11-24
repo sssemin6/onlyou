@@ -765,6 +765,17 @@ class Integration(unittest.TestCase):
                 zipped.writestr(path, data)
         return buffer.getvalue()
 
+    def test_missing_heartbeat_waits_for_indexing_and_the_idle_period(self):
+        self.app.last_seen = 1.0
+        stopped = MagicMock()
+        stopped.wait.side_effect = [False, False, False, True]
+        with (patch("mailsearch.server.time.monotonic", side_effect=[20.0, 23.0, 34.0]),
+              patch.object(self.indexer, "has_work", side_effect=[True, False, False]),
+              patch.object(self.app, "shutdown") as shutdown):
+            self.app.watch_page(stopped)
+        self.assertEqual(stopped.wait.call_count, 3)
+        shutdown.assert_called_once_with()
+
     def test_document_folder_registration_opens_cells_and_sections(self):
         folder = Path(self.workspace.name) / "docs"
         folder.mkdir()
@@ -1331,6 +1342,51 @@ class Integration(unittest.TestCase):
         self.indexer.command(source, "resume")
         latest = await_source(self.store, source, {"ready", "error"})
         self.assertEqual((latest["state"], latest["done"], latest["omitted"]), ("ready", 4, 1))
+
+    def test_restart_recovers_committed_index_work_and_keeps_manual_pause(self):
+        started, release = threading.Event(), threading.Event()
+        index_headers = self.indexer.index_headers
+
+        def staged(*args, **kwargs):
+            index_headers(*args, **kwargs)
+            started.set()
+            release.wait(5)
+
+        self.indexer.index_headers = staged
+        source = self.indexer.register(self.mail)
+        try:
+            self.assertTrue(started.wait(5))
+            manual = self.indexer.register(self.mail / "approved.eml")
+            self.indexer.command(manual, "pause")
+            with self.store.connection() as conn:
+                committed = conn.execute(
+                    "SELECT id FROM mails WHERE source=? ORDER BY id", (source,),
+                ).fetchall()
+            self.assertEqual(len(committed), 4)
+        finally:
+            stopper = threading.Thread(target=self.indexer.stop)
+            stopper.start()
+            if source in self.indexer.events:
+                self.indexer.events[source].wait(5)
+            release.set()
+            stopper.join(5)
+        row = self.store.source(source)
+        self.assertEqual((row["state"], row["done"]), ("queued", 4))
+
+        # A hard exit leaves the last active stage in SQLite. Startup queues that
+        # same pending revision too.
+        with self.store.connection() as conn:
+            conn.execute("UPDATE sources SET state='headers' WHERE id=?", (source,))
+        reopened = Indexer(self.store, ai=self.ai)
+        self.addCleanup(reopened.stop)
+        reopened.wake()
+        ready = await_source(self.store, source, {"ready", "error"})
+        self.assertEqual((ready["state"], ready["active"], ready["done"], ready["omitted"]),
+                         ("ready", row["pending"], 4, 1))
+        self.assertEqual(self.store.source(manual)["state"], "paused")
+        with self.store.connection() as conn:
+            self.assertEqual(conn.execute("SELECT id FROM mails WHERE source=? ORDER BY id", (source,)).fetchall(),
+                             committed)
 
     def test_keyword_works_if_local_model_stops(self):
         self.import_mail()
