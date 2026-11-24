@@ -13,7 +13,7 @@ import time
 import unicodedata
 from collections import defaultdict, OrderedDict
 from threading import Lock, local
-from datetime import datetime, timezone
+from datetime import date, datetime, time as midnight, timedelta, timezone
 from functools import lru_cache
 from pathlib import Path
 
@@ -154,6 +154,96 @@ def read_signature(path):
 
 def normalized(value):
     return unicodedata.normalize("NFKC", value).casefold()
+
+
+QUESTION_PERIOD = re.compile(
+    r"(?<![\w@.-])(?P<period>최근|이번\s*주|지난\s*달|올해)"
+    r"(?P<particle>에|의|\s+동안|부터|까지|이랑|랑|하고|와|과|은|는|도|만|을|를)?(?![\w@.-])"
+)
+MAIL_DATE_HINT = re.compile(r"메일|이메일|회신|발신|수신|발송|보낸|받은")
+BUSINESS_PERIOD = re.compile(r"납기|납품|출하|출고|입고|마감|업무\s*일정|매출|예산")
+EMAIL_ADDRESS = r"[A-Za-z0-9][A-Za-z0-9._%+\-]*@[A-Za-z0-9.-]+\.[A-Za-z]{2,}"
+QUESTION_SENDER = re.compile(
+    rf'(?<!\w)(?:발신자\s*[:：]\s*(?:"(?P<name>[^"\n]{{2,80}})"|(?P<address>{EMAIL_ADDRESS})|(?P<label>[가-힣]{{2,6}})(?!\w))'
+    rf'|(?P<from>{EMAIL_ADDRESS})\s*[이가]?\s*보낸|["“](?P<person>[가-힣][가-힣 ]{{1,20}})["”][이가]\s*보낸)'
+    r'(?![A-Za-z0-9_@.-])', re.I
+)
+ATTACHMENT_MAIL = re.compile(r"(?<!\w)(?:첨부(?:\s*파일|물)?(?:이|가)?\s*(?:있는|포함된)|첨부된)\s+(?:메일|이메일|회신)")
+ATTACHMENT_CONTENT = re.compile(r"(?<!\w)첨부(?:\s*파일|물)(?:의|을|를)?\s*(?:내용|요약|비교|정리|검토)")
+
+
+def local_midnight_utc(day):
+    return datetime.combine(day, midnight()).astimezone(timezone.utc).isoformat(timespec="seconds")
+
+
+def period_bounds(period, today):
+    if period == "최근":
+        return today - timedelta(days=29), today + timedelta(days=1)
+    if period == "이번주":
+        monday = today - timedelta(days=today.weekday())
+        return monday, monday + timedelta(days=7)
+    if period == "지난달":
+        start = today.replace(day=1)
+        return (start - timedelta(days=1)).replace(day=1), start
+    return today.replace(month=1, day=1), date(today.year + 1, 1, 1)
+
+
+def question_scope(question, filters, *, today=None):
+    """Use explicit question metadata without altering user-set constraints."""
+    scope = dict(filters)
+    if scope.get("tab") in ("document", "pcf"):
+        return question, scope
+    removed = []
+    quoted = list(re.finditer(r'["“][^"”]*["”]', question))
+
+    def outside_quotes(match):
+        return not any(start.start() < match.start() < start.end() for start in quoted)
+
+    periods = [match for match in QUESTION_PERIOD.finditer(question) if outside_quotes(match)]
+    distinct_periods = {re.sub(r"\s+", "", match["period"]) for match in periods}
+    if len(distinct_periods) == 1 and not (scope.get("after") or scope.get("before")):
+        first = periods[0]
+        following = question[first.end():].lstrip()
+        is_mail_period = MAIL_DATE_HINT.search(question) or not question[:first.start()].strip()
+        business = BUSINESS_PERIOD.search(following)
+        is_business_period = business and not MAIL_DATE_HINT.search(following[:business.start()])
+        if (is_mail_period and not is_business_period
+                and not any(match["particle"] in ("부터", "까지", "이랑", "랑", "하고", "와", "과") for match in periods)
+                and not re.match(r"(?:이전|이후|전까지|부터|버전|문서|대비|기준|\d+\s*(?:일|주|달|개월|년))", following)):
+            start, end = period_bounds(distinct_periods.pop(), today or date.today())
+            scope.update(after=local_midnight_utc(start), before=local_midnight_utc(end))
+            removed.extend(match.span() for match in periods)
+
+    senders = [match for match in QUESTION_SENDER.finditer(question) if outside_quotes(match)]
+    if len(senders) == 1 and not scope.get("sender"):
+        match = senders[0]
+        if not re.match(r"\s*(?:[,/]|또는|및\s)", question[match.end():]):
+            address = match["address"] or match["from"]
+            sender = address or (match["name"] or match["label"] or match["person"]).strip()
+            if sender:
+                scope["sender"] = sender
+                if address:
+                    scope["sender_address"] = True
+                removed.append(match.span())
+
+    if not scope.get("attachment"):
+        match = next((m for m in ATTACHMENT_MAIL.finditer(question) if outside_quotes(m)
+                      and not re.match(r"(?:이|은|는|을|를)?\s*(?:아닌|말고|빼고|제외)", question[m.end():])), None)
+        if match:
+            scope["attachment"] = "yes"
+            removed.append(match.span())
+        elif any(outside_quotes(m) and not re.match(r"(?:은|을|는|를)?\s*(?:빼고|제외|말고)", question[m.end():])
+                 for m in ATTACHMENT_CONTENT.finditer(question)):
+            scope["prefer_attachment"] = True
+    for start, end in sorted(removed, reverse=True):
+        question = question[:start] + " " + question[end:]
+    return " ".join(question.split()) if removed else question, scope
+
+
+def prioritize_attachments(rows, filters):
+    if filters.get("prefer_attachment"):
+        return sorted(rows, key=lambda row: not (row.get("attachment") and row.get("location") != "파일명"))
+    return rows
 
 
 def grams(word):
@@ -323,7 +413,7 @@ def optional_numpy():
     try:
         import numpy
         return numpy
-    except (ImportError, OSError):
+    except (ImportError, OSError, RuntimeError, ValueError):
         return None
 
 
@@ -551,8 +641,13 @@ class Store:
             clauses.append("m.kind IN ('mail','document')")
         for name, col in {"sender": "m.sender", "recipient": "m.recipient", "subject": "m.subject"}.items():
             if filters.get(name):
-                clauses.append(f"instr(lower({col}),lower(?))>0")
-                params.append(filters[name])
+                if name == "sender" and filters.get("sender_address"):
+                    clauses.append("""(instr(lower(m.sender), '<' || lower(?) || '>')>0 OR
+                        instr(',' || replace(lower(m.sender),' ','') || ',', ',' || lower(?) || ',')>0)""")
+                    params.extend((filters[name], filters[name]))
+                else:
+                    clauses.append(f"instr(lower({col}),lower(?))>0")
+                    params.append(filters[name])
         if filters.get("body"):
             clauses.append("""((m.kind='mail' AND instr(lower(m.body),lower(?))>0) OR
                 (m.kind<>'mail' AND EXISTS(SELECT 1 FROM passages bp WHERE bp.mail=m.id AND instr(lower(bp.text),lower(?))>0)))""")
@@ -963,6 +1058,12 @@ class Store:
                 if len(results) >= limit:
                     break
             return results[:limit]
+
+    @property
+    def vector_backend(self):
+        if self.vector_index:
+            return "usearch(int8)"
+        return "sqlite+numpy" if optional_numpy() is not None else "sqlite(pure-python)"
 
     def passages(self, passages, filters=None, conn=None, *, checked=False):
         if not passages:
