@@ -11,8 +11,9 @@ import sqlite3
 import struct
 import time
 import unicodedata
-from collections import defaultdict, OrderedDict
-from threading import Lock, local
+from collections import defaultdict, deque, OrderedDict
+from concurrent.futures import FIRST_COMPLETED, Future, wait
+from threading import Lock, Thread, local
 from datetime import date, datetime, time as midnight, timedelta, timezone
 from functools import lru_cache
 from pathlib import Path
@@ -108,7 +109,11 @@ CREATE VIEW IF NOT EXISTS searchable_vectors AS
     JOIN embedding_values v ON v.model=r.model AND v.digest=r.digest;
 
 """
-MAIL_COLUMNS = "m.id,m.source,m.fingerprint,m.folder,m.subject,m.sender,m.recipient,m.sent,m.kind,m.item,s.path,s.updated,s.kind source_kind"
+VECTOR_LOOKUP_SQL = """SELECT passage,value FROM searchable_vectors
+                       WHERE model=? AND passage IN (SELECT value FROM json_each(?))"""
+# The format prefix controls adoption; duplicate results still use the content digest.
+MAIL_COLUMNS = """m.id,m.source,substr(m.fingerprint,instr(m.fingerprint,':')+1) fingerprint,m.folder,
+                  m.subject,m.sender,m.recipient,m.sent,m.kind,m.item,s.path,s.updated,s.kind source_kind"""
 JOIN = "JOIN sources s ON s.id=m.source"
 VISIBLE_VERSION = """m.version=coalesce(s.active,s.pending)
     AND (s.active IS NOT NULL OR coalesce(s.issue,'')<>'changed')"""
@@ -292,11 +297,24 @@ def topic_key(subject):
     return re.sub(r"\s+", " ", subject)
 
 
-def fingerprint(mail, item):
+MAIL_INDEX_FORMAT = "sections-v2"
+ACCESS_CHECK_TIMEOUT = .35
+MAX_ACCESS_CHECKS = 8
+
+
+def fingerprint(mail, item, *, index_format=MAIL_INDEX_FORMAT):
     attachment_names = [name for name, _ in mail["attachments"]]
     identity = [mail[key] for key in ("message_id", "subject", "sender", "recipient", "sent", "body")]
     # An attachment-bearing copy may contain a different revision under the same name.
-    return hashlib.sha256(json.dumps([identity, attachment_names, item if attachment_names else ""], ensure_ascii=False).encode()).hexdigest()
+    data = [identity, attachment_names, item if attachment_names else ""]
+    digest = hashlib.sha256(json.dumps(data, ensure_ascii=False).encode()).hexdigest()
+    return f"{index_format}:{digest}" if index_format else digest
+
+
+def matches_fingerprint(mail, item, stored):
+    # Older active results and paused jobs can still refer to pre-versioned originals.
+    index_format, separator, _ = stored.partition(":")
+    return fingerprint(mail, item, index_format=index_format if separator else None) == stored
 
 
 def like_prefix(prefix):
@@ -444,6 +462,7 @@ class Store:
         self.vector_index = None
         self.access_cache = OrderedDict()
         self.access_cache_lock = Lock()
+        self.access_inflight = {}
         with self.connection() as conn:
             conn.execute("PRAGMA journal_mode=WAL")
             conn.executescript(SCHEMA)
@@ -530,30 +549,98 @@ class Store:
             self.access_cache.pop(key, None)
             return None
 
-    def result_access(self, row, sources, documents, *, cached_only=False, refresh=False):
+    @staticmethod
+    def access_keys(row):
         source_key = ("source", row["source"], row["path"], row["source_kind"])
-        doc_key = ("document", row["source"], row["path"], row["item"])
+        document_key = ("document", row["source"], row["path"], row["item"])
+        return source_key, document_key
 
-        def verify(key, memo, check, *args):
+    def check_access(self, key):
+        kind, _, path, detail = key
+        check = source_readable if kind == "source" else document_readable
+        decision = check(path, detail)
+        # This lease applies only to search results. Opening or sending evidence rechecks.
+        with self.access_cache_lock:
+            self.access_cache[key] = (time.monotonic() + (10 if decision else 2), decision)
+            self.access_cache.move_to_end(key)
+            if len(self.access_cache) > 2048:
+                self.access_cache.popitem(last=False)
+        return decision
+
+    def start_access_probe(self, key):
+        with self.access_cache_lock:
+            if key in self.access_inflight:
+                return self.access_inflight[key]
+            if len(self.access_inflight) >= MAX_ACCESS_CHECKS:
+                return None
+            future = Future()
+            self.access_inflight[key] = future
+
+        def run():
+            try:
+                decision = self.check_access(key)
+            except (OSError, RuntimeError, ValueError):
+                decision = False
+            finally:
+                with self.access_cache_lock:
+                    self.access_inflight.pop(key, None)
+            future.set_result(decision)
+
+        try:
+            # A blocked Windows share call cannot hold the HTTP request or app exit open.
+            Thread(target=run, name="search-access", daemon=True).start()
+        except RuntimeError:
+            with self.access_cache_lock:
+                self.access_inflight.pop(key, None)
+            future.set_result(False)
+        return future
+
+    def prefetch_access(self, keys, *, refresh):
+        decisions = {key: None if refresh else self.cached_access(key) for key in keys}
+        remaining = deque(key for key, decision in decisions.items() if decision is None)
+        deadline = time.monotonic() + ACCESS_CHECK_TIMEOUT
+        pending = {}
+        while remaining or pending:
+            while remaining and time.monotonic() < deadline:
+                key = remaining[0]
+                future = self.start_access_probe(key)
+                if future is None:
+                    break
+                pending[future] = key
+                remaining.popleft()
+            if not pending:
+                break
+            done, _ = wait(pending, timeout=max(0, deadline - time.monotonic()), return_when=FIRST_COMPLETED)
+            for future in done:
+                decisions[pending.pop(future)] = future.result()
+            if time.monotonic() >= deadline:
+                break
+        return decisions
+
+    def prefetch_search_access(self, rows, *, refresh=False):
+        entries = [(self.access_keys(row), row["kind"]) for row in rows]
+        sources = self.prefetch_access((keys[0] for keys, _ in entries), refresh=refresh)
+        documents = self.prefetch_access((keys[1] for keys, kind in entries
+                                          if kind != "mail" and sources[keys[0]] is True), refresh=refresh)
+        pending = None in sources.values() or None in documents.values()
+        return sources, documents, pending
+
+    def result_access(self, row, sources, documents, *, cached_only=False, refresh=False):
+        source_key, doc_key = self.access_keys(row)
+
+        def verify(key, memo):
             if key not in memo:
                 decision = None if refresh else self.cached_access(key)
                 if decision is None and not cached_only:
                     with self.measure("access"):
-                        decision = check(*args)
-                    # A short positive lease applies only to rendering search
-                    # results. Opening or sending evidence always rechecks.
-                    with self.access_cache_lock:
-                        self.access_cache[key] = (time.monotonic() + (10 if decision else 2), decision)
-                        self.access_cache.move_to_end(key)
-                        if len(self.access_cache) > 2048:
-                            self.access_cache.popitem(last=False)
+                        decision = self.check_access(key)
                 memo[key] = decision
             return memo[key]
 
-        readable = verify(source_key, sources, source_readable, row["path"], row["source_kind"])
+        readable = verify(source_key, sources)
         if readable is not True or row["kind"] == "mail":
             return readable
-        return verify(doc_key, documents, document_readable, row["path"], row["item"])
+        return verify(doc_key, documents)
 
     def readable(self, row, sources, documents):
         return self.deferred_access() or self.result_access(row, sources, documents, refresh=True)
@@ -728,7 +815,7 @@ class Store:
         cursor = conn.execute(
             """INSERT INTO mails(source,version,item,fingerprint,folder,subject,sender,recipient,sent,message_id,topic,body,kind)
                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (source, version, item, fingerprint(mail, item), doc["folder"], doc["name"], "", "",
+            (source, version, item, fingerprint(mail, item, index_format=None), doc["folder"], doc["name"], "", "",
              doc["sent"], "", topic_key(doc["name"]), "",
              document_kind(doc["name"])),
         )
@@ -798,11 +885,11 @@ class Store:
             )
         return new_id
 
-    def try_adopt(self, conn, source, previous, version, item, mail):
+    def try_adopt(self, conn, source, previous, version, item, mail, *, index_format=MAIL_INDEX_FORMAT):
         """Reuse the previous version's work when the mail content is unchanged."""
         old = conn.execute(
             "SELECT id FROM mails WHERE source=? AND version=? AND item=? AND fingerprint=?",
-            (source, previous, item, fingerprint(mail, item)),
+            (source, previous, item, fingerprint(mail, item, index_format=index_format)),
         ).fetchone()
         if old is None:
             return False
@@ -824,6 +911,31 @@ class Store:
         with self.connection() as conn:
             return {row["label"]: row["signature"] for row in
                     conn.execute("SELECT label,signature FROM pst_files WHERE source=?", (source,))}
+
+    def outdated_pst_labels(self, source, version, labels):
+        """Find PSTs whose active mail passages predate the current format."""
+        if version is None or not labels:
+            return set()
+        labels = set(labels)
+        marker = MAIL_INDEX_FORMAT + ":"
+        outdated = set()
+        with self.connection() as conn:
+            rows = conn.execute(
+                """SELECT item FROM mails WHERE source=? AND version=? AND kind='mail'
+                   AND substr(fingerprint,1,?)<>?""", (source, version, len(marker), marker),
+            )
+            for row in rows:
+                if "" in labels:
+                    return {""}
+                item = row["item"]
+                for position in re.finditer("/", item):
+                    prefix = item[:position.end()]
+                    if prefix in labels:
+                        outdated.add(prefix)
+                        break
+                if outdated == labels:
+                    break
+        return outdated
 
     def save_pst_files(self, conn, source, signatures):
         conn.execute("DELETE FROM pst_files WHERE source=?", (source,))
@@ -1033,10 +1145,7 @@ class Store:
                         (model, json.dumps(probes), *params),
                     )
                     chosen = [row[0] for row in ranked]
-            vectors = conn.execute(
-                "SELECT passage,value FROM searchable_vectors WHERE model=? AND passage IN (SELECT value FROM json_each(?))",
-                (model, json.dumps(chosen)),
-            )
+            vectors = conn.execute(VECTOR_LOOKUP_SQL, (model, json.dumps(chosen)))
             eligible = [(row["passage"], row["value"]) for row in vectors if len(row["value"]) == len(vector) * 4]
             scores = []
             if eligible:
