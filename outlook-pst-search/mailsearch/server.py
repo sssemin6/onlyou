@@ -352,7 +352,8 @@ class Handler(BaseHTTPRequestHandler):
             use_gateway = embedding and embedding.index_key
             self.send_json(200, {
                 "sources": [{**row, "available": row["id"] in ids,
-                             "updates": self.server.indexer.pending_updates(row)} for row in sources],
+                             "updates": self.server.indexer.pending_updates(row),
+                             "pst_read": self.server.indexer.pst_progress(row)} for row in sources],
                 "model": self.server.ai.model,
                 "embedding": embedding.model if use_gateway else self.server.ai.embedding_model,
                 "embedding_endpoint": embedding.endpoint if use_gateway else None,
