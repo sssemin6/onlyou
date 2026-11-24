@@ -583,6 +583,7 @@ form.addEventListener("submit", async (event) => {
   const active = request = new AbortController();
   const query = element("query").value.trim();
   const ask = event.submitter?.value === "ask";
+  const semantic = event.submitter?.value === "semantic";
   const pcf = activeTab === "pcf";
   if (ask && !query) {
     element("query").focus();
@@ -592,12 +593,12 @@ form.addEventListener("submit", async (event) => {
   const filters = Object.fromEntries(["source", ...TAB_FILTERS[activeTab]].map((id) => [id, element(id).value]));
   filters.tab = activeTab;
   const payload = { query, filters, context: ask ? previousQuestion : "" };
-  notice(ask ? "답변에 쓸 근거를 찾고 있습니다." : "검색 중입니다.");
+  notice(ask ? "답변에 쓸 근거를 찾고 있습니다." : semantic ? "의미 검색 중입니다." : "검색 중입니다.");
   try {
     if (ask) {
       await previewAnswer(pcf ? "/api/pcf/preview" : "/api/external/preview", payload, active, pcf);
     } else {
-      const data = await call("/api/search", payload, active.signal);
+      const data = await call("/api/search", { ...payload, mode: semantic ? "hybrid" : "keyword" }, active.signal);
       if (active.signal.aborted) return;
       showResults(data.results, query ? "검색 결과" : recentTitle());
       notice("");
