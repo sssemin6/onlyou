@@ -200,6 +200,20 @@ def document_kind(filename):
     return "pcf" if "pcf" in Path(filename).stem.lower() else "document"
 
 
+def source_readable(path, kind):
+    try:
+        path = Path(path)
+        if kind == "eml_dir":
+            with os.scandir(path) as iterator:
+                next(iterator, None)
+        else:
+            with path.open("rb"):
+                pass
+        return True
+    except OSError:
+        return False
+
+
 def document_readable(source_path, item):
     try:
         root = Path(source_path)
@@ -276,6 +290,9 @@ class Store:
             for column in ("embedding_done", "embedding_total"):
                 if column not in source_columns:
                     conn.execute(f"ALTER TABLE sources ADD COLUMN {column} INTEGER")
+            if "active_signature" not in source_columns:
+                conn.execute("ALTER TABLE sources ADD COLUMN active_signature TEXT")
+                conn.execute("UPDATE sources SET active_signature=signature WHERE active IS NOT NULL AND pending IS NULL")
             columns = {row[1] for row in conn.execute("PRAGMA table_info(mails)")}
             if "kind" not in columns:
                 # Tab scoping (mail vs document); older rows are classified by item suffix.
@@ -294,6 +311,7 @@ class Store:
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys=ON")
         conn.execute("PRAGMA secure_delete=ON")
+        conn.create_function("source_readable", 2, lru_cache(maxsize=2048)(source_readable))
         conn.create_function("document_readable", 2, lru_cache(maxsize=2048)(document_readable))
         conn.create_function("pcf_field_matches", 4, pcf_field_value)
         try:
@@ -333,24 +351,18 @@ class Store:
         for row in sources:
             if source is not None and row["id"] != source:
                 continue
-            path = Path(row["path"])
-            try:
-                if row["kind"] == "eml_dir":
-                    with os.scandir(path) as iterator:
-                        next(iterator, None)
-                else:
-                    with path.open("rb"):
-                        pass
-            except OSError:
-                continue
-            ids.append(row["id"])
+            if source_readable(row["path"], row["kind"]):
+                ids.append(row["id"])
         return ids
 
     def scope(self, filters, extra=()):
-        ids = self.allowed_sources(filters.get("source"))
-        clauses = [VISIBLE_VERSION, "m.source IN (SELECT value FROM json_each(?))",
-                   "CASE WHEN m.kind<>'mail' THEN document_readable(s.path,m.item) ELSE 1 END"]
-        params = [json.dumps(ids)]
+        clauses = [VISIBLE_VERSION]
+        params = []
+        if filters.get("source"):
+            clauses.append("m.source=?")
+            params.append(filters["source"])
+        clauses.extend(("source_readable(s.path,s.kind)",
+                        "CASE WHEN m.kind<>'mail' THEN document_readable(s.path,m.item) ELSE 1 END"))
         if filters.get("regular_only"):
             clauses.append("m.kind IN ('mail','document')")
         for name, col in {"sender": "m.sender", "recipient": "m.recipient", "subject": "m.subject"}.items():
@@ -722,10 +734,21 @@ class Store:
                 return None
             result = dict(row)
             result["attachments"] = [dict(item) for item in conn.execute(
-                """SELECT a.name,a.status,(SELECT min(id) FROM passages WHERE attachment=a.id AND location<>'파일명') passage
+                """SELECT a.id,a.name,a.status,(SELECT min(id) FROM passages WHERE attachment=a.id AND location<>'파일명') passage
                    FROM attachments a WHERE a.mail=? ORDER BY a.id""", (row["id"],)
             )]
         return result
+
+    def original_attachment(self, attachment):
+        with self.connection() as conn:
+            return conn.execute(
+                f"""SELECT a.name,m.item,m.folder,m.fingerprint,m.version,m.source,s.kind,s.path,
+                           s.active,s.pending,s.signature,s.active_signature,
+                           (SELECT COUNT(*) FROM attachments earlier WHERE earlier.mail=m.id AND earlier.id<a.id) position
+                    FROM attachments a JOIN mails m ON m.id=a.mail {JOIN}
+                    WHERE a.id=? AND m.kind='mail' AND {VISIBLE_VERSION} AND source_readable(s.path,s.kind)""",
+                (attachment,),
+            ).fetchone()
 
     def pcf_case(self, seed, filters=None):
         """Resolve a cell to its full case in the visible indexed document version."""
