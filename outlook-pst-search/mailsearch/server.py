@@ -18,7 +18,7 @@ from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 
 from .answer import (PCF_INSTRUCTIONS, LocalAI, map_citations, pcf_candidates, pcf_retrieval, pcf_word, delivery_date_answer,
                      evidence_for, merge_rows, public_row, validate)
@@ -29,7 +29,7 @@ from .external import DEFAULT_MODEL, DEFAULT_URL, MAX_EXCERPTS, MAX_INTERNAL_EXC
 from .extract import MAX_ATTACHMENT
 from .filesystem import local_path, source_path
 from .indexer import ImportIssue, Indexer, runtime_logger
-from .intranet import CHAT_PATH, LOCAL_EMBEDDING, IntranetAI, available_models, validate_selections
+from .intranet import CHAT_PATH, LOCAL_EMBEDDING, RERANK_PATH, IntranetAI, available_models, validate_selections
 from .ollama_setup import OllamaSetup
 from .pcf import PCF_CELL
 from .store import Store, normalized, pack_vector, query_words, quoted_plan
@@ -86,6 +86,7 @@ class App(ThreadingHTTPServer):
         self.gateway_fields = gateway_defaults(gateway_preset)
         self.gateway_test_origin = self.gateway_fields["gateway_url"] if self.gateway_fields.pop("test_unverified") else ""
         self.gateway_unverified_origin = ""
+        self.rerank_unverified_origin = ""
         self.api_settings = api_settings
         self.api_profiles = api_settings.load() if api_settings else {}
         for profile in ("gateway", "external"):
@@ -148,13 +149,15 @@ class App(ThreadingHTTPServer):
                 fields = gateway_fields(gateway, self.gateway_fields)
                 origin = fields["gateway_url"]
                 unverified = bool(origin and gateway.get("unverified_origin") == origin)
+                rerank_unverified = bool(origin and gateway.get("rerank_unverified_origin") == origin)
                 selections = gateway["selections"]
                 validate_selections(selections, fields["answer_models"])
                 current = self.ai.embedding_api
                 try:
                     client = IntranetAI.from_settings(
                         gateway.get("key", ""), selections, current, origin=origin,
-                        answer_models=fields["answer_models"], tls=gateway_tls(fields["ca_file"], unverified),
+                        answer_models=fields["answer_models"],
+                        tls=gateway_tls(fields["ca_file"], unverified, rerank_unverified=rerank_unverified),
                     )
                 except ValueError:
                     client = None
@@ -164,6 +167,7 @@ class App(ThreadingHTTPServer):
                 self.embedding_selection = selections["embedding"]
                 self.gateway_fields = fields
                 self.gateway_unverified_origin = origin if unverified else ""
+                self.rerank_unverified_origin = origin if rerank_unverified else ""
                 gateway_answer = client.answer_client if client else None
             except (ValueError, TypeError, KeyError):
                 self.api_profiles.pop("gateway", None)
@@ -192,10 +196,12 @@ def gateway_fields(payload, defaults):
     return fields
 
 
-def gateway_tls(ca_file, runtime_unverified, test_unverified=False):
-    if runtime_unverified:
-        return GatewayTLSOptions(ca_file, unverified_paths=(CHAT_PATH, EMBEDDING_PATH))
-    return GatewayTLSOptions(verify=False) if test_unverified else GatewayTLSOptions(ca_file)
+def gateway_tls(ca_file, runtime_unverified, test_unverified=False, *, rerank_unverified=False):
+    paths = (CHAT_PATH, EMBEDDING_PATH) if runtime_unverified else ()
+    if rerank_unverified:
+        paths += (RERANK_PATH,)
+    return GatewayTLSOptions(ca_file if not test_unverified else "", verify=not test_unverified,
+                             unverified_paths=paths)
 
 
 def gateway_environment():
@@ -306,10 +312,12 @@ class Handler(BaseHTTPRequestHandler):
         # Paths and query parameters contain private mail metadata.
         return
 
-    def send_bytes(self, status, content_type, body):
+    def send_bytes(self, status, content_type, body, *, filename=None):
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
+        if filename is not None:
+            self.send_header("Content-Disposition", "attachment; filename*=UTF-8''" + quote(filename, safe=""))
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Referrer-Policy", "no-referrer")
@@ -360,19 +368,30 @@ class Handler(BaseHTTPRequestHandler):
             self.send_bytes(200, content_type, body)
         elif route.path == "/api/sources":
             sources = self.server.store.sources()
-            ids = set(self.server.store.allowed_sources(sources=sources))
+            scan = route.query != "scan=0"
+            ids = set(self.server.store.allowed_sources(sources=sources)) if scan else None
             external = self.server.external
             embedding = self.server.ai.embedding_api
             use_gateway = embedding and embedding.index_key
             self.send_json(200, {
-                "sources": [{**row, "available": row["id"] in ids,
-                             "updates": self.server.indexer.pending_updates(row),
+                "sources": [{**row, "available": row["id"] in ids if scan else None,
+                             "updates": self.server.indexer.pending_updates(row) if scan else [],
                              "pst_read": self.server.indexer.pst_progress(row)} for row in sources],
                 "model": self.server.ai.model,
                 "embedding": embedding.model if use_gateway else self.server.ai.embedding_model,
                 "embedding_endpoint": embedding.endpoint if use_gateway else None,
                 "external": external.public if external else None,
             })
+        elif re.fullmatch(r"/api/source-updates/\d{1,16}", route.path):
+            source = int(route.path.rsplit("/", 1)[-1])
+            row = self.server.store.source(source)
+            if row is None:
+                self.send_json(404, {"error": "source_missing"})
+            else:
+                self.send_json(200, {"available": bool(self.server.store.allowed_sources(source)),
+                                     "updates": self.server.indexer.pending_updates(row)})
+        elif re.fullmatch(r"/api/attachment/\d{1,16}", route.path):
+            self.download_attachment(int(route.path.rsplit("/", 1)[-1]))
         elif route.path == "/api/ping":
             self.server.last_seen = time.monotonic()
             self.send_json(200, {"ok": True})
@@ -404,6 +423,26 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(200, payload)
         else:
             self.send_json(404, {"error": "not_found"})
+
+    def download_attachment(self, attachment):
+        row = self.server.store.original_attachment(attachment)
+        if row is None:
+            self.send_json(404, {"error": "attachment_missing"})
+            return
+        try:
+            body = self.server.indexer.attachment_bytes(row)
+        except ImportIssue as exc:
+            self.send_json(409, {"error": str(exc)})
+        except (OSError, ValueError, LookupError, RuntimeError, TypeError):
+            self.send_json(422, {"error": "attachment_missing"})
+        else:
+            if body is None:
+                self.send_json(202, {"status": "preparing"})
+            elif self.server.store.original_attachment(attachment) is None:
+                self.send_json(404, {"error": "attachment_missing"})
+            else:
+                filename = re.split(r"[/\\]", row["name"])[-1]
+                self.send_bytes(200, "application/octet-stream", body, filename=filename)
 
     def do_POST(self):
         route = urlsplit(self.path).path
@@ -455,6 +494,7 @@ class Handler(BaseHTTPRequestHandler):
         filters = filters_from(options.get)
         store, ai = self.server.store, self.server.ai
         if route == "/api/search":
+            started = time.monotonic()
             keyword_only = payload.get("mode") == "keyword"
             plan = quoted_plan(query)
             if plan is not None:
@@ -469,6 +509,11 @@ class Handler(BaseHTTPRequestHandler):
                         pass
             if query and not keyword_only and plan is None:
                 rows = ai.rerank_candidates(query, rows)
+            elapsed = time.monotonic() - started
+            if elapsed >= 1:
+                runtime_logger.info("Search took %.2fs (mode=%s, tab=%s, scoped=%s)", elapsed,
+                                    "keyword" if keyword_only or plan else "hybrid",
+                                    filters.get("tab", "all"), "source" in filters)
             tokens = query_words(query, fuzzy=True)[:8]
             distinct = {}
             for row in rows:
@@ -787,6 +832,7 @@ class Handler(BaseHTTPRequestHandler):
             "configured": configured, "persistent_keys": self.server.persistent_keys,
             "test_unverified": bool(origin and origin == self.server.gateway_test_origin),
             "runtime_unverified": bool(origin and origin == self.server.gateway_unverified_origin),
+            "rerank_unverified": bool(origin and origin == self.server.rerank_unverified_origin),
             "selections": selections,
             "active_answer": configured and current.answer_client is not None and self.server.external is current.answer_client,
         }
@@ -836,6 +882,7 @@ class Handler(BaseHTTPRequestHandler):
             local_model = server.ai.embedding_model
             fields = server.gateway_fields
             unverified_origin = ""
+            rerank_unverified_origin = ""
             selections = {"answer": "", "rerank": "", "embedding": LOCAL_EMBEDDING if local_model == BGE_MODEL else ""}
             if action != "disconnect":
                 key = payload.get("key", "")
@@ -850,8 +897,13 @@ class Handler(BaseHTTPRequestHandler):
                     runtime_unverified = payload.get("runtime_unverified", False)
                     if type(runtime_unverified) is not bool or (runtime_unverified and not fields["gateway_url"]):
                         raise ValueError("gateway_settings")
+                    rerank_unverified = payload.get("rerank_unverified", False)
+                    if type(rerank_unverified) is not bool or (rerank_unverified and not fields["gateway_url"]):
+                        raise ValueError("gateway_settings")
                     unverified_origin = fields["gateway_url"] if runtime_unverified else ""
-                    tls = gateway_tls(fields["ca_file"], runtime_unverified, skip_verify)
+                    rerank_unverified_origin = fields["gateway_url"] if rerank_unverified else ""
+                    tls = gateway_tls(fields["ca_file"], runtime_unverified, skip_verify,
+                                      rerank_unverified=rerank_unverified)
                     candidate = IntranetAI.from_settings(
                         key.strip(), selections, current, origin=fields["gateway_url"],
                         answer_models=fields["answer_models"], tls=tls,
@@ -887,12 +939,14 @@ class Handler(BaseHTTPRequestHandler):
                     answer = server.generic_answer
                 try:
                     server.remember_api("gateway", {**fields, "selections": selections, "unverified_origin": unverified_origin,
+                                                   "rerank_unverified_origin": rerank_unverified_origin,
                                                    "key": candidate._key if candidate else ""}, answer)
                 except (OSError, ValueError):
                     self.send_json(500, {"error": "api_settings_save_failed"})
                     return
                 server.gateway_fields = fields
                 server.gateway_unverified_origin = unverified_origin
+                server.rerank_unverified_origin = rerank_unverified_origin
                 server.ai.configure_embedding(local_model, candidate)
                 server.embedding_selection = LOCAL_EMBEDDING if local_model == BGE_MODEL else ""
                 server.external = answer
