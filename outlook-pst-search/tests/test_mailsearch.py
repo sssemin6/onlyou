@@ -468,7 +468,7 @@ class Integration(unittest.TestCase):
         (folder / "보관.pst").write_bytes(b"!BDN\x00\x00\x00\x00SM\x00\x00")
         (folder / "깨진.pst").write_bytes(b"not-a-pst-header")
 
-        def fake_export(pst, stage, event):
+        def fake_export(pst, stage, event, source):
             message = EmailMessage()
             message["From"] = "a@example.invalid"
             message["To"] = "b@example.invalid"
@@ -514,7 +514,7 @@ class Integration(unittest.TestCase):
                 raise error
             return nullcontext()
 
-        def export(pst, stage, _event):
+        def export(pst, stage, _event, _source):
             exported.append(pst.name)
             message = EmailMessage()
             message["Subject"] = pst.stem
@@ -602,7 +602,7 @@ class Integration(unittest.TestCase):
         (folder / "깨진.pst").write_bytes(b"not-a-pst-header")
         exports = []
 
-        def fake_export(pst, stage, event):
+        def fake_export(pst, stage, event, source):
             exports.append(pst.name)
             message = EmailMessage()
             message["From"] = "a@example.invalid"
@@ -1361,6 +1361,69 @@ class Integration(unittest.TestCase):
         self.assertIsNone(row["active"])
         self.assertFalse((Path(run.call_args.kwargs["cwd"]).parent / "export-complete").exists())
         self.assertEqual(run.call_args.args[0][-3:], ["-o", ".", str(pst)])
+
+    def test_pst_read_reports_output_before_indexing_for_files_and_folders(self):
+        self.indexer.readpst = sys.executable
+        mail = (self.mail / "approved.eml").read_bytes()
+        header = b"!BDN" + bytes(4) + b"SM" + bytes(2)
+
+        for in_folder in (False, True):
+            with self.subTest(in_folder=in_folder):
+                folder = Path(self.workspace.name) / ("folder" if in_folder else "single")
+                folder.mkdir()
+                nested = folder / "archive"
+                nested.mkdir()
+                target = nested / "outlook.pst"
+                target.write_bytes(header)
+                if in_folder:
+                    (folder / "a-invalid.pst").write_bytes(b"not a PST")
+
+                started, finish = threading.Event(), threading.Event()
+                process = MagicMock()
+                process.__enter__.return_value = process
+                process.returncode = 0
+                process.poll.side_effect = lambda: 0 if finish.is_set() else None
+
+                def launch(*args, cwd, **kwargs):
+                    started.set()
+                    return process
+
+                def listing(source):
+                    status, result = self.call("/api/sources")
+                    self.assertEqual(status, 200)
+                    return next(item for item in result["sources"] if item["id"] == source)
+
+                with (patch("mailsearch.indexer.subprocess.Popen", side_effect=launch) as run,
+                      patch("mailsearch.indexer.PST_PROGRESS_INTERVAL", .01)):
+                    status, result = self.call("/api/sources", {"path": str(folder if in_folder else target)})
+                    self.assertEqual(status, 202)
+                    source = result["source"]
+                    try:
+                        self.assertTrue(started.wait(5))
+                        row = listing(source)
+                        self.assertEqual((row["state"], row["done"], row["updates"]), ("extracting", 0, []))
+                        reading = row["pst_read"]
+                        self.assertEqual(reading["item"], "archive/outlook.pst" if in_folder else "outlook.pst")
+                        position = 2 if in_folder else 1
+                        self.assertEqual((reading["position"], reading["total"], reading["files"]),
+                                         (position, position, 0))
+                        out = Path(run.call_args.kwargs["cwd"]) / "mailbox"
+                        out.mkdir()
+                        (out / "1").write_bytes(mail)
+                        (out / "readpst.log").touch()
+                        deadline = time.monotonic() + 5
+                        while time.monotonic() < deadline:
+                            row = listing(source)
+                            if row["pst_read"]["files"] == 1 and row["pst_read"]["elapsed"] >= 1:
+                                break
+                            time.sleep(.05)
+                        self.assertEqual((row["state"], row["done"], row["pst_read"]["files"]), ("extracting", 0, 1))
+                        self.assertGreaterEqual(row["pst_read"]["elapsed"], 1)
+                    finally:
+                        finish.set()
+                    row = await_source(self.store, source, {"ready", "error", "empty"})
+                    self.assertEqual((row["state"], row["done"]), ("ready", 1))
+                    self.assertIsNone(listing(source)["pst_read"])
 
     def test_pst_embedding_reports_committed_batches_and_reuses_them_after_disconnect(self):
         target = self.mail / "progress.pst"
