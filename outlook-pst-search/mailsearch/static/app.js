@@ -215,8 +215,12 @@ async function showSources() {
     }
     if (source.failed || source.omitted || source.partial) {
       entry.append(node("p", "실패 " + source.failed + " · 누락 " + source.omitted + " · 일부 색인 " + source.partial));
+      if (source.deferred_psts) {
+        entry.append(node("p", "잠김·접근 불가로 보류된 PST " + source.deferred_psts + "개", "issue"));
+      }
       for (const problem of source.problems || []) {
-        entry.append(node("p", problem.item + " · " + (issueNames[problem.code] || problem.code), "issue"));
+        const reason = problem.code === "pst_in_use" ? "잠김 또는 읽기 권한 없음" : issueNames[problem.code] || problem.code;
+        entry.append(node("p", problem.item + " · " + reason, "issue"));
       }
     }
     if (source.updated) {
