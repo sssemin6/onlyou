@@ -8,13 +8,14 @@ import shutil
 import subprocess
 import threading
 import time
+from collections import OrderedDict
 from contextlib import contextmanager
 from pathlib import Path
 from functools import partial
 
 from .extract import CREATE_FLAGS
 from .pcf import PCF_CELL, WORD_SUFFIXES, comment_number
-from .store import normalized, query_words, topic_key
+from .store import normalized, pack_vector, query_words, topic_key
 
 QUOTE_LIMIT = 300
 MAX_HTTP_BODY = 8 * 1024 * 1024
@@ -89,12 +90,18 @@ class LocalAI:
         self.model = model
         self.port = port
         self.timeout = timeout
+        self.query_cache = OrderedDict()
+        self.query_cache_lock = threading.Lock()
         self.configure_embedding(embedding_model, embedding_api)
         self.server = None
         self.server_lock = threading.Lock()
+        self.embed_ready_lock = threading.Lock()
+        self.embed_ready = {}
 
     def configure_embedding(self, local_model, provider):
-        self.embedding_config = local_model, provider
+        with self.query_cache_lock:
+            self.embedding_config = local_model, provider
+            self.query_cache.clear()
 
     @property
     def embedding_model(self):
@@ -197,23 +204,51 @@ class LocalAI:
         return embed(texts, timeout)
 
     def embed_local(self, model, texts, timeout=8):
-        self.ensure_server()
-        model = self.ensure_model(model)
-        values = self.call("/api/embed", {"model": model, "input": texts, "truncate": True}, timeout)
-        return values["embeddings"]
+        with self.embed_ready_lock:
+            ready = self.embed_ready.get(model)
+            if ready is None or time.monotonic() >= ready[1]:
+                self.ensure_server()
+                ready = self.ensure_model(model), time.monotonic() + 30
+                self.embed_ready = {model: ready}
+        try:
+            values = self.call("/api/embed", {
+                "model": ready[0], "input": texts, "truncate": True, "keep_alive": -1,
+            }, timeout)
+            return values["embeddings"]
+        except (OSError, RuntimeError, ValueError, KeyError, http.client.HTTPException):
+            with self.embed_ready_lock:
+                if self.embed_ready.get(model) is ready:
+                    self.embed_ready.pop(model, None)
+            raise
 
     def semantic_search(self, store, query, filters):
-        index, embed = self.embedding_backend()
-        if index:
-            return store.semantic(embed([query], 6)[0], index, filters)
-        return []
+        with self.query_cache_lock:
+            configuration = self.embedding_config
+            index, embed = self.embedding_backend()
+            cached = self.query_cache.get(query)
+            if cached is not None:
+                self.query_cache.move_to_end(query)
+        if not index:
+            return []
+        if cached is None:
+            with store.measure("embed"):
+                cached = embed([query], 6)[0]
+                pack_vector(cached)
+            with self.query_cache_lock:
+                if self.embedding_config is configuration:
+                    self.query_cache[query] = cached
+                    self.query_cache.move_to_end(query)
+                    if len(self.query_cache) > 128:
+                        self.query_cache.popitem(last=False)
+        with store.measure("vector"):
+            return store.semantic(cached, index, filters)
 
-    def rerank_candidates(self, query, rows):
+    def rerank_candidates(self, query, rows, *, limit=10, text_limit=512):
         provider = self.embedding_api
         if not getattr(provider, "models", {}).get("rerank") or len(rows) < 2:
             return rows
-        batch = rows[:24]
-        documents = [f"{row['subject'][:160]}\n{row['text'][:1100]}" for row in batch]
+        batch = rows[:limit]
+        documents = [f"{row['subject'][:160]}\n{row['text'][:text_limit]}" for row in batch]
         try:
             order = provider.rerank(query, documents)
         except (OSError, ValueError, RuntimeError, http.client.HTTPException):
@@ -223,11 +258,16 @@ class LocalAI:
     def answer(self, question, evidence, context):
         self.ensure_server()
         model = self.ensure_model(self.model)
+        evidence = sorted(evidence, key=lambda row: (
+            not row["sent"], row["sent"], row["id"], row.get("start", 0), row["passage"],
+        ))
         ids = {index: row["passage"] for index, row in enumerate(evidence, 1)}
         data = {"question": question, "context": context, "evidence": [
             {"source": index, "text": source_text(row)} for index, row in enumerate(evidence, 1)
         ]}
-        prompt = ANSWER_INSTRUCTIONS + "context는 앞선 질문에서 선택한 검색 맥락이다."
+        prompt = (ANSWER_INSTRUCTIONS + " context는 앞선 질문에서 선택한 검색 맥락이다. "
+                  "근거는 발송 시각 순서다. 요청, 잠정 회신, 최종 확정, 취소를 구분하고 "
+                  "독립된 사실마다 해당 출처를 직접 인용한다.")
         response = self.call("/api/generate", {
             "model": model, "system": prompt, "prompt": json.dumps(data, ensure_ascii=False),
             "format": FORMAT, "stream": False, "think": False,
@@ -314,9 +354,10 @@ def pcf_retrieval(store, ai, question, filters, context):
     return list(expanded.values())[:14], mode
 
 
-def evidence_for(store, ai, question, filters, context, semantic=True, limit=9, expand=False):
+def evidence_for(store, ai, question, filters, context, semantic=True, limit=9, expand=False, *, thread_hops=1):
     search_text = f"{question} {context}".strip()
-    lexical = store.lexical(search_text, filters, fuzzy=True)
+    with store.measure("fts"):
+        lexical = store.lexical(search_text, filters, fuzzy=True)
     semantic_rows = []
     mode = "keyword"
     if semantic and ai.embedding_index:
@@ -327,7 +368,8 @@ def evidence_for(store, ai, question, filters, context, semantic=True, limit=9, 
             mode = "keyword_only"
     seeds = merge_rows(lexical, semantic_rows, limit=max(24, limit))
     if semantic:
-        seeds = ai.rerank_candidates(search_text, seeds)
+        with store.measure("rerank"):
+            seeds = ai.rerank_candidates(search_text, seeds, limit=24, text_limit=1100)
     chosen = []
     counts = {}
     for row in seeds:
@@ -336,7 +378,8 @@ def evidence_for(store, ai, question, filters, context, semantic=True, limit=9, 
         per_document = 8 if expand and row.get("kind") == "document" else 2
         if counts[group] <= per_document or (limit > 9 and PCF_CELL.fullmatch(row["location"])):
             chosen.append(row)
-    linked = store.related(list(dict.fromkeys(row["id"] for row in chosen[:7])), filters)
+    with store.measure("context"):
+        linked = store.related(list(dict.fromkeys(row["id"] for row in chosen[:7])), filters, hops=thread_hops)
     seen = set()
     evidence = []
     for row in [*chosen[:4], *linked[:4], *chosen[4:]]:
@@ -351,7 +394,8 @@ def evidence_for(store, ai, question, filters, context, semantic=True, limit=9, 
         expanded = {}
         for row in evidence[:4]:
             expanded[row["passage"]] = row
-        contexts = [store.evidence_context(row, filters) for row in evidence[:6]]
+        with store.measure("context"):
+            contexts = [store.evidence_context(row, filters) for row in evidence[:6]]
         for position in range(3):
             for group in contexts:
                 if position < len(group) and len(expanded) < 12:
@@ -378,6 +422,20 @@ def fact_values(text):
     return {re.sub(r"[\s,]", "", m.group()).casefold() for m in FACT_VALUE.finditer(text)}
 
 
+def compact_space(value):
+    return " ".join(value.split())
+
+
+def original_quote(text, quote):
+    if quote in text:
+        return quote
+    tokens = quote.split()
+    if not tokens:
+        return None
+    match = re.search(r"\s+".join(map(re.escape, tokens)), text)
+    return match.group() if match else None
+
+
 def same_statement(text, body_quotes, cited_rows, active_approval, local_metadata):
     actors = set(ACTOR.findall(text))
     facts = fact_values(text)
@@ -387,16 +445,18 @@ def same_statement(text, body_quotes, cited_rows, active_approval, local_metadat
     if not (facts or actors or active_approval or states or uncertain or codes):
         return True
     for quote, row in zip(body_quotes, cited_rows):
-        for match in CLAUSE.finditer(row["text"]):
+        quote = compact_space(quote)
+        current_body = compact_space(QUOTED_MAIL.split(row["text"], 1)[0])
+        for match in CLAUSE.finditer(compact_space(row["text"])):
             line = match.group().strip()
-            # Check surrounding original wording even if the model quoted only "승인".
+            # Check surrounding wording even if the model quoted only "승인".
             if not line or (quote not in line and line not in quote):
                 continue
             support = line if line in quote else quote
             proven_actors = set(ACTOR.findall(support))
             sender = row["sender"] if local_metadata else row.get("reviewed_sender", "")
             if (len(actors) == 1 and not proven_actors and not row.get("attachment") and not row.get("start")
-                    and line in QUOTED_MAIL.split(row["text"], 1)[0]):
+                    and line in current_body):
                 proven_actors.update(actor for actor in actors if actor in sender)
             if codes - {code.casefold() for code in ITEM_CODE.findall(support)}:
                 continue
@@ -468,6 +528,58 @@ def conflicting_decisions(question, rows):
     return None
 
 
+def supports_claim(text, quotes, rows, *, pcf=False, metadata=False, sent_date=False):
+    """Keep actor, quantity and decision status attached to supporting evidence."""
+    proof = " ".join(compact_space(quote) for quote in quotes)
+    numbers = {n.rstrip(".,").replace(",", "") for n in NUMBERS.findall(text)}
+    active = APPROVED.search(text) and not NEGATED.search(text) and not UNCONFIRMED.search(text)
+    if not pcf and not (sent_date and not quotes) and not same_statement(
+            text, quotes, rows, active and not UNSETTLED.search(text), metadata):
+        return False
+    if active and (not APPROVED.search(proof) or NEGATED.search(proof)):
+        return False
+    if CANCELLED.search(text) and not CANCELLED.search(proof):
+        return False
+    scopes = [word for word in SCOPE_WORDS if word in text]
+    if not scopes or not active:
+        return True
+    for line in (line for quote in quotes for line in CLAUSE.findall(compact_space(quote))):
+        if (APPROVED.search(line) and not NEGATED.search(line) and not PENDING_PCF.search(line)
+                and all(word in line for word in scopes)
+                and numbers <= {n.rstrip(".,").replace(",", "") for n in NUMBERS.findall(line)}
+                and not any(re.search(rf"{other}\s*(?:만|에만|에 한해)", line)
+                            for other in SCOPE_WORDS if other not in scopes)):
+            return True
+    return False
+
+
+def supports_synthesis(text, quotes, rows, metadata):
+    # Independent statements may cite different passages. A single atomic
+    # statement must still establish all its facts in the same evidence.
+    parts = [part.strip() for part in re.split(
+        r"[;；\n]+|(?<=[.!?。])\s+|[,，]\s*(?:그리고|반면|한편|and|while)\s+",
+        text, flags=re.I,
+    ) if part.strip()]
+    if not 2 <= len(parts) <= 5:
+        return False
+    used = set()
+    for part in parts:
+        possible = set()
+        tokens = set(query_words(part, fuzzy=True))
+        numbers = {n.rstrip(".,").replace(",", "") for n in NUMBERS.findall(part)}
+        for quote, row in zip(quotes, rows):
+            present = {n.rstrip(".,").replace(",", "") for n in NUMBERS.findall(quote)}
+            aligned = compact_space(part) in compact_space(quote) or len(
+                {token for token in tokens if token in normalized(quote)}
+            ) >= 2
+            if aligned and numbers <= present and supports_claim(part, [quote], [row], metadata=metadata):
+                possible.add(row["passage"])
+        if not possible:
+            return False
+        used.update(possible)
+    return len(used) >= 2
+
+
 def validate(result, candidates, question="", *, text_for=source_text, pcf=False, claim_limit=5, complete=True):
     business_date = re.search(r"납기|납품|출하|출고|입고|일정|마감|공급가|단가|금액", question)
     sent_date = re.search(r"발송일|발송\s*(?:시각|날짜)|(?:메일|회신)(?:이|을)?\s*언제\s*(?:보냈|왔)", question)
@@ -496,11 +608,14 @@ def validate(result, candidates, question="", *, text_for=source_text, pcf=False
                 continue
             row = by_id[ref["source"]]
             quote = ref.get("quote")
-            if isinstance(quote, str) and 4 <= len(quote.strip()) <= QUOTE_LIMIT and quote.strip() in text_for(row):
-                quote = quote.strip()
-                citations.append({**public_row(row), "quote": quote})
-                if quote in row["text"]:
-                    body_quotes.append(quote)
+            if isinstance(quote, str) and 4 <= len(quote.strip()) <= QUOTE_LIMIT:
+                original = original_quote(text_for(row), quote.strip())
+                if original is None or len(original) > QUOTE_LIMIT:
+                    continue
+                citations.append({**public_row(row), "quote": original})
+                body_quote = original_quote(row["text"], quote.strip())
+                if body_quote is not None:
+                    body_quotes.append(body_quote)
                     cited_rows.append(row)
         proof = " ".join(ref["quote"] for ref in citations)
         text_proof = " ".join(body_quotes)
@@ -510,22 +625,9 @@ def validate(result, candidates, question="", *, text_for=source_text, pcf=False
         stated_numbers = {n.rstrip(".,").replace(",", "") for n in NUMBERS.findall(text)}
         if not citations or not text or stated_numbers - proof_numbers:
             continue
-        active_approval = APPROVED.search(text) and not NEGATED.search(text) and not UNCONFIRMED.search(text)
-        if not pcf and not (sent_date and not body_quotes) and not same_statement(
-                text, body_quotes, cited_rows, active_approval and not UNSETTLED.search(text), text_for is source_text):
-            continue
-        if active_approval and (not APPROVED.search(text_proof) or NEGATED.search(text_proof)):
-            continue
-        if CANCELLED.search(text) and not CANCELLED.search(text_proof):
-            continue
-        scopes = [word for word in SCOPE_WORDS if word in text]
-        if scopes and active_approval:
-            approved_lines = [line for quote in body_quotes for line in re.split(r"[\n!?]|(?<!\d)\.|\.(?!\d)", quote)
-                              if APPROVED.search(line) and not NEGATED.search(line) and not PENDING_PCF.search(line)]
-            if not any(all(word in line for word in scopes) and
-                       stated_numbers <= {n.rstrip(".,").replace(",", "") for n in NUMBERS.findall(line)} and
-                       not any(re.search(rf"{other}\s*(?:만|에만|에 한해)", line)
-                               for other in SCOPE_WORDS if other not in scopes) for line in approved_lines):
+        if not supports_claim(text, body_quotes, cited_rows, pcf=pcf,
+                              metadata=text_for is source_text, sent_date=bool(sent_date)):
+            if pcf or not supports_synthesis(text, body_quotes, cited_rows, text_for is source_text):
                 continue
         if pcf:
             def measurements(value):
