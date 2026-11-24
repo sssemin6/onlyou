@@ -455,25 +455,30 @@ class Handler(BaseHTTPRequestHandler):
         filters = filters_from(options.get)
         store, ai = self.server.store, self.server.ai
         if route == "/api/search":
+            keyword_only = payload.get("mode") == "keyword"
             plan = quoted_plan(query)
             if plan is not None:
                 rows = store.exact_search(plan, filters)
             else:
                 rows = store.lexical(query, filters, limit=180)
-                if query and ai.embedding_index:
+                if query and not keyword_only and ai.embedding_index:
                     try:
                         nearby = ai.semantic_search(store, query, filters)
                         rows = merge_rows(rows, nearby, limit=60)
                     except (OSError, ValueError, RuntimeError, KeyError, IndexError, TypeError, http.client.HTTPException):
                         pass
-            if query and plan is None:
+            if query and not keyword_only and plan is None:
                 rows = ai.rerank_candidates(query, rows)
             tokens = query_words(query, fuzzy=True)[:8]
             distinct = {}
             for row in rows:
                 cell = PCF_CELL.fullmatch(row["location"]) if filters.get("tab") == "pcf" else None
                 key = (row["id"], cell[1]) if cell else row["fingerprint"]
-                shown = distinct.setdefault(key, public_row(row))
+                if key not in distinct:
+                    if len(distinct) == 20:
+                        continue
+                    distinct[key] = public_row(row)
+                shown = distinct[key]
                 if "similarity" in row and shown.get("similarity") is None:
                     shown["similarity"] = round(row["similarity"], 3)
                 if shown.get("matched") is None:
@@ -481,7 +486,7 @@ class Handler(BaseHTTPRequestHandler):
                     matched = [token for token in tokens if normalized(token) in haystack]
                     shown["matched"] = matched
                     shown["snippet"] = best_snippet(row["text"], matched)
-            self.send_json(200, {"results": list(distinct.values())[:20]})
+            self.send_json(200, {"results": list(distinct.values())})
             return
         if not query:
             self.send_json(400, {"error": "question_required"})
