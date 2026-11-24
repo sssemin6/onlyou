@@ -47,6 +47,7 @@ def gateway_origin(raw=None):
 class GatewayTLSOptions:
     ca_file: str = ""
     verify: bool = True
+    unverified_paths: tuple[str, ...] = ()
 
 
 @lru_cache(maxsize=4)
@@ -61,16 +62,20 @@ def tls_context(verify, ca_file):
 
 
 @lru_cache(maxsize=8)
-def warn_unverified(destination):
-    logger.warning("TLS certificate verification disabled for %s by %s=0 (test only)", destination, VERIFY_ENV)
+def warn_unverified(destination, runtime=False):
+    if runtime:
+        logger.warning("TLS certificate verification disabled for %s by saved gateway settings", destination)
+    else:
+        logger.warning("TLS certificate verification disabled for %s (test only: connection test or %s=0)", destination, VERIFY_ENV)
 
 
 def request_gateway_json(origin, path, payload, headers, *, timeout, max_bytes, tls=None):
     """Send to the configured gateway and log transport errors without request or response data."""
     endpoint = urlsplit(origin)
     destination = endpoint.netloc + path
-    verify = os.environ.get(VERIFY_ENV, "1").strip() if tls is None else ("1" if tls.verify else "0")
-    ca_file = os.environ.get(CA_FILE_ENV, "").strip() if tls is None else tls.ca_file
+    runtime = tls is not None and path in tls.unverified_paths
+    verify = os.environ.get(VERIFY_ENV, "1").strip() if tls is None else ("1" if tls.verify and not runtime else "0")
+    ca_file = os.environ.get(CA_FILE_ENV, "").strip() if tls is None else ("" if runtime else tls.ca_file)
     if verify not in {"0", "1"} or (verify == "0" and ca_file):
         logger.error("TLS configuration error: set %s to 0 or 1 and use %s only with verification enabled",
                      VERIFY_ENV, CA_FILE_ENV)
@@ -82,7 +87,7 @@ def request_gateway_json(origin, path, payload, headers, *, timeout, max_bytes, 
         raise
 
     if verify == "0":
-        warn_unverified(endpoint.netloc)
+        warn_unverified(endpoint.netloc, runtime)
     connection = http.client.HTTPSConnection(endpoint.hostname, endpoint.port or 443, timeout=timeout, context=context)
     try:
         connection.request("POST", path, json.dumps(payload, ensure_ascii=False).encode("utf-8"), headers)
