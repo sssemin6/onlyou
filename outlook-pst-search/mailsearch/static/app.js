@@ -677,9 +677,12 @@ form.addEventListener("submit", async (event) => {
         notice("원본 접근을 확인하는 중입니다.");
         const verified = await call("/api/search-access", { ticket: data.access_ticket }, active.signal);
         if (active.signal.aborted) return;
-        showResults(verified.results, title, emptyMessage);
+        const pendingMessage = verified.access_pending ? "응답이 늦는 원본을 확인 중입니다. 잠시 후 다시 검색해 주세요." : "";
+        showResults(verified.results, title, pendingMessage || emptyMessage);
+        notice(pendingMessage);
+      } else {
+        notice("");
       }
-      notice("");
     }
   } catch (error) {
     if (!active.signal.aborted) notice(error.message);
