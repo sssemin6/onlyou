@@ -10,6 +10,7 @@ from .external import ExternalAI, ExternalRequestError
 
 LOCAL_EMBEDDING = "ollama:" + MODEL
 CHAT_PATH = "/v1/chat/completions"
+RERANK_PATH = "/v1/rerank"
 MODELS = {
     "embedding": {LOCAL_EMBEDDING: "로컬 Ollama · BGE-M3", MODEL: "사내 API · BGE-M3"},
     "rerank": {"bge-reranker-v2-m3": "BGE-Reranker-v2-M3"},
@@ -55,7 +56,7 @@ class IntranetAI(EmbeddingAPI):
         return cls(key, selections, origin=origin, answer_models=answer_models, tls=tls)
 
     def rerank(self, query, documents, timeout=6):
-        data = self.request("/v1/rerank", {
+        data = self.request(RERANK_PATH, {
             "model": self.models["rerank"], "query": query, "documents": documents, "top_n": len(documents),
         }, timeout)
         results = data.get("results") if isinstance(data, dict) else None
