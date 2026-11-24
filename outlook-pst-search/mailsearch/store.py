@@ -23,7 +23,8 @@ CREATE TABLE IF NOT EXISTS sources (
     active INTEGER, pending INTEGER, revision INTEGER NOT NULL DEFAULT 0,
     state TEXT NOT NULL DEFAULT 'queued', signature TEXT, updated TEXT,
     done INTEGER NOT NULL DEFAULT 0, failed INTEGER NOT NULL DEFAULT 0,
-    omitted INTEGER NOT NULL DEFAULT 0, partial INTEGER NOT NULL DEFAULT 0, issue TEXT
+    omitted INTEGER NOT NULL DEFAULT 0, partial INTEGER NOT NULL DEFAULT 0, issue TEXT,
+    embedding_done INTEGER, embedding_total INTEGER
 );
 CREATE TABLE IF NOT EXISTS mails (
     id INTEGER PRIMARY KEY AUTOINCREMENT, source INTEGER NOT NULL REFERENCES sources(id),
@@ -268,6 +269,10 @@ class Store:
         with self.connection() as conn:
             conn.execute("PRAGMA journal_mode=WAL")
             conn.executescript(SCHEMA)
+            source_columns = {row[1] for row in conn.execute("PRAGMA table_info(sources)")}
+            for column in ("embedding_done", "embedding_total"):
+                if column not in source_columns:
+                    conn.execute(f"ALTER TABLE sources ADD COLUMN {column} INTEGER")
             columns = {row[1] for row in conn.execute("PRAGMA table_info(mails)")}
             if "kind" not in columns:
                 # Tab scoping (mail vs document); older rows are classified by item suffix.
