@@ -1315,6 +1315,54 @@ class Integration(unittest.TestCase):
             self.assertTrue(result[1]["results"])
             self.assertNotIn(str(other), [check.args[0] for check in probe.call_args_list])
 
+    def test_quick_search_uses_metadata_without_ai_and_keeps_body_search(self):
+        source = self.import_mail()
+        with (patch.object(self.ai, "semantic_search") as semantic,
+              patch.object(self.ai, "rerank_candidates") as rerank):
+            def search(query, mode="quick", **filters):
+                status, result = self.call("/api/search", {
+                    "query": query, "mode": mode, "filters": {"source": source, "tab": "mail", **filters},
+                })
+                self.assertEqual(status, 200)
+                return result
+
+            self.assertEqual(len(search("구매팀")["results"]), 4)
+            self.assertEqual(len(search("A-17")["results"]), 3)
+            self.assertEqual(len(search('"A-17" & "승인"')["results"]), 1)
+            quick = search("도면")
+            self.assertEqual(quick["mode"], "quick")
+            self.assertEqual([row["attachment"] for row in quick["results"]], ["B-19_도면.hwp"])
+            self.assertEqual(self.call(f"/api/evidence/{quick['results'][0]['passage']}")[0], 200)
+            self.assertFalse(search("반도체냉각판")["results"])
+            self.assertTrue(search("반도체냉각판", mode="keyword")["results"])
+            self.assertEqual(len(search("한빛", body="최종 승인")["results"]), 1)
+            self.assertFalse(search("도면", attachment="no")["results"])
+            semantic.assert_not_called()
+            rerank.assert_not_called()
+
+    def test_quick_search_backfills_old_data_and_obeys_visibility(self):
+        source = self.import_mail()
+        with self.store.connection() as conn:
+            conn.execute("DROP TRIGGER quick_terms_remove")
+            conn.execute("DROP TABLE quick_terms")
+        reopened = Store(self.store.root)
+        filters = {"source": source, "tab": "mail"}
+        self.assertEqual(len(reopened.quick_search("A-17", filters)), 3)
+        with reopened.connection() as conn:
+            current = conn.execute("SELECT active FROM sources WHERE id=?", (source,)).fetchone()[0]
+            first = conn.execute("SELECT id FROM mails WHERE source=? AND subject LIKE '%견적%'", (source,)).fetchone()[0]
+            new_id = reopened.adopt_mail(conn, current + 1, first)
+            conn.execute("UPDATE sources SET pending=? WHERE id=?", (current + 1, source))
+        self.assertEqual(reopened.quick_search("도면", filters)[0]["id"], first)
+        with reopened.connection() as conn:
+            conn.execute("UPDATE sources SET active=pending,pending=NULL WHERE id=?", (source,))
+            conn.execute("DELETE FROM mails WHERE source=? AND version=?", (source, current))
+            self.assertIsNone(conn.execute("SELECT rowid FROM quick_terms WHERE rowid=?", (first,)).fetchone())
+        self.assertEqual(reopened.quick_search("도면", filters)[0]["id"], new_id)
+        renamed = self.mail.with_name("source-revoked")
+        self.mail.rename(renamed)
+        self.assertFalse(reopened.quick_search("도면", filters))
+
     def test_keyword_search_bypasses_ai_while_hybrid_search_uses_it(self):
         self.import_mail()
         with (patch.object(self.ai, "semantic_search", return_value=[]) as semantic,
