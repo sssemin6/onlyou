@@ -10,6 +10,7 @@ import subprocess
 import threading
 from pathlib import Path
 
+from .embedding import logger
 from .extract import CREATE_FLAGS, DOCUMENT_SUFFIXES, extract_attachment, extract_document, parse_mail
 from .filesystem import source_path, stable_input
 from .pcf import WORD_SUFFIXES
@@ -121,7 +122,8 @@ class Indexer:
                         self.discard_pending(conn, row)
                         conn.execute(
                             """UPDATE sources SET pending=revision+1,revision=revision+1,signature=NULL,
-                               done=0,failed=0,omitted=0,partial=0 WHERE id=?""", (source,)
+                               done=0,failed=0,omitted=0,partial=0,embedding_done=NULL,embedding_total=NULL
+                               WHERE id=?""", (source,)
                         )
                     conn.execute("UPDATE sources SET state='queued',issue=NULL WHERE id=?", (source,))
             elif action == "remove":
@@ -375,8 +377,11 @@ class Indexer:
         self.index_attachments(root, temp, source, version, event, extras=extras)
         issue = None
         if self.ai is not None and self.ai.embedding_index:
-            self.state(source, "embeddings")
             issue = self.index_embeddings(source, version, event)
+        else:
+            with self.store.connection() as conn:
+                conn.execute("""UPDATE sources SET embedding_done=NULL,embedding_total=NULL
+                                WHERE id=? AND pending=?""", (source, version))
         self.check(event)
         if read_signature(path) != signature:
             raise ImportIssue("changed")
@@ -525,6 +530,16 @@ class Indexer:
 
     def index_embeddings(self, source, version, event):
         model = self.ai.embedding_index
+        self.check(event)
+        with self.store.connection() as conn:
+            total, done = conn.execute(
+                """SELECT COUNT(*),COUNT(v.passage) FROM mails m JOIN passages p ON p.mail=m.id
+                   LEFT JOIN vectors v ON v.passage=p.id AND v.model=?
+                   WHERE m.source=? AND m.version=?""", (model, source, version),
+            ).fetchone()
+            conn.execute("""UPDATE sources SET state='embeddings',embedding_done=?,embedding_total=?
+                            WHERE id=? AND pending=? AND state NOT IN ('paused','removing')""",
+                         (done, total, source, version))
         last = 0
         while True:
             self.check(event)
@@ -543,7 +558,13 @@ class Indexer:
                 )]
                 if len(encoded) != len(rows):
                     raise ValueError("embeddings")
-            except (OSError, ValueError, RuntimeError, KeyError, TypeError, http.client.HTTPException):
+            except (OSError, ValueError, RuntimeError, KeyError, TypeError, http.client.HTTPException) as exc:
+                winerror = getattr(exc, "winerror", None)
+                backend = "gateway" if self.ai.embedding_api and self.ai.embedding_api.index_key else "Ollama"
+                logger.error("Embedding batch failed (backend=%s, completed=%d/%d): %s (errno=%s, winerror=%s)",
+                             backend, done, total, type(exc).__name__, getattr(exc, "errno", None), winerror)
+                if isinstance(exc, ConnectionAbortedError) or winerror == 10053:
+                    return "embedding_connection_aborted"
                 return "embedding_unavailable"
             self.check(event)
             with self.store.connection() as conn:
@@ -554,4 +575,7 @@ class Indexer:
                         "INSERT INTO vector_buckets VALUES(?,?,?)",
                         ((model, bucket, passage) for bucket in buckets(vector_array(value))),
                     )
+                done += len(rows)
+                conn.execute("UPDATE sources SET embedding_done=? WHERE id=? AND pending=?",
+                             (done, source, version))
             last = rows[-1]["id"]
