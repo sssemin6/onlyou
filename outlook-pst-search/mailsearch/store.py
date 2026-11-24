@@ -33,6 +33,7 @@ CREATE TABLE IF NOT EXISTS mails (
     sent TEXT NOT NULL, message_id TEXT NOT NULL, topic TEXT NOT NULL, body TEXT NOT NULL,
     UNIQUE(source, version, item)
 );
+CREATE INDEX IF NOT EXISTS mail_source_version_id ON mails(source,version,id);
 CREATE INDEX IF NOT EXISTS mail_message_id ON mails(message_id);
 CREATE INDEX IF NOT EXISTS mail_topic ON mails(topic);
 CREATE INDEX IF NOT EXISTS mail_sent ON mails(sent DESC, id DESC);
@@ -45,6 +46,7 @@ CREATE TABLE IF NOT EXISTS attachments (
     id INTEGER PRIMARY KEY, mail INTEGER NOT NULL REFERENCES mails(id) ON DELETE CASCADE,
     name TEXT NOT NULL, status TEXT NOT NULL
 );
+CREATE INDEX IF NOT EXISTS attachment_mail_status ON attachments(mail,status);
 CREATE TABLE IF NOT EXISTS passages (
     id INTEGER PRIMARY KEY AUTOINCREMENT, mail INTEGER NOT NULL REFERENCES mails(id) ON DELETE CASCADE,
     attachment INTEGER REFERENCES attachments(id) ON DELETE CASCADE, location TEXT NOT NULL,
@@ -54,6 +56,7 @@ CREATE TABLE IF NOT EXISTS pcf_documents (
     mail INTEGER PRIMARY KEY REFERENCES mails(id) ON DELETE CASCADE, data TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS passages_mail ON passages(mail);
+CREATE INDEX IF NOT EXISTS passages_attachment ON passages(attachment) WHERE attachment IS NOT NULL;
 CREATE VIRTUAL TABLE IF NOT EXISTS terms USING fts5(subject, people, label, text, tokenize='unicode61');
 CREATE TRIGGER IF NOT EXISTS passage_remove AFTER DELETE ON passages BEGIN
     DELETE FROM terms WHERE rowid=old.id;
@@ -526,12 +529,15 @@ class Store:
         expanded = list(dict.fromkeys([*words, *(word for key, alternatives in SYNONYMS.items() if fuzzy and key in question for word in alternatives)]))
         ranked = {}
         exact_identifier = len(words) == 1 and bool(re.fullmatch(r"[a-z0-9]+(?:[-_][a-z0-9]+)+", words[0]))
-        strategies = (("terms", words, 1.5), ("grams", expanded, 1.0))
-        for mode, group, weight in strategies:
-            if mode == "grams" and exact_identifier and ranked and not fuzzy:
-                break
-            statement = fts_query(group, mode)
-            with self.connection() as conn:
+        term_statement = fts_query(words, "terms")
+        gram_statement = fts_query(expanded, "grams")
+        strategies = [(term_statement, 1.5), (gram_statement, 1.0)]
+        if term_statement == gram_statement:
+            strategies = [(term_statement, 2.5)]
+        with self.connection() as conn:
+            for position, (statement, weight) in enumerate(strategies):
+                if position and exact_identifier and ranked and not fuzzy:
+                    break
                 rows = conn.execute(
                     f"""SELECT {MAIL_COLUMNS},p.id passage,p.text,p.location,p.start,a.name attachment
                         FROM terms JOIN passages p ON p.id=terms.rowid JOIN mails m ON m.id=p.mail
