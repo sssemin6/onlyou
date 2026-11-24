@@ -749,7 +749,7 @@ class Integration(unittest.TestCase):
             self.assertIsNone(await_source(self.store, source, {"ready"})["issue"])
             self.assertTrue(any("similarity" in row for row in self.call("/api/search", query)[1]["results"]))
             self.assertEqual(local_call.call_args.args[:2], ("/api/embed", {
-                "model": "bge-m3:latest", "input": [query["query"]], "truncate": True,
+                "model": "bge-m3:latest", "input": [query["query"]], "truncate": True, "keep_alive": -1,
             }))
             https.assert_not_called()
 
@@ -1327,6 +1327,146 @@ class Integration(unittest.TestCase):
         self.assertIn("errno=13", message)
         self.assertNotIn("다른 실행이", message)
 
+    def test_validation_preserves_original_whitespace_and_checks_each_synthesis_clause(self):
+        source = self.import_mail()
+        row = self.store.lexical("납품", {"source": source})[0]
+        first = {**row, "text": "조달팀은 예산 300만원을\n  보류했습니다."}
+        second = {**row, "passage": row["passage"] + 1000,
+                  "text": "품질팀은 검수 2건을 승인했습니다."}
+        quotes = [{"source": first["passage"], "quote": "조달팀은 예산 300만원을 보류했습니다."},
+                  {"source": second["passage"], "quote": second["text"]}]
+        claim = {"text": "조달팀은 예산 300만원을 보류했습니다. 품질팀은 검수 2건을 승인했습니다.",
+                 "citations": quotes}
+        result = validate({"status": "answered", "claims": [claim]}, [first, second])
+        self.assertEqual(result["status"], "answered")
+        self.assertEqual(result["claims"][0]["citations"][0]["quote"], first["text"])
+        bad = {**claim, "text": "품질팀은 예산 300만원을 승인했습니다."}
+        result = validate({"status": "answered", "claims": [bad]}, [first, second])
+        self.assertEqual(result["status"], "insufficient")
+
+    def test_search_access_is_deferred_without_exposing_unverified_matches(self):
+        self.import_mail()
+        payload = {"query": "A-17", "mode": "quick", "defer_access": True, "filters": {"tab": "mail"}}
+        with patch("mailsearch.store.source_readable", return_value=True) as check:
+            status, first = self.call("/api/search", payload)
+            self.assertEqual(status, 200)
+            self.assertEqual(first["results"], [])
+            check.assert_not_called()
+            self.assertEqual(self.call("/api/search-access", {"ticket": first["access_ticket"]}, token=False)[0], 403)
+            status, released = self.call("/api/search-access", {"ticket": first["access_ticket"]})
+            self.assertEqual((status, len(released["results"])), (200, 3))
+            check.assert_called_once()
+            status, warm = self.call("/api/search", payload)
+            self.assertEqual((status, warm), (200, released))
+            check.assert_called_once()
+            self.assertEqual(self.call("/api/search-access", {"ticket": first["access_ticket"]})[0], 409)
+        self.store.access_cache.clear()
+        status, first = self.call("/api/search", payload)
+        self.assertEqual(status, 200)
+        with patch("mailsearch.store.source_readable", return_value=False):
+            self.assertFalse(self.call("/api/search-access", {"ticket": first["access_ticket"]})[1]["results"])
+
+    def test_query_embeddings_are_reused_until_configuration_changes(self):
+        source = self.import_mail()
+        with patch.object(self.ai, "embed_local", wraps=self.ai.embed_local) as embed:
+            payload = {"query": "A-17", "mode": "hybrid", "filters": {"source": source}}
+            for _ in range(2):
+                self.assertEqual(self.call("/api/search", payload)[0], 200)
+            embed.assert_called_once()
+            self.ai.configure_embedding("embed", None)
+            self.assertEqual(self.call("/api/search", payload)[0], 200)
+            self.assertEqual(embed.call_count, 2)
+
+    def test_quoted_reply_and_duplicate_attachments_index_once_without_losing_links(self):
+        folder = Path(self.workspace.name) / "duplicate-attachments"
+        folder.mkdir()
+        body = "오늘 송부합니다.\n\n> 오래된 검토 98765\n\n새 회신입니다.\n-- \n서명비밀 19573"
+        data = "공유 첨부문단 30719".encode()
+        for idx in range(2):
+            msg = EmailMessage()
+            msg["Subject"] = f"Message {idx}"
+            msg["From"] = "local@example.invalid"
+            msg.set_content(body)
+            msg.add_attachment(data, maintype="text", subtype="plain", filename=f"file{idx}.txt")
+            (folder / f"mail{idx}.eml").write_bytes(msg.as_bytes())
+        from mailsearch.extract import extract_bytes
+        with (patch("mailsearch.extract.extract_bytes", wraps=extract_bytes) as extract,
+              patch.object(self.ai, "embed", wraps=self.ai.embed) as embed):
+            source = self.indexer.register(folder)
+            self.assertEqual(await_source(self.store, source, {"ready", "error"})["state"], "ready")
+            extract.assert_called_once()
+            self.assertEqual(sum(value == data.decode() for call in embed.call_args_list for value in call.args[0]), 1)
+        with self.store.connection() as conn:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM embedding_values").fetchone()[0], 1)
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM embedding_refs").fetchone()[0], 2)
+            self.assertTrue(all("98765" in row[0] for row in conn.execute("SELECT body FROM mails WHERE source=?", (source,))))
+        filters = {"source": source}
+        self.assertFalse(self.store.lexical("98765", filters))
+        self.assertFalse(self.store.lexical("19573", filters))
+        self.assertEqual(len({row["id"] for row in self.store.lexical("30719", filters)}), 2)
+        rows = self.store.semantic([1, .05, .12], "embed", filters)
+        self.assertEqual(len({row["attachment"] for row in rows if "30719" in row["text"]}), 2)
+
+    def test_http11_reuses_sqlite_on_one_socket(self):
+        self.import_mail()
+        with patch.object(self.store, "open_connection", wraps=self.store.open_connection) as opened:
+            connection = http.client.HTTPConnection("127.0.0.1", self.app.server_port, timeout=5)
+            try:
+                for _ in range(2):
+                    connection.request("GET", "/api/sources?scan=0", headers={"X-Mail-Session": self.app.token})
+                    response = connection.getresponse()
+                    self.assertEqual(response.status, 200)
+                    response.read()
+            finally:
+                connection.close()
+            opened.assert_called_once()
+
+    def test_local_embedding_probes_once_until_recovery(self):
+        ai = LocalAI("test", "embed")
+        vector = [[1., .05, .12]]
+        with (patch.object(ai, "ensure_server") as server,
+              patch.object(ai, "ensure_model", return_value="embed:latest") as model,
+              patch.object(ai, "call", side_effect=[{"embeddings": vector}, {"embeddings": vector},
+                                                     OSError("offline"), {"embeddings": vector}]) as call):
+            for _ in range(2):
+                self.assertEqual(ai.embed_local("embed", ["query"]), vector)
+            self.assertEqual(call.call_args.args[1]["keep_alive"], -1)
+            server.assert_called_once()
+            model.assert_called_once_with("embed")
+            with self.assertRaises(OSError):
+                ai.embed_local("embed", ["query"])
+            self.assertEqual(ai.embed_local("embed", ["query"]), vector)
+            self.assertEqual(model.call_count, 2)
+
+    def test_answer_expands_thread_and_delivers_sources_in_chronological_order(self):
+        folder = Path(self.workspace.name) / "thread"
+        folder.mkdir()
+        for i, subject in enumerate(("Original need", "Changed subject", "Another subject", "UniqueTrace"), 1):
+            msg = EmailMessage()
+            msg["From"] = "sender@example.invalid"
+            msg["Message-ID"] = f"<thread-{i}@example.invalid>"
+            msg["Subject"] = subject
+            msg["Date"] = f"0{i} Apr 2026 09:00:00 +0900"
+            if i > 1:
+                msg["In-Reply-To"] = f"<thread-{i-1}@example.invalid>"
+            msg.set_content(f"본문 단계 {i}입니다.")
+            (folder / f"{i}.eml").write_bytes(msg.as_bytes())
+        self.ai.configure_embedding("", None)
+        source = self.indexer.register(folder)
+        self.assertEqual(await_source(self.store, source, {"ready", "error"})["state"], "ready")
+        with (patch.object(self.ai, "ensure_server"),
+              patch.object(self.ai, "ensure_model"),
+              patch.object(self.ai, "call", return_value={"response": '{"status":"insufficient","claims":[]}'}) as generate,
+              self.assertLogs("mailsearch.runtime", level="INFO") as timings):
+            status, _ = self.call("/api/answer", {"query": "UniqueTrace", "filters": {"source": source}})
+            self.assertEqual(status, 200)
+            prompt = json.loads(generate.call_args.args[1]["prompt"])
+            snippets = [item["text"] for item in prompt["evidence"]]
+            self.assertEqual([text.split("\n")[2] for text in snippets],
+                             ["Subject: " + name for name in ("Original need", "Changed subject", "Another subject", "UniqueTrace")])
+            self.assertIn("mode=answer", timings.output[-1])
+            self.assertIn("generation_ms=", timings.output[-1])
+
     def test_status_poll_and_unrelated_keyword_query_do_not_probe_other_roots(self):
         source = self.import_mail()
         other = Path(self.workspace.name) / "slow-share"
@@ -1403,6 +1543,8 @@ class Integration(unittest.TestCase):
             status, hybrid = self.call("/api/search", {**query, "mode": "hybrid"})
             self.assertEqual((status, hybrid), (200, found))
             semantic.assert_called_once()
+            rerank.assert_not_called()
+            self.assertEqual(self.call("/api/search", {**query, "mode": "hybrid", "rerank": True})[0], 200)
             rerank.assert_called_once()
 
     def test_quoted_exact_search_with_and_or(self):
