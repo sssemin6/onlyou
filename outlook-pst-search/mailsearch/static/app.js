@@ -81,6 +81,9 @@ const issueNames = {
   index_unavailable: "색인 DB에 접근하지 못했습니다. 잠시 후 다시 시도하세요.",
 };
 let previousQuestion = "";
+let localConversation = "";
+let localAnswerAvailable = false;
+let externalAnswerAvailable = false;
 let request;
 let pendingReview;
 let sourceSnapshot = "";
@@ -101,6 +104,7 @@ function selectTab(value) {
     setQuestionContext("");
   }
   activeTab = value;
+  showLocalControls();
   for (const [id, tab] of TABS) {
     element(id).classList.toggle("active", value === tab);
     element(id).setAttribute("aria-selected", String(value === tab));
@@ -154,6 +158,49 @@ async function call(route, data, signal) {
   const body = await response.json();
   if (!response.ok) throw new Error(issueNames[body.error] || "이 PC의 검색 앱과 연결하지 못했습니다.");
   return body;
+}
+
+function showLocalControls() {
+  const enabled = localAnswerAvailable && activeTab !== "pcf";
+  element("local-conversation").hidden = !enabled;
+  element("submit-local-answer").hidden = !enabled;
+}
+
+async function streamAnswer(payload, signal, progress) {
+  if (!globalThis.TextDecoderStream) return call("/api/answer", payload, signal);
+  const response = await fetch("/api/answer/stream", {
+    method: "POST", headers: { "X-Mail-Session": token, "Content-Type": "application/json" },
+    body: JSON.stringify(payload), signal, cache: "no-store",
+  });
+  if ([404, 405].includes(response.status)) return call("/api/answer", payload, signal);
+  if (!response.ok) {
+    const data = await response.json();
+    throw new Error(issueNames[data.error] || issueNames.app_disconnected);
+  }
+  if (!response.body || !response.headers.get("Content-Type")?.startsWith("text/event-stream")) {
+    throw new Error(issueNames.app_disconnected);
+  }
+  const reader = response.body.pipeThrough(new TextDecoderStream()).getReader();
+  try {
+    let buffer = "";
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) throw new Error(issueNames.app_disconnected);
+      buffer += value;
+      let end;
+      while ((end = buffer.indexOf("\n\n")) !== -1) {
+        const line = buffer.slice(0, end).split("\n").find((item) => item.startsWith("data: "));
+        buffer = buffer.slice(end + 2);
+        if (!line) continue;
+        const event = JSON.parse(line.slice(6));
+        if (event.stage === "done") return event;
+        progress(event);
+      }
+    }
+  } finally {
+    await reader.cancel().catch(() => {});
+    reader.releaseLock();
+  }
 }
 
 function notice(message) {
@@ -334,6 +381,9 @@ async function showSources() {
     (replacement || addOpen).focus({ preventScroll: true });
   }
   const modelStatus = element("model-status");
+  localAnswerAvailable = Boolean(data.model);
+  externalAnswerAvailable = Boolean(data.external);
+  showLocalControls();
   modelStatus.parentElement.dataset.configured = Boolean(data.embedding);
   if (data.embedding_endpoint) {
     modelStatus.textContent = "사내 API 의미 검색 · " + data.embedding;
@@ -525,6 +575,7 @@ function showAnswer(data) {
     model_busy: "로컬 AI가 다른 질문을 처리 중입니다. 잠시 후 다시 시도하세요.",
     model_not_configured: "로컬 AI 모델을 연결하면 근거를 바탕으로 답변할 수 있습니다.",
     model_unavailable: "로컬 AI 모델을 열지 못했습니다. 아래 메일을 직접 확인할 수 있습니다.",
+    index_unavailable: issueNames.index_unavailable,
     external_unavailable: "외부 API 응답을 받지 못했습니다. 연결 주소, 키, 모델, 네트워크를 확인하세요.",
   };
   const heading = node("h2", "AI 답변");
@@ -567,11 +618,57 @@ function clearReview() {
 
 function clearSearch() {
   request?.abort();
+  element("cancel-answer").hidden = true;
   clearReview();
   element("answer").hidden = true;
   element("result-section").hidden = true;
   notice("");
 }
+
+async function localAnswer(payload, active) {
+  const stop = element("cancel-answer");
+  stop.hidden = false;
+  try {
+    const data = await streamAnswer({ ...payload, context: "", session_id: localConversation }, active.signal, (event) => {
+      if (active.signal.aborted) return;
+      const labels = {
+        planning: "질문을 분석하고 있습니다.",
+        retrieving: "근거 " + event.count + "건과 관련 회신을 확인했습니다.",
+        synthesizing: "로컬 AI가 근거를 정리하고 있습니다.",
+        validating: "인용 원문과 수치를 대조하고 있습니다.",
+      };
+      if (labels[event.stage]) notice(labels[event.stage]);
+    });
+    if (active.signal.aborted) return;
+    localConversation = data.session_id || "";
+    showAnswer(data);
+    showResults(data.results, "근거 후보");
+    notice("");
+  } finally {
+    if (request === active) stop.hidden = true;
+  }
+}
+
+element("cancel-answer").addEventListener("click", () => {
+  request?.abort();
+  element("cancel-answer").hidden = true;
+  notice("답변을 중단했습니다.");
+});
+
+element("reset-conversation").addEventListener("click", async () => {
+  const old = localConversation;
+  localConversation = "";
+  clearSearch();
+  setQuestionContext("");
+  element("query").focus();
+  if (old) {
+    try {
+      await call("/api/answer/reset", { session_id: old });
+    } catch (error) {
+      notice(error.message);
+    }
+  }
+});
 
 function showReview(data, pcf) {
   pendingReview = { ...data, pcf };
@@ -650,7 +747,7 @@ form.addEventListener("submit", async (event) => {
   const active = request = new AbortController();
   const query = element("query").value.trim();
   const intent = event.submitter?.value;
-  const ask = intent === "ask";
+  const ask = intent === "ask" || intent === "local-answer";
   const mode = intent === "semantic" ? "hybrid" : intent === "body" ? "keyword" : "quick";
   const pcf = activeTab === "pcf";
   if (ask && !query) {
@@ -663,7 +760,9 @@ form.addEventListener("submit", async (event) => {
   const payload = { query, filters, context: ask ? previousQuestion : "" };
   notice(ask ? "답변에 쓸 근거를 찾고 있습니다." : mode === "hybrid" ? "의미 검색 중입니다." : "검색 중입니다.");
   try {
-    if (ask) {
+    if (!pcf && (intent === "local-answer" || (ask && localAnswerAvailable && !externalAnswerAvailable))) {
+      await localAnswer(payload, active);
+    } else if (ask) {
       await previewAnswer(pcf ? "/api/pcf/preview" : "/api/external/preview", payload, active, pcf);
     } else {
       const data = await call("/api/search", { ...payload, mode, defer_access: true,
