@@ -1,6 +1,7 @@
 """Loopback-only web application."""
 import argparse
 import datetime
+import errno
 import hashlib
 import hmac
 import http.client
@@ -45,31 +46,76 @@ MAX_REQUEST = 16 * 1024
 PAGE_IDLE_SECONDS = 12
 
 
+class SessionBusy(Exception):
+    """The data directory is already locked by another process."""
+
+
 class SessionLock:
     def __init__(self, folder):
         self.path = folder / "session.lock"
 
     def __enter__(self):
         self.handle = self.path.open("a+b")
-        if os.name == "nt":
-            import msvcrt
-            self.handle.seek(0)
-            try:
+        try:
+            if os.name == "nt":
+                import msvcrt
+                self.handle.seek(0)
                 msvcrt.locking(self.handle.fileno(), msvcrt.LK_NBLCK, 1)
-            except OSError:
-                self.handle.close()
-                raise
-        else:
-            import fcntl
-            try:
+            else:
+                import fcntl
                 fcntl.flock(self.handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except OSError:
-                self.handle.close()
-                raise
+        except OSError as exc:
+            self.handle.close()
+            if exc.errno in {errno.EACCES, errno.EAGAIN}:
+                raise SessionBusy() from exc
+            raise
         return self
 
     def __exit__(self, *exc):
         self.handle.close()
+
+
+INSTANCE_FILE = "session-instance.json"
+
+
+@contextmanager
+def publish_instance(root, app):
+    path = root / INSTANCE_FILE
+    temporary = path.with_suffix(".tmp")
+    try:
+        temporary.write_text(json.dumps({"port": app.server_port, "id": app.instance_id}), encoding="ascii")
+        temporary.replace(path)
+    except OSError as exc:
+        runtime_logger.warning("Could not record the running app (errno=%s)", exc.errno)
+    try:
+        yield
+    finally:
+        for file in (path, temporary):
+            try:
+                file.unlink(missing_ok=True)
+            except OSError as exc:
+                runtime_logger.warning("Could not remove the running app record (errno=%s)", exc.errno)
+
+
+def existing_origin(root):
+    try:
+        with (root / INSTANCE_FILE).open("rb") as metadata:
+            info = json.loads(metadata.read(512))
+        port = info["port"]
+        instance_id = info["id"]
+        if type(port) is not int or not 1 <= port <= 65535 or not re.fullmatch(r"[a-f0-9]{32}", instance_id):
+            return None
+        connection = http.client.HTTPConnection("127.0.0.1", port, timeout=1)
+        try:
+            connection.request("GET", "/session-instance", headers={"X-Mail-Instance": instance_id})
+            response = connection.getresponse()
+            if response.status == 200 and response.read(64) == b"Outlook PST Search":
+                return f"http://127.0.0.1:{port}"
+        finally:
+            connection.close()
+    except (OSError, ValueError, TypeError, KeyError, http.client.HTTPException):
+        return None
+    return None
 
 
 class App(ThreadingHTTPServer):
@@ -96,6 +142,7 @@ class App(ThreadingHTTPServer):
         self.reviews = Reviews()
         self.outbound = threading.BoundedSemaphore(1)
         self.token = secrets.token_urlsafe(32)
+        self.instance_id = secrets.token_hex(16)
         self.generation = threading.BoundedSemaphore(1)
         self.origin = f"http://127.0.0.1:{self.server_port}"
         self.last_seen = 0.0
@@ -366,6 +413,13 @@ class Handler(BaseHTTPRequestHandler):
             if route.path == "/":
                 body = body.replace(b"__LOCAL_SESSION__", self.server.token.encode())
             self.send_bytes(200, content_type, body)
+        elif route.path == "/session-instance":
+            key = self.headers.get("X-Mail-Instance", "")
+            if hmac.compare_digest(key.encode(), self.server.instance_id.encode()):
+                self.server.last_seen = time.monotonic()
+                self.send_bytes(200, "text/plain; charset=utf-8", b"Outlook PST Search")
+            else:
+                self.send_json(404, {"error": "not_found"})
         elif route.path == "/api/sources":
             sources = self.server.store.sources()
             scan = route.query != "scan=0"
@@ -1113,18 +1167,26 @@ def main(argv=None):
         except ValueError:
             print("Embedding API disabled: check LITELLM_API_KEY and MAILSEARCH_GATEWAY_URL.", file=sys.stderr)
     del embedding_key
+    root = args.data
+    stage = "데이터 폴더 확인"
     try:
         root = local_path(args.data)
         root.mkdir(mode=0o700, parents=True, exist_ok=True)
         ai = LocalAI(args.model, args.embedding_model, args.ollama_port, embedding_api=embedding_api)
+        stage = "세션 잠금 파일 열기"
         with SessionLock(root), gateway_diagnostics(root), file_diagnostics(root / "app-runtime.log", runtime_logger):
             runtime_logger.setLevel(logging.INFO)
             runtime_logger.info("App starting (pid=%d)", os.getpid())
             try:
+                stage = "로컬 검색 DB 열기"
                 store = Store(root)
                 indexer = Indexer(store, args.readpst, args.pdftotext, ai)
                 preset = Path(__file__).resolve().parent.parent / "gateway-defaults.json"
-                with App(args.port, store, indexer, ai, external, api_settings=ApiSettings(root), gateway_preset=preset) as app:
+                stage = f"로컬 포트 {args.port} 열기"
+                with (App(args.port, store, indexer, ai, external,
+                          api_settings=ApiSettings(root), gateway_preset=preset) as app,
+                      publish_instance(root, app)):
+                    stage = "검색 앱 실행"
                     stopped = threading.Event()
                     try:
                         indexer.wake()
@@ -1146,8 +1208,35 @@ def main(argv=None):
                 raise
             else:
                 runtime_logger.info("App stopped normally")
+    except SessionBusy:
+        origin = existing_origin(root)
+        if origin:
+            print(f"검색 앱이 이미 실행 중입니다. {origin}")
+            if not args.no_browser:
+                webbrowser.open(origin)
+                return 0
+        else:
+            print("다른 실행이 데이터 폴더를 사용 중입니다. 기존 앱이 시작되는 중이면 잠시 후 다시 시도하세요. "
+                  "업데이트하려면 기존 앱을 종료한 뒤 새 버전을 실행하세요.", file=sys.stderr)
+        print(f"데이터 폴더: {root}", file=sys.stderr)
+        return 1
     except (OSError, sqlite3.Error, ValueError, RuntimeError) as exc:
-        print(f"App failed ({type(exc).__name__}). Check app-runtime.log and the data folder, port, and SQLite 3.42+ with FTS5.", file=sys.stderr)
+        details = [type(exc).__name__]
+        for attribute in ("errno", "winerror", "sqlite_errorname"):
+            value = getattr(exc, attribute, None)
+            if value is not None:
+                details.append(f"{attribute}={value}")
+        print(f"검색 앱 시작 실패 · {stage} ({', '.join(details)})", file=sys.stderr)
+        print(f"데이터 폴더: {root}", file=sys.stderr)
+        if stage.startswith("로컬 포트"):
+            if getattr(exc, "errno", None) == errno.EADDRINUSE or getattr(exc, "winerror", None) == 10048:
+                print("이미 사용 중인 포트입니다. --port 옵션으로 다른 포트를 지정하세요.", file=sys.stderr)
+            else:
+                print("이 포트를 열 권한이 있는지 확인하거나 --port 옵션으로 다른 포트를 지정하세요.", file=sys.stderr)
+        elif isinstance(exc, PermissionError):
+            print("현재 계정에 기존 데이터 폴더의 읽기·쓰기 권한이 있는지 확인하세요.", file=sys.stderr)
+        elif isinstance(exc, sqlite3.Error) or stage == "로컬 검색 DB 열기":
+            print("SQLite 3.42 이상, FTS5 지원 및 검색 DB의 읽기·쓰기 권한을 확인하세요.", file=sys.stderr)
         return 1
     return 0
 
