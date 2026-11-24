@@ -31,7 +31,7 @@ from .embedding import (CA_FILE_ENV, GatewayTLSOptions, MODEL as BGE_MODEL, PATH
 from .external import DEFAULT_MODEL, DEFAULT_URL, MAX_EXCERPTS, MAX_INTERNAL_EXCERPTS, MAX_PCF_CELLS, ExternalAI, ExternalRequestError, Reviews, pcf_batches, pcf_input_fits
 from .extract import MAX_ATTACHMENT
 from .filesystem import local_path, source_path
-from .indexer import ImportIssue, Indexer, runtime_logger
+from .indexer import EMBEDDING_BATCH_SIZE, EMBEDDING_BATCH_TIMEOUT, ImportIssue, Indexer, runtime_logger
 from .intranet import CHAT_PATH, LOCAL_EMBEDDING, RERANK_PATH, IntranetAI, available_models, validate_selections
 from .ollama_setup import OllamaSetup
 from .pcf import PCF_CELL
@@ -633,12 +633,13 @@ class Handler(BaseHTTPRequestHandler):
         with store.search_session(profile, defer_access=True):
             # Check that the results still refer to the current visible index.
             current = {row["passage"]: row for row in store.passages([r["passage"] for r in rows], filters)}
-            files, documents = {}, {}
+            with store.measure("access"):
+                files, documents, access_pending = store.prefetch_search_access(current.values(), refresh=rerank)
             verified = []
             distinct = set()
             for row in rows:
                 live = current.get(row["passage"])
-                if live is None or not store.result_access(live, files, documents, refresh=rerank):
+                if live is None or not store.result_access(live, files, documents, cached_only=True):
                     continue
                 verified.append({**live, **({"similarity": row["similarity"]} if "similarity" in row else {})})
                 distinct.add(self.search_result_key(live, filters))
@@ -649,7 +650,10 @@ class Handler(BaseHTTPRequestHandler):
             if rerank:
                 with profile.measure("rerank"):
                     verified = self.server.ai.rerank_candidates(query, verified)
-            self.send_json(200, self.search_results(verified, query, filters, quick, exact))
+            result = self.search_results(verified, query, filters, quick, exact)
+            if access_pending:
+                result["access_pending"] = True
+            self.send_json(200, result)
         profile.log(runtime_logger, "verify")
 
     @staticmethod
@@ -1258,6 +1262,12 @@ def main(argv=None):
     parser.add_argument("--pdftotext", default="pdftotext")
     parser.add_argument("--model", default="")
     parser.add_argument("--embedding-model", default="")
+    parser.add_argument("--embedding-batch-size", type=int,
+                        default=os.environ.get("MAILSEARCH_EMBEDDING_BATCH_SIZE", str(EMBEDDING_BATCH_SIZE)),
+                        help="Background embedding batch size (24–64)")
+    parser.add_argument("--embedding-batch-timeout", type=int,
+                        default=os.environ.get("MAILSEARCH_EMBEDDING_BATCH_TIMEOUT", str(EMBEDDING_BATCH_TIMEOUT)),
+                        help="Background embedding request timeout in seconds (30–60)")
     parser.add_argument("--ollama-port", type=int, default=11435)
     parser.add_argument("--answer-num-ctx", type=int,
                         default=os.environ.get("MAILSEARCH_ANSWER_NUM_CTX", str(DEFAULT_ANSWER_NUM_CTX)),
@@ -1270,6 +1280,8 @@ def main(argv=None):
         parser.error("Invalid port configuration")
     if not 2048 <= args.answer_num_ctx <= 32768:
         parser.error("--answer-num-ctx must be between 2048 and 32768")
+    if not 24 <= args.embedding_batch_size <= 64 or not 30 <= args.embedding_batch_timeout <= 60:
+        parser.error("Use --embedding-batch-size 24–64 and --embedding-batch-timeout 30–60")
     try:
         external = ExternalAI.from_environment()
     except ValueError:
@@ -1313,7 +1325,9 @@ def main(argv=None):
                 backend = store.vector_backend
                 runtime_logger.info("Vector search backend=%s numpy=%s", backend,
                                     "disabled" if backend == "sqlite(pure-python)" else "enabled")
-                indexer = Indexer(store, args.readpst, args.pdftotext, ai)
+                indexer = Indexer(store, args.readpst, args.pdftotext, ai,
+                                  embedding_batch_size=args.embedding_batch_size,
+                                  embedding_batch_timeout=args.embedding_batch_timeout)
                 preset = Path(__file__).resolve().parent.parent / "gateway-defaults.json"
                 stage = f"로컬 포트 {args.port} 열기"
                 with (App(args.port, store, indexer, ai, external,
