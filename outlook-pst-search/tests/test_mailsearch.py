@@ -3,6 +3,7 @@ import http.client
 import io
 import json
 import os
+import shutil
 import ssl
 import sys
 import tempfile
@@ -307,6 +308,36 @@ class Integration(unittest.TestCase):
             self.assertEqual(status, 200)
             self.assertFalse(settings["runtime_unverified"])
             self.assertEqual(self.app.external.tls.unverified_paths, ())
+
+    def test_reranker_certificate_opt_in_is_explicit_and_address_bound(self):
+        route = "/api/intranet/settings"
+        self.app.api_settings = ApiSettings(self.store.root)
+        roles = {"answer": "", "embedding": "", "rerank": "bge-reranker-v2-m3"}
+        payload = {"action": "apply", "key": "rerank-fixture-key", "selections": roles}
+        with (patch.object(ApiSettings, "secure", True),
+              patch("mailsearch.api_settings.user_dpapi",
+                    side_effect=lambda data, decrypt=False: zlib.decompress(data) if decrypt else zlib.compress(data)),
+              patch("mailsearch.embedding.http.client.HTTPSConnection") as https):
+            response = https.return_value.getresponse.return_value
+            response.status = 200
+            response.read.return_value = b'{"results":[{"index":0,"relevance_score":1}]}'
+            self.assertEqual(self.call(route, payload)[0], 200)
+            self.assertFalse(self.call(route)[1]["rerank_unverified"])
+            self.ai.embedding_api.rerank("test", ["one"])
+            self.assertEqual(https.call_args.kwargs["context"].verify_mode, ssl.CERT_REQUIRED)
+            status, settings = self.call(route, {**payload, "rerank_unverified": True})
+            self.assertEqual(status, 200)
+            self.assertTrue(settings["rerank_unverified"])
+            self.assertFalse(settings["runtime_unverified"])
+            self.ai.embedding_api.rerank("test", ["one"])
+            self.assertEqual(https.call_args.kwargs["context"].verify_mode, ssl.CERT_NONE)
+            with App(0, self.store, self.indexer, LocalAI("test"), api_settings=self.app.api_settings) as restored:
+                self.assertEqual(restored.rerank_unverified_origin, GATEWAY_ORIGIN)
+                self.assertEqual(restored.ai.embedding_api.tls.unverified_paths, ("/v1/rerank",))
+            status, settings = self.call(route, {**payload, "gateway_url": "https://different.example.invalid"})
+            self.assertEqual(status, 200)
+            self.assertFalse(settings["rerank_unverified"])
+            self.assertFalse(self.ai.embedding_api.tls.unverified_paths)
 
     def test_gateway_probes_distinguish_local_model_tls_http_and_response_errors(self):
         route = "/api/intranet/settings"
@@ -1269,6 +1300,21 @@ class Integration(unittest.TestCase):
         self.assertEqual(self.call("/api/search", {"query": "납품", "filters": {"after": "2027-01-01"}})[1]["results"], [])
         self.assertEqual(self.call("/api/search", {"query": 123})[0], 400)
 
+    def test_status_poll_and_unrelated_keyword_query_do_not_probe_other_roots(self):
+        source = self.import_mail()
+        other = Path(self.workspace.name) / "slow-share"
+        other.mkdir()
+        with self.store.connection() as conn:
+            conn.execute("INSERT INTO sources(path,kind,state) VALUES(?, 'eml_dir','ready')", (str(other),))
+        from mailsearch.store import source_readable
+        with (patch.object(self.indexer, "pending_updates", side_effect=AssertionError("recursive scan")),
+              patch("mailsearch.store.source_readable", wraps=source_readable) as probe):
+            self.assertEqual(self.call("/api/sources?scan=0")[0], 200)
+            probe.assert_not_called()
+            result = self.call("/api/search", {"query": "A-17", "mode": "keyword", "filters": {"source": source}})
+            self.assertTrue(result[1]["results"])
+            self.assertNotIn(str(other), [check.args[0] for check in probe.call_args_list])
+
     def test_keyword_search_bypasses_ai_while_hybrid_search_uses_it(self):
         self.import_mail()
         with (patch.object(self.ai, "semantic_search", return_value=[]) as semantic,
@@ -1550,6 +1596,64 @@ class Integration(unittest.TestCase):
             self.assertEqual((row["state"], row["issue"], row["embedding_done"], row["embedding_total"]),
                              ("ready", None, 30, 30))
             self.assertEqual(sizes, [24, 6, 6])
+
+    def test_raw_attachment_download_survives_missing_text_and_old_pst_indexes(self):
+        pst = self.mail / "source.pst"
+        pst.write_bytes(b"!BDN" + bytes(4) + b"SM" + bytes(2))
+        message = EmailMessage()
+        message["From"] = "local@example.invalid"
+        message["Subject"] = "Original binary test"
+        message.set_content("fixture")
+        image = b"\xff\xd8\xff\xd9"
+        pdf = b"%PDF-1.7\ninvalid fixture PDF\n"
+        message.add_attachment(image, maintype="image", subtype="jpeg", filename="image004.jpg")
+        message.add_attachment(pdf, maintype="application", subtype="pdf", filename="도면.pdf")
+        self.indexer.readpst = sys.executable
+        process = MagicMock()
+        process.__enter__.return_value = process
+        process.poll.return_value = process.returncode = 0
+
+        def export_numbered(*args, cwd, **kwargs):
+            (Path(cwd) / "1").write_bytes(message.as_bytes())
+            return process
+
+        def download(attachment, token=True):
+            connection = http.client.HTTPConnection("127.0.0.1", self.app.server_port, timeout=5)
+            try:
+                headers = {"X-Mail-Session": self.app.token} if token else {}
+                connection.request("GET", f"/api/attachment/{attachment}", headers=headers)
+                response = connection.getresponse()
+                return response.status, response.getheader("Content-Disposition"), response.read()
+            finally:
+                connection.close()
+
+        with (patch("mailsearch.indexer.subprocess.Popen", side_effect=export_numbered) as launcher,
+              patch("mailsearch.indexer.extract_attachment", side_effect=[
+                    ("미지원 형식", []), ("추출 실패 또는 암호화", [])])):
+            source = self.indexer.register(pst)
+            row = await_source(self.store, source, {"ready", "error"})
+            self.assertEqual((row["state"], row["omitted"]), ("ready", 2))
+            result = self.call("/api/search", {"query": "binary", "mode": "keyword"})[1]["results"][0]
+            info = self.call(f"/api/evidence/{result['passage']}")[1]
+            picture, document = info["attachments"]
+            self.assertIsNone(picture["passage"])
+            self.assertIsNone(document["passage"])
+            self.assertEqual(download(picture["id"], token=False)[0], 403)
+            self.assertEqual(download(picture["id"]), (200, "attachment; filename*=UTF-8''image004.jpg", image))
+            self.assertEqual(download(document["id"]), (200, "attachment; filename*=UTF-8''%EB%8F%84%EB%A9%B4.pdf", pdf))
+            self.assertEqual(launcher.call_count, 1)
+
+            # Earlier versions removed the local EML after indexing.
+            cache = self.indexer.original_cache(source, "", row["signature"])
+            shutil.rmtree(cache)
+            self.assertEqual(download(document["id"])[0], 202)
+            deadline = time.monotonic() + 5
+            while self.indexer.has_work() and time.monotonic() < deadline:
+                time.sleep(.02)
+            self.assertEqual(download(document["id"])[2], pdf)
+            self.assertEqual(launcher.call_count, 2)
+            pst.unlink()
+            self.assertEqual(download(picture["id"])[0], 404)
 
     def test_pst_numbered_exports_index_and_empty_refresh_keeps_previous_index(self):
         pst = self.mail / "archive.pst"
