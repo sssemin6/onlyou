@@ -452,11 +452,11 @@ def merge_contiguous_passages(left, right):
 
 
 REPLY_START = re.compile(
-    r"^\s*(?:-{2,}\s*(?:original message|원본 메시지|original appointment)\s*-{2,}|"
-    r"on .+ wrote:)\s*$", re.I,
+    r"^\s*(?:-{2,}\s*(?:original message|원본\s*메시지|original appointment|원본\s*메일|전달된\s*메일|"
+    r"forwarded\s+message)\s*-{2,}|on .+ wrote:)\s*$", re.I,
 )
-REPLY_FROM = re.compile(r"^\s*(?:From|보낸\s*사람)\s*:", re.I)
-REPLY_SENT = re.compile(r"^\s*(?:Sent|Date|보낸\s*날짜)\s*:", re.I)
+REPLY_FROM = re.compile(r"^\s*(?:From|보낸\s*사람|발신(?:자)?)\s*:", re.I)
+REPLY_SENT = re.compile(r"^\s*(?:Sent|Date|보낸\s*날짜|(?:발송\s*)?일시|보낸\s*시각)\s*:", re.I)
 QUOTED_LINE = re.compile(r"^\s*>+(?=\s|\w|$)")
 SIGN_OFF = re.compile(r"^\s*(?:best regards|kind regards|sincerely|감사합니다)[,.!]?\s*$", re.I)
 CONTACT = re.compile(r"(?:\b(?:tel|mobile|fax|email)\s*[:.]|[\w.+-]+@[\w.-]+\.[\w]+|\d{2,4}[- ]\d{3,4}[- ]\d{4})", re.I)
@@ -468,7 +468,7 @@ def mail_sections(body):
     offset = start = 0
     for i, line in enumerate(lines):
         boundary = (REPLY_START.match(line.rstrip("\r\n")) or line.rstrip("\r\n") == "-- "
-                    or (REPLY_FROM.match(line) and any(REPLY_SENT.match(item) for item in lines[i + 1:i + 5]))
+                    or (REPLY_FROM.match(line) and any(REPLY_SENT.match(item) for item in lines[i + 1:i + 6]))
                     or (0 < len(lines) - i <= 7 and SIGN_OFF.match(line)
                         and any(CONTACT.search(item) for item in lines[i + 1:])))
         if boundary or QUOTED_LINE.match(line):
