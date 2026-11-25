@@ -152,6 +152,8 @@
         <label for="source-path">파일 또는 폴더 경로</label>
         <input id="source-path" placeholder="\\서버\공유폴더 또는 Z:\업무자료" required spellcheck="false" aria-describedby="source-help">
         <p id="source-help" class="filter-hint">로컬 경로와 공유 폴더를 지원합니다. PST·EML, PDF·Word·Excel·TXT를 등록할 수 있습니다. 파일명에 PCF가 있으면 PCF 탭에서 찾을 수 있습니다.</p>
+        <label class="settings-checkbox"><input id="source-outlook" type="checkbox"> Outlook MAPI 증분 갱신</label>
+        <p id="source-outlook-help" class="filter-hint" hidden>클래식 Outlook과 pywin32가 필요합니다. 기본 사서함은 경로를 비워 두고, PST는 로컬 파일 경로를 입력하세요.</p>
         <button type="submit" class="button small primary">등록</button>
         <p class="form-message" id="add-notice" role="status"></p>
       </form>

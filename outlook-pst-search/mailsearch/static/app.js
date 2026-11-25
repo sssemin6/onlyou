@@ -7,6 +7,7 @@ const sourcesList = element("sources");
 const addForm = element("add-form");
 const addOpen = element("add-open");
 const sourcePath = element("source-path");
+const sourceOutlook = element("source-outlook");
 const sourceSelect = element("source");
 const reviewBox = element("review");
 const reviewSend = element("review-send");
@@ -76,6 +77,15 @@ const issueNames = {
   source_path: "경로를 열 수 없습니다. 공유 폴더라면 파일 탐색기에서 연결 상태와 경로를 확인하세요.",
   source_access: "파일이나 폴더를 읽을 권한이 없습니다. Windows 계정의 공유 및 파일 권한을 확인하세요.",
   source_format: "PST, EML·문서 파일(PDF·DOCX·XLSX·TXT) 또는 그런 파일이 든 폴더를 등록할 수 있습니다.",
+  outlook_windows: "Outlook MAPI는 Windows PC의 클래식 Outlook에서 사용할 수 있습니다.",
+  outlook_pywin32: "현재 Python에 pywin32를 설치하세요. PowerShell에서 py -3 -m pip install pywin32를 실행할 수 있습니다.",
+  outlook_pst_path: "이 PC에 있는 로컬 PST 파일 경로를 지정하세요. 공유 경로는 일반 PST 색인을 사용하세요.",
+  outlook_unavailable: "클래식 Outlook과 기본 프로필을 열어 둔 뒤 다시 시도하세요.",
+  outlook_enumeration: "Outlook 폴더의 메일 목록을 읽지 못했습니다. 기존 색인을 사용할 수 있습니다.",
+  outlook_item_changed: "읽는 중 메일이 이동됐거나 원본을 열 수 없습니다. Outlook 보관함을 갱신하세요.",
+  outlook_attachment: "Outlook에서 첨부파일을 읽을 수 없습니다.",
+  outlook_attachment_size: "첨부파일이 다운로드 크기 한도를 초과합니다.",
+  outlook_no_mail: "Outlook 사서함에서 색인할 메일이 없습니다.",
   source_busy: "현재 작업이 끝난 뒤 다시 시도하세요.",
   source_missing: "보관함을 찾지 못했습니다.",
   evidence_missing: "이 근거의 보관함이 갱신되었거나 접근 권한이 사라졌습니다.",
@@ -358,11 +368,15 @@ async function showSources() {
   const selectedSource = sourceSelect.value;
   sourceSelect.replaceChildren(new Option("전체 보관함", ""));
   for (const source of data.sources) {
-    sourceSelect.append(new Option(source.path, source.id));
-    const name = source.path.split(/[\\/]/).pop();
+    const path = source.kind === "outlook_mapi"
+      ? (source.path === "outlook:default" ? "Outlook 기본 사서함" : source.path.slice("outlook:".length))
+      : source.path;
+    const label = source.kind === "outlook_mapi" && source.path !== "outlook:default" ? path + " (Outlook)" : path;
+    sourceSelect.append(new Option(label, source.id));
+    const name = label.split(/[\\/]/).pop();
     const entry = node("div", "", "source-card");
     const heading = node("h3", name, "source-name");
-    heading.title = source.path;
+    heading.title = label;
     const pstRead = source.pst_read;
     entry.append(heading);
     if (source.state === "removing" || source.state === "remove_failed") {
@@ -632,10 +646,13 @@ function marked(text, words) {
 
 function showResults(rows, title, emptyMessage = "이 범위에서 일치하는 자료를 찾지 못했습니다.") {
   const result = element("results");
-  result.replaceChildren();
   element("result-section").hidden = false;
+  const snapshot = JSON.stringify([title, rows.length ? "" : emptyMessage, rows]);
+  if (result.searchSnapshot === snapshot) return;
+  result.searchSnapshot = snapshot;
   element("result-heading").textContent = title + " (" + rows.length + ")";
-  if (!rows.length) result.append(node("p", emptyMessage, "result-empty"));
+  const content = document.createDocumentFragment();
+  if (!rows.length) content.append(node("p", emptyMessage, "result-empty"));
   for (const row of rows) {
     const button = node("button", "", "result");
     button.type = "button";
@@ -650,8 +667,9 @@ function showResults(rows, title, emptyMessage = "이 범위에서 일치하는 
     else preview.textContent = row.preview;
     button.append(preview);
     button.addEventListener("click", () => openEvidence(row.passage));
-    result.append(button);
+    content.append(button);
   }
+  result.replaceChildren(content);
 }
 
 function showAnswer(data) {
@@ -855,7 +873,7 @@ form.addEventListener("submit", async (event) => {
     } else if (ask) {
       await previewAnswer(pcf ? "/api/pcf/preview" : "/api/external/preview", payload, active, pcf);
     } else {
-      const data = await call("/api/search", { ...payload, mode, defer_access: true,
+      const data = await call("/api/search", { ...payload, mode, defer_access: true, full_text: intent === "body",
         rerank: mode === "hybrid" && element("search-rerank").checked }, active.signal);
       if (active.signal.aborted) return;
       const quick = data.mode === "quick" && query;
@@ -1322,6 +1340,10 @@ function showAddForm(open) {
   (open ? sourcePath : addOpen).focus();
 }
 addOpen.addEventListener("click", () => showAddForm(addForm.hidden));
+sourceOutlook.addEventListener("change", () => {
+  sourcePath.required = !sourceOutlook.checked;
+  element("source-outlook-help").hidden = !sourceOutlook.checked;
+});
 addForm.addEventListener("submit", async (event) => {
   event.preventDefault();
   const button = addForm.querySelector("button[type=submit]");
@@ -1329,7 +1351,9 @@ addForm.addEventListener("submit", async (event) => {
   addNotice.textContent = "";
   button.disabled = true;
   try {
-    await call("/api/sources", { path: sourcePath.value.trim().replace(/^"(.*)"$/, "$1") });
+    const payload = { path: sourcePath.value.trim().replace(/^"(.*)"$/, "$1") };
+    if (sourceOutlook.checked) payload.kind = "outlook_mapi";
+    await call("/api/sources", payload);
     sourcePath.value = "";
     showAddForm(false);
     notice("자료를 등록했습니다.");

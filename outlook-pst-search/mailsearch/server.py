@@ -38,7 +38,7 @@ from .filesystem import local_path, source_path
 from .indexer import EMBEDDING_BATCH_SIZE, EMBEDDING_BATCH_TIMEOUT, ImportIssue, Indexer, runtime_logger
 from .intranet import CHAT_PATH, LOCAL_EMBEDDING, RERANK_PATH, IntranetAI, available_models, validate_selections
 from .ollama_setup import OllamaSetup
-from .pcf import PCF_CELL
+from .pcf import PCF_CELL, PCF_FIELDS
 from .search_profile import SearchProfile, SearchTickets
 from .store import (Store, local_midnight_utc, normalized, pack_vector, prioritize_attachments, query_words,
                     question_scope, quoted_plan)
@@ -543,7 +543,10 @@ class Handler(BaseHTTPRequestHandler):
             if not isinstance(payload, dict):
                 raise ValueError("body")
             if route == "/api/sources":
-                source = self.server.indexer.register(payload["path"])
+                if payload.get("kind") == "outlook_mapi":
+                    source = self.server.indexer.register(payload.get("path", ""), outlook=True)
+                else:
+                    source = self.server.indexer.register(payload["path"])
                 self.send_json(202, {"source": source})
             elif route == "/api/source-action":
                 self.server.indexer.command(int(payload["source"]), payload["action"])
@@ -599,6 +602,9 @@ class Handler(BaseHTTPRequestHandler):
         plan = quoted_plan(query)
         quick = mode == "quick" and plan is None and not filters.get("body")
         hybrid = plan is None and mode not in ("keyword", "quick")
+        memory = (plan is None and mode in ("quick", "keyword") and payload.get("full_text") is not True
+                  and filters.get("tab") not in ("document", "pcf") and not filters.get("prefer_attachment")
+                  and not any(filters.get(field) for field in PCF_FIELDS))
         rerank = hybrid and bool(query) and payload.get("rerank") is True
         defer = payload.get("defer_access") is True
         profile = SearchProfile("quick" if quick else "hybrid" if hybrid else "keyword")
@@ -609,6 +615,12 @@ class Handler(BaseHTTPRequestHandler):
             with profile.measure("fts"):
                 if plan is not None:
                     rows = store.exact_search(plan, filters)
+                elif memory:
+                    rows = store.memory_search(query, filters, quick=quick, limit=100 if defer else 20)
+                    if not rows and mode == "keyword" and "," not in normalized(query) and not filters.get("body"):
+                        # Old keyword clients also search deep mail text and attachment contents.
+                        rows = store.lexical(query, filters, limit=180)
+                        memory = False
                 elif quick:
                     rows = store.quick_search(query, filters, limit=100 if defer else 20)
                 else:
@@ -625,17 +637,17 @@ class Handler(BaseHTTPRequestHandler):
                         unknown = True
                     elif decision:
                         allowed.append(row)
-                result = self.search_results(allowed, query, filters, quick, bool(plan))
+                result = self.search_results(allowed, query, filters, quick, bool(plan), memory)
                 if unknown or rerank:
                     result["access_ticket"] = self.server.search_tickets.issue(
-                        (rows, query, filters, quick, bool(plan), rerank, profile)
+                        (rows, query, filters, quick, bool(plan), rerank, profile, memory)
                     )
                 self.send_json(200, result)
             else:
                 if rerank:
                     with profile.measure("rerank"):
                         rows = ai.rerank_candidates(query, rows)
-                self.send_json(200, self.search_results(rows, query, filters, quick, bool(plan)))
+                self.send_json(200, self.search_results(rows, query, filters, quick, bool(plan), memory))
         profile.log(runtime_logger, "query")
 
     def verify_search(self, ticket):
@@ -643,11 +655,12 @@ class Handler(BaseHTTPRequestHandler):
         if pending is None:
             self.send_json(409, {"error": "search_expired"})
             return
-        rows, query, filters, quick, exact, rerank, profile = pending
+        rows, query, filters, quick, exact, rerank, profile, memory = pending
         store = self.server.store
         with store.search_session(profile, defer_access=True):
             # Check that the results still refer to the current visible index.
-            current = {row["passage"]: row for row in store.passages([r["passage"] for r in rows], filters)}
+            verify_filters = {} if memory else filters
+            current = {row["passage"]: row for row in store.passages([r["passage"] for r in rows], verify_filters)}
             with store.measure("access"):
                 files, documents, access_pending = store.prefetch_search_access(current.values(), refresh=rerank)
             verified = []
@@ -660,12 +673,12 @@ class Handler(BaseHTTPRequestHandler):
                 distinct.add(self.search_result_key(live, filters))
                 if len(distinct) == 20:
                     break
-            still_visible = {row["passage"] for row in store.passages([row["passage"] for row in verified], filters)}
+            still_visible = {row["passage"] for row in store.passages([row["passage"] for row in verified], verify_filters)}
             verified = [row for row in verified if row["passage"] in still_visible]
             if rerank:
                 with profile.measure("rerank"):
                     verified = self.server.ai.rerank_candidates(query, verified)
-            result = self.search_results(verified, query, filters, quick, exact)
+            result = self.search_results(verified, query, filters, quick, exact, memory)
             if access_pending:
                 result["access_pending"] = True
             self.send_json(200, result)
@@ -676,7 +689,7 @@ class Handler(BaseHTTPRequestHandler):
         cell = PCF_CELL.fullmatch(row["location"]) if filters.get("tab") == "pcf" else None
         return (row["id"], cell[1]) if cell else row["fingerprint"]
 
-    def search_results(self, rows, query, filters, quick, exact):
+    def search_results(self, rows, query, filters, quick, exact, memory=False):
         rows = prioritize_attachments(rows, filters)
         distinct = {}
         for row in rows:
@@ -688,7 +701,7 @@ class Handler(BaseHTTPRequestHandler):
         store = self.server.store
         tokens = query_words(query, fuzzy=True)[:8]
         with store.measure("fts"):
-            snippets = {} if quick or exact else store.snippets(query, [row["passage"] for row in distinct.values()])
+            snippets = {} if quick or exact or memory else store.snippets(query, [row["passage"] for row in distinct.values()])
         results = []
         for row in distinct.values():
             shown = public_row(row)

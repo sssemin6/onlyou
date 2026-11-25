@@ -15,11 +15,12 @@ import time
 from pathlib import Path
 
 from .embedding import GatewayRequestError, logger
-from .extract import CREATE_FLAGS, DOCUMENT_SUFFIXES, extract_attachment, extract_document, parse_mail
-from .filesystem import source_path, stable_input
+from .extract import CREATE_FLAGS, DOCUMENT_SUFFIXES, MAX_ATTACHMENT, extract_attachment, extract_document, parse_mail
+from .filesystem import local_path, source_path, stable_input
+from .outlook import DEFAULT_OUTLOOK, OutlookError, outlook_modules, outlook_store
 from .pcf import WORD_SUFFIXES
-from .store import (buckets, document_kind, document_identity, matches_fingerprint, now, pack_vector, read_signature,
-                    sections, vector_array)
+from .store import (MAIL_INDEX_FORMAT, buckets, document_kind, document_identity, matches_fingerprint, now,
+                    pack_vector, read_signature, sections, vector_array)
 
 
 NO_MAIL = {"pst_no_mail", "eml_no_mail"}
@@ -97,7 +98,23 @@ class Indexer:
         self.spool = store.root / "work"
         self.spool.mkdir(mode=0o700, exist_ok=True)
 
-    def register(self, path):
+    def register(self, path, *, outlook=False):
+        if outlook:
+            try:
+                outlook_modules()
+                if not isinstance(path, str):
+                    raise ImportIssue("source_path")
+                value = path.strip().strip('"')
+                if not value:
+                    return self.save_source(DEFAULT_OUTLOOK, "outlook_mapi")
+                local = local_path(value, strict=True)
+                if not local.is_file() or local.suffix.casefold() != ".pst":
+                    raise ImportIssue("outlook_pst_path")
+                return self.save_source("outlook:" + str(local), "outlook_mapi")
+            except OutlookError as exc:
+                raise ImportIssue(str(exc)) from exc
+            except (OSError, ValueError, RuntimeError) as exc:
+                raise ImportIssue("outlook_pst_path") from exc
         if not isinstance(path, (str, os.PathLike)):
             raise ImportIssue("source_path")
         path = str(path).strip()
@@ -130,12 +147,17 @@ class Indexer:
             raise ImportIssue("source_path") from exc
         except (RuntimeError, ValueError) as exc:
             raise ImportIssue("source_path") from exc
+        return self.save_source(str(path), kind)
+
+    def save_source(self, path, kind):
         with self.lock:
             with self.store.connection() as conn:
                 cursor = conn.execute("INSERT OR IGNORE INTO sources(path,kind) VALUES(?,?)", (str(path), kind))
                 source = conn.execute("SELECT id FROM sources WHERE path=?", (str(path),)).fetchone()[0]
                 if cursor.rowcount:
                     conn.execute("UPDATE sources SET pending=revision+1,revision=revision+1 WHERE id=?", (source,))
+            if cursor.rowcount:
+                self.store.reload_memory(source)
             self.wake()
         return source
 
@@ -171,12 +193,15 @@ class Indexer:
                                WHERE id=?""", (source,)
                         )
                     conn.execute("UPDATE sources SET state='queued',issue=NULL WHERE id=?", (source,))
+                if row["active"] is None:
+                    self.store.reload_memory(source)
             elif action == "remove":
                 event = self.events.get(source)
                 if event is not None:
                     event.set()
                 with self.store.connection() as conn:
                     conn.execute("UPDATE sources SET state='removing',active=NULL,pending=NULL,issue=NULL WHERE id=?", (source,))
+                self.store.reload_memory(source)
             else:
                 raise ImportIssue("source_action")
             self.wake()
@@ -463,6 +488,8 @@ class Indexer:
         return file
 
     def attachment_bytes(self, row):
+        if row["kind"] == "outlook_mapi":
+            return self.outlook_attachment_bytes(row)
         source, version, item = row["source"], row["version"], row["item"]
         root = Path(row["path"])
         if root.resolve(strict=True) != root:
@@ -516,6 +543,26 @@ class Indexer:
         if payload is None:
             raise ImportIssue("attachment_missing")
         return payload
+
+    def outlook_attachment_bytes(self, row):
+        try:
+            with tempfile.TemporaryDirectory(dir=self.spool, prefix="outlook-") as folder, outlook_store(row["path"]) as outlook:
+                signature = row["active_signature"] if row["version"] == row["active"] else row["signature"]
+                if signature != outlook.store_id:
+                    raise ImportIssue("attachment_changed")
+                mail = outlook.read(row["item"], row["folder"], folder)
+                position = row["position"]
+                if not matches_fingerprint(mail, row["item"], row["fingerprint"]) or position >= len(mail["attachments"]):
+                    raise ImportIssue("attachment_changed")
+                name, part = mail["attachments"][position]
+                if name != row["name"]:
+                    raise ImportIssue("attachment_changed")
+                content = part.get_payload(decode=True)
+                if not content or len(content) > MAX_ATTACHMENT:
+                    raise ImportIssue("outlook_attachment_size")
+                return content
+        except OutlookError as exc:
+            raise ImportIssue(str(exc)) from exc
 
     def prepare_original(self, path, source, label, signature):
         key = (source, label, signature)
@@ -623,6 +670,14 @@ class Indexer:
         for leftover in temp.glob("pdf-*"):
             shutil.rmtree(leftover, ignore_errors=True)
         kind = row["kind"]
+        if kind == "outlook_mapi":
+            try:
+                with self.store.thread_connection():
+                    self.process_outlook(row, temp, event)
+            except OutlookError as exc:
+                raise ImportIssue(str(exc)) from exc
+            shutil.rmtree(stage, ignore_errors=True)
+            return
         signature = source_signature(path, kind)
         saved = row["signature"]
         if saved and kind == "eml_dir":
@@ -644,7 +699,11 @@ class Indexer:
                         raise ImportIssue("pst_invalid")
                     outdated = self.store.outdated_pst_labels(source, previous, ("",))
                     cached = self.original_cache(source, "", signature)
-                    root = cached if outdated and cached.is_dir() else self.cached_export(path, stage, event, source, "", signature)
+                    if previous is not None and row["active_signature"] == signature and not outdated:
+                        carried = ("",)
+                        root = cached if cached.is_dir() else stage
+                    else:
+                        root = cached if outdated and cached.is_dir() else self.cached_export(path, stage, event, source, "", signature)
                     if read_signature(path) != signature:
                         raise ImportIssue("changed")
             except OSError as exc:
@@ -709,31 +768,13 @@ class Indexer:
             raise ImportIssue("mail_parse_failed" if progress["failed"] else "pst_no_mail")
         self.state(source, "attachments")
         self.index_attachments(root, temp, source, version, event, extras=extras)
-        issue = None
-        if self.ai is not None and self.ai.embedding_index:
-            issue = self.index_embeddings(source, version, event)
-        else:
-            with self.store.connection() as conn:
-                conn.execute("""UPDATE sources SET embedding_done=NULL,embedding_total=NULL,embedding_model_key=NULL
-                                WHERE id=? AND pending=?""", (source, version))
+        issue = self.embed_revision(source, version, event)
         self.check(event)
         with self.store.connection() as conn:
             conn.execute("UPDATE sources SET index_stage='finalizing' WHERE id=? AND pending=?", (source, version))
         if source_signature(path, kind) != signature:
             raise ImportIssue("changed")
-        with self.lock:
-            self.check(event)
-            with self.store.connection() as conn:
-                conn.execute(
-                    """UPDATE sources SET active=?,active_signature=?,pending=NULL,state=?,updated=?,issue=?,
-                       index_stage=? WHERE id=?""",
-                    (version, signature, "empty" if empty_eml else "ready", now(), "eml_no_mail" if empty_eml else issue,
-                     "headers" if empty_eml else "complete", source),
-                )
-                conn.execute("DELETE FROM mails WHERE source=? AND version<>?", (source, version))
-                conn.execute("DELETE FROM problems WHERE source=? AND version<>?", (source, version))
-                if signatures is not None:
-                    self.store.save_pst_files(conn, source, signatures)
+        self.publish_revision(source, version, signature, event, issue, empty_eml=empty_eml, signatures=signatures)
         shutil.rmtree(stage, ignore_errors=True)
         if signatures is not None or is_pst:
             retained = signatures if signatures is not None else {"": signature}
@@ -742,6 +783,125 @@ class Indexer:
             for folder in cached.iterdir() if cached.is_dir() else ():
                 if folder / "eml" not in keep:
                     shutil.rmtree(folder, ignore_errors=True)
+
+    def embed_revision(self, source, version, event, *, retain=False):
+        if self.ai is not None and self.ai.embedding_index:
+            if retain:
+                return self.index_embeddings(source, version, event, retain=True)
+            return self.index_embeddings(source, version, event)
+        with self.store.connection() as conn:
+            conn.execute("""UPDATE sources SET embedding_done=NULL,embedding_total=NULL,embedding_model_key=NULL
+                            WHERE id=? AND pending=?""", (source, version))
+        return None
+
+    def publish_revision(self, source, version, signature, event, issue, *, empty_eml=False, signatures=None,
+                         retain=False, unchanged=None):
+        with self.lock:
+            self.check(event)
+            active = version if unchanged is None else unchanged
+            with self.store.connection() as conn:
+                if retain and unchanged is None:
+                    conn.execute("UPDATE mails SET version=? WHERE id IN (SELECT id FROM outlook_retained)", (version,))
+                conn.execute(
+                    """UPDATE sources SET active=?,active_signature=?,pending=NULL,state=?,updated=?,issue=?,
+                       index_stage=? WHERE id=?""",
+                    (active, signature, "empty" if empty_eml else "ready", now(), issue or ("eml_no_mail" if empty_eml else None),
+                     "headers" if empty_eml else "complete", source),
+                )
+                conn.execute("DELETE FROM mails WHERE source=? AND version<>?", (source, active))
+                conn.execute("DELETE FROM problems WHERE source=? AND version<>?", (source, active))
+                if signatures is not None:
+                    self.store.save_pst_files(conn, source, signatures)
+                if unchanged is None:
+                    self.store.commit_memory_revision(conn, source)
+
+    def process_outlook(self, row, temporary, event):
+        source, version, previous = row["id"], row["pending"], row["active"]
+        with outlook_store(row["path"]) as outlook:
+            signature = outlook.store_id
+            with self.store.connection() as conn:
+                old = self.store.mail_identities(conn, source, previous) if row["active_signature"] == signature else {}
+                if row["signature"] and row["signature"] != signature:
+                    conn.execute("DELETE FROM mails WHERE source=? AND version=?", (source, version))
+                pending = self.store.mail_identities(conn, source, version)
+            folders, aliases = {}, {}
+            for entry_id, folder in outlook.identities(lambda: self.check(event)):
+                # Virtual search folders can expose the same EntryID more than once.
+                if entry_id in folders and folders[entry_id] != folder:
+                    aliases.setdefault(entry_id, {folders[entry_id]}).add(folder)
+                previous_item = old.get(entry_id) or pending.get(entry_id)
+                if entry_id not in folders or (previous_item and previous_item["folder"] == folder):
+                    folders[entry_id] = folder
+
+            self.state(source, "headers")
+            self.check(event)
+            retained = {entry: old[entry]["id"] for entry, folder in folders.items()
+                        if entry in old and old[entry]["folder"] == folder}
+            pending_ids = {entry for entry, item in pending.items()
+                           if entry not in retained and folders.get(entry) == item["folder"]}
+            with self.store.connection() as conn:
+                conn.execute("CREATE TEMP TABLE outlook_retained(id INTEGER PRIMARY KEY)")
+                conn.executemany("INSERT INTO outlook_retained VALUES(?)", ((mail,) for mail in retained.values()))
+                conn.executemany("DELETE FROM mails WHERE id=?", ((item["id"],) for entry, item in pending.items()
+                                                                 if entry not in pending_ids))
+                done = len(retained) + len(pending_ids)
+                conn.execute("""UPDATE sources SET signature=?,done=?,index_done=?,index_total=?,
+                                failed=0,omitted=0,partial=0 WHERE id=? AND pending=?""",
+                             (signature, done, done, len(folders), source, version))
+            remaining = (entry for entry in folders if entry not in retained and entry not in pending_ids)
+            batch = []
+            with self.store.connection() as conn:
+                for entry_id in remaining:
+                    self.check(event)
+                    mail = outlook.read(entry_id, folders[entry_id], temporary, aliases.get(entry_id, ()))
+                    mail_id = self.store.add_mail(conn, source, version, entry_id, mail)
+                    self.index_outlook_attachments(conn, mail_id, mail, temporary, event)
+                    del mail
+                    done += 1
+                    batch.append(mail_id)
+                    if len(batch) == 32:
+                        conn.execute("UPDATE sources SET done=?,index_done=? WHERE id=? AND pending=?",
+                                     (done, done, source, version))
+                        conn.commit()
+                        if previous is None:
+                            self.store.append_pending_memory(source, batch)
+                        batch.clear()
+                conn.execute("UPDATE sources SET done=?,index_done=? WHERE id=? AND pending=?",
+                             (done, done, source, version))
+            if previous is None:
+                self.store.append_pending_memory(source, batch)
+
+            with self.store.connection() as conn:
+                omitted, partial = conn.execute(
+                    """SELECT COALESCE(SUM(a.status NOT IN ('완료','대기') AND NOT EXISTS(
+                               SELECT 1 FROM passages p WHERE p.attachment=a.id AND p.location<>'파일명')),0),
+                              COALESCE(SUM(a.status LIKE '일부 색인%'),0)
+                       FROM mails m JOIN attachments a ON a.mail=m.id WHERE m.source=?
+                       AND (m.version=? OR m.id IN (SELECT id FROM outlook_retained))""", (source, version),
+                ).fetchone()
+                conn.execute("UPDATE sources SET omitted=?,partial=? WHERE id=? AND pending=?",
+                             (omitted, partial, source, version))
+
+        issue = self.embed_revision(source, version, event, retain=True)
+        self.check(event)
+        with self.store.connection() as conn:
+            conn.execute("UPDATE sources SET index_stage='finalizing' WHERE id=? AND pending=?", (source, version))
+        unchanged = previous if len(retained) == len(old) == len(folders) and row["active_signature"] == signature else None
+        self.publish_revision(source, version, signature, event, issue or (None if folders else "outlook_no_mail"),
+                              empty_eml=not folders, retain=True, unchanged=unchanged)
+
+    def index_outlook_attachments(self, conn, mail_id, mail, temporary, event):
+        entries = conn.execute("SELECT id FROM attachments WHERE mail=? ORDER BY id", (mail_id,)).fetchall()
+        for entry, (name, part) in zip(entries, mail["attachments"], strict=True):
+            self.check(event)
+            try:
+                status, locations = extract_attachment(name, part, temporary, self.pdf, check=lambda: self.check(event))
+            except OutlookError as exc:
+                status, locations = ("용량 초과" if str(exc) == "outlook_attachment_size" else "Outlook 첨부 읽기 실패"), []
+            for location, text in locations:
+                for start, segment in sections(text):
+                    self.store.add_passage(conn, mail_id, mail, entry["id"], name, location, start, segment)
+            conn.execute("UPDATE attachments SET status=? WHERE id=?", (status, entry["id"]))
 
     def pending_updates(self, row):
         """PST files that changed or use an older index format."""
@@ -791,18 +951,26 @@ class Indexer:
                     conn.execute("UPDATE sources SET done=done+? WHERE id=?", (adopted, source))
                     conn.commit()
             workspace = temp or self.spool
-            total = 0
-            for _ in self.scan_entries(root, numbered=numbered, extras=extras):
+            if numbered and "" in carried:
+                conn.execute("UPDATE sources SET index_done=0,index_total=0 WHERE id=? AND pending=?", (source, version))
+                return
+            old_mails = self.store.mail_identities(conn, source, previous)
+            entries = []
+            for entry in self.scan_entries(root, numbered=numbered, extras=extras):
                 self.check(event)
-                total += 1
-            conn.execute("UPDATE sources SET index_done=0,index_total=? WHERE id=? AND pending=?", (total, source, version))
+                entries.append(entry)
+            conn.execute("UPDATE sources SET index_done=0,index_total=? WHERE id=? AND pending=?", (len(entries), source, version))
             conn.commit()
             done = 0
-            for done, (path, item, folder) in enumerate(self.scan_entries(root, numbered=numbered, extras=extras), 1):
+            batch = []
+            for done, (path, item, folder) in enumerate(entries, 1):
                 self.check(event)
                 if done > 1 and (done - 1) % 32 == 0:
                     conn.execute("UPDATE sources SET index_done=? WHERE id=? AND pending=?", (done - 1, source, version))
                     conn.commit()
+                    if previous is None:
+                        self.store.append_pending_memory(source, batch)
+                        batch.clear()
                 if conn.execute("SELECT 1 FROM mails WHERE source=? AND version=? AND item=?", (source, version, item)).fetchone():
                     continue
                 if conn.execute("SELECT 1 FROM problems WHERE source=? AND version=? AND item=?", (source, version, item)).fetchone():
@@ -827,20 +995,40 @@ class Indexer:
                                 SELECT id FROM mails WHERE source=? AND version=? AND item=?)""",
                                          (status, source, version, item))
                         else:
-                            self.store.add_document(conn, source, version, item, doc)
+                            mail_id = self.store.add_document(conn, source, version, item, doc)
+                            if previous is None:
+                                batch.append(mail_id)
                         conn.execute("UPDATE sources SET done=done+1,partial=partial+? WHERE id=?",
                                      (int(status.startswith("일부 색인")), source))
                     continue
                 try:
-                    mail = parse_mail(path, folder)
+                    stat_result = path.stat()
+                    signature = (stat_result.st_size, stat_result.st_mtime_ns)
+                    old = old_mails.get(item)
+                    if (old and old["folder"] == folder and old["fingerprint"].startswith(MAIL_INDEX_FORMAT + ":")
+                            and (old["file_size"], old["file_mtime_ns"]) == signature):
+                        mail_id = self.store.adopt_mail(conn, version, old["id"])
+                    else:
+                        mail = parse_mail(path, folder)
+                        current_stat = path.stat()
+                        if (current_stat.st_size, current_stat.st_mtime_ns) != signature:
+                            raise ImportIssue("changed")
+                        if (old and old["folder"] == folder and old["fingerprint"].startswith(MAIL_INDEX_FORMAT + ":")
+                                and matches_fingerprint(mail, item, old["fingerprint"])):
+                            mail_id = self.store.adopt_mail(conn, version, old["id"])
+                        else:
+                            mail_id = self.store.add_mail(conn, source, version, item, mail)
+                        conn.execute("UPDATE mails SET file_size=?,file_mtime_ns=? WHERE id=?", (*signature, mail_id))
                 except (ValueError, OSError, LookupError, TypeError, RecursionError):
                     conn.execute("INSERT INTO problems VALUES(?,?,?,'parse')", (source, version, item))
                     conn.execute("UPDATE sources SET failed=failed+1 WHERE id=?", (source,))
                 else:
-                    if previous is None or not self.store.try_adopt(conn, source, previous, version, item, mail):
-                        self.store.add_mail(conn, source, version, item, mail)
+                    if previous is None:
+                        batch.append(mail_id)
                     conn.execute("UPDATE sources SET done=done+1 WHERE id=?", (source,))
             conn.execute("UPDATE sources SET index_done=?,index_total=? WHERE id=? AND pending=?", (done, done, source, version))
+        if previous is None:
+            self.store.append_pending_memory(source, batch)
 
     def index_attachments(self, root, temp, source, version, event, extras=()):
         with self.store.connection() as conn:
@@ -944,18 +1132,19 @@ class Indexer:
             if extracted:
                 save_extracted()
 
-    def index_embeddings(self, source, version, event):
+    def index_embeddings(self, source, version, event, *, retain=False):
         model = self.ai.embedding_index
         batch_size = self.embedding_batch_size
         timeout = self.embedding_batch_timeout
+        scope = "(m.version=? OR m.id IN (SELECT id FROM outlook_retained))" if retain else "m.version=?"
         self.check(event)
         with self.store.connection() as conn:
             total, done = conn.execute(
-                """SELECT COUNT(*),COALESCE(SUM(v.passage IS NOT NULL OR r.passage IS NOT NULL),0)
+                f"""SELECT COUNT(*),COALESCE(SUM(v.passage IS NOT NULL OR r.passage IS NOT NULL),0)
                    FROM mails m JOIN passages p ON p.mail=m.id
                    LEFT JOIN vectors v ON v.passage=p.id AND v.model=?
                    LEFT JOIN embedding_refs r ON r.passage=p.id AND r.model=?
-                   WHERE m.source=? AND m.version=?""", (model, model, source, version),
+                   WHERE m.source=? AND {scope}""", (model, model, source, version),
             ).fetchone()
             conn.execute("""UPDATE sources SET state='embeddings',index_stage='embeddings',embedding_done=?,
                             embedding_total=?,embedding_model_key=?
@@ -966,8 +1155,8 @@ class Indexer:
             self.check(event)
             with self.store.connection() as conn:
                 rows = conn.execute(
-                    """SELECT p.id,p.text,m.subject,a.name,p.embedding_key FROM passages p CROSS JOIN mails m ON m.id=p.mail
-                       LEFT JOIN attachments a ON a.id=p.attachment WHERE m.source=? AND m.version=? AND p.id>?
+                    f"""SELECT p.id,p.text,m.subject,a.name,p.embedding_key FROM passages p CROSS JOIN mails m ON m.id=p.mail
+                       LEFT JOIN attachments a ON a.id=p.attachment WHERE m.source=? AND {scope} AND p.id>?
                        AND NOT EXISTS(SELECT 1 FROM vectors v WHERE v.passage=p.id AND v.model=?)
                        AND NOT EXISTS(SELECT 1 FROM embedding_refs r WHERE r.passage=p.id AND r.model=?)
                        ORDER BY p.id LIMIT ?""", (source, version, last, model, model, batch_size)

@@ -17,7 +17,7 @@ def percentile_95(samples):
     return sorted(samples)[math.ceil(len(samples) * .95) - 1]
 
 
-def run(count, repetitions, chunks=1):
+def run(count, repetitions, chunks=1, *, compare_memory=False):
     with tempfile.TemporaryDirectory(prefix="mail-benchmark-") as directory:
         root = Path(directory)
         archive = root / "synthetic"
@@ -40,6 +40,9 @@ def run(count, repetitions, chunks=1):
         ingestion = time.perf_counter() - begin
         generator = random.Random(17)
         queries = [f"AX-{generator.randrange(count):06d}" for _ in range(repetitions)]
+        if compare_memory:
+            compare_search_paths(store, source, count, queries)
+            return
         exact_times = []
         hit = 0
         for query in queries:
@@ -67,6 +70,37 @@ def run(count, repetitions, chunks=1):
                     print(f"{name}: median {statistics.median(samples[1:]):.1f} ms, P95 {percentile_95(samples[1:]):.1f} ms")
         print(f"Exact IDs: {hit}/{repetitions} first hits, median {statistics.median(exact_times):.1f} ms, P95 {percentile_95(exact_times):.1f} ms")
         print(f"Common Korean terms: {len(broad_times)} searches, median {statistics.median(broad_times):.1f} ms, P95 {percentile_95(broad_times):.1f} ms")
+
+
+def compare_search_paths(store, source, count, queries):
+    start = time.perf_counter()
+    store.reload_memory()
+    startup = time.perf_counter() - start
+    filters = {"source": source, "tab": "mail"}
+    common = ("반도체 펌프", "양산 일정", "납품 검수", "5월 출하 승인", "가상구매팀")
+    print(f"{count:,} synthetic emails; memory load {startup:.2f}s; warm lookup includes passage hydration")
+    with store.search_session(defer_access=True):
+        for workload, terms in (("selective", queries), ("common", common * 4)):
+            for label, method in (
+                ("memory quick", lambda term: store.memory_search(term, filters, quick=True)),
+                ("FTS5 quick", lambda term: store.quick_search(term, filters)),
+                ("memory keyword", lambda term: store.memory_search(term, filters, quick=False)),
+                ("FTS5 full text", lambda term: store.lexical(term, filters, limit=20)),
+            ):
+                if workload == "common" and "quick" in label:
+                    continue
+                method(terms[0])
+                timings = []
+                hits = 0
+                for term in terms:
+                    start = time.perf_counter()
+                    rows = method(term)
+                    timings.append((time.perf_counter() - start) * 1_000)
+                    if workload == "selective":
+                        hits += bool(rows and rows[0]["subject"].startswith(term + " "))
+                check = f"; {hits}/{len(terms)} first hits" if workload == "selective" else ""
+                print(f"{workload}, {label}: median {statistics.median(timings):.2f} ms, "
+                      f"P95 {percentile_95(timings):.2f} ms{check}")
 
 
 def scoped_semantic(count, repetitions, backend="sqlite", dimensions=96):
@@ -162,6 +196,7 @@ if __name__ == "__main__":
     parser.add_argument("--repetitions", type=int, default=100)
     parser.add_argument("--semantic-scope", action="store_true", help="Measure filtered vector search with colliding buckets")
     parser.add_argument("--duplicate-attachments", action="store_true", help="Count repeated quote and attachment work")
+    parser.add_argument("--memory-search", action="store_true", help="Compare warm memory and SQLite FTS5 lookups")
     parser.add_argument("--chunks", type=int, default=1, help="Scale out mail body text")
     parser.add_argument("--dimensions", type=int, default=96)
     parser.add_argument("--vector-index", choices=("sqlite", "usearch"), default="sqlite")
@@ -177,4 +212,4 @@ if __name__ == "__main__":
     elif args.duplicate_attachments:
         duplicate_attachments(args.count)
     else:
-        run(args.count, args.repetitions, args.chunks)
+        run(args.count, args.repetitions, args.chunks, compare_memory=args.memory_search)

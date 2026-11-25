@@ -2,6 +2,7 @@
 import array
 import contextlib
 import hashlib
+import heapq
 import json
 import math
 import os
@@ -13,12 +14,15 @@ import time
 import unicodedata
 from collections import defaultdict, deque, OrderedDict
 from concurrent.futures import FIRST_COMPLETED, Future, wait
-from threading import Lock, Thread, local
+from dataclasses import dataclass, field
+from threading import Lock, RLock, Thread, local
 from datetime import date, datetime, time as midnight, timedelta, timezone
 from functools import lru_cache
+from itertools import tee
 from pathlib import Path
 
 from .pcf import COMMENT_HEADER, PCF_CELL, PCF_FIELDS, case_key, cell_location, pcf_field_value
+from .outlook import DEFAULT_OUTLOOK
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS sources (
@@ -35,6 +39,8 @@ CREATE TABLE IF NOT EXISTS mails (
     version INTEGER NOT NULL, item TEXT NOT NULL, fingerprint TEXT NOT NULL,
     folder TEXT NOT NULL, subject TEXT NOT NULL, sender TEXT NOT NULL, recipient TEXT NOT NULL,
     sent TEXT NOT NULL, message_id TEXT NOT NULL, topic TEXT NOT NULL, body TEXT NOT NULL,
+    body_prefix TEXT,
+    file_size INTEGER, file_mtime_ns INTEGER,
     UNIQUE(source, version, item)
 );
 CREATE INDEX IF NOT EXISTS mail_source_version_id ON mails(source,version,id);
@@ -338,6 +344,8 @@ def document_kind(filename):
 
 def source_readable(path, kind):
     try:
+        if kind == "outlook_mapi":
+            return os.name == "nt" and (path == DEFAULT_OUTLOOK or Path(path.removeprefix("outlook:")).is_file())
         path = Path(path)
         if kind == "eml_dir":
             with os.scandir(path) as iterator:
@@ -450,6 +458,177 @@ def buckets(vector):
         yield band * 2048 + value
 
 
+def mail_body_prefix(parts, limit=1200):
+    prefix = ""
+    end = 0
+    for start, text in parts:
+        if start > end and prefix and not prefix[-1].isspace():
+            prefix += "\n"
+        prefix += text[max(0, end - start):][:limit - len(prefix)]
+        if len(prefix) >= limit:
+            break
+        end = start + len(text)
+    return prefix
+
+
+# Part-number fragments shortlist a query without changing substring semantics.
+IDENTIFIER_FRAGMENT = re.compile(r"(?=([a-z0-9][-_][a-z0-9]{6}))")
+
+
+@dataclass(frozen=True, slots=True)
+class MemoryMail:
+    id: int
+    source: int
+    fingerprint: str
+    topic_key: str
+    folder: str
+    subject: str
+    sender: str
+    recipient: str
+    sent: str
+    kind: str
+    item: str
+    attachment_names: tuple[str, ...]
+    body_prefix: str
+    subject_norm: str = field(init=False)
+    sender_norm: str = field(init=False)
+    recipient_norm: str = field(init=False)
+    people_norm: str = field(init=False)
+    sender_addresses: str = field(init=False)
+    attachment_norm: str = field(init=False)
+    metadata_norm: str = field(init=False)
+    body_norm: str = field(init=False)
+
+    def __post_init__(self):
+        for name in ("subject", "sender", "recipient"):
+            object.__setattr__(self, name + "_norm", normalized(getattr(self, name)))
+        object.__setattr__(self, "people_norm", self.sender_norm + "\n" + self.recipient_norm)
+        object.__setattr__(self, "sender_addresses", "," + self.sender_norm.replace(" ", "") + ",")
+        object.__setattr__(self, "attachment_norm", normalized("\n".join(self.attachment_names)))
+        object.__setattr__(self, "metadata_norm", "\n".join((self.subject_norm, self.people_norm, self.attachment_norm)))
+        object.__setattr__(self, "body_norm", normalized(self.body_prefix))
+
+
+class MemoryIndex:
+    """Publish immutable per-source lists and conversation references."""
+
+    def __init__(self):
+        self.lock = RLock()
+        self.sources = {}
+        self.topics = {}
+        self.identifiers = {}
+        self.generation = 0
+
+    @staticmethod
+    def prepare(records):
+        records = tuple(sorted(records, key=lambda row: (row.sent, row.id), reverse=True))
+        topics, identifiers = defaultdict(list), defaultdict(list)
+        for row in records:
+            if row.topic_key:
+                topics[row.topic_key].append(row.id)
+            fragments = {fragment for field in (row.metadata_norm, row.body_norm)
+                         for fragment in IDENTIFIER_FRAGMENT.findall(field)}
+            for fragment in fragments:
+                identifiers[fragment].append(row)
+        return records, topics, identifiers
+
+    def replace(self, source, prepared):
+        records, topics, identifiers = prepared
+        with self.lock:
+            self.generation += 1
+            for index, value in ((self.sources, [records] if records else []), (self.topics, topics),
+                                 (self.identifiers, identifiers)):
+                if value:
+                    index[source] = value
+                else:
+                    index.pop(source, None)
+
+    def extend(self, source, prepared):
+        records, topics, identifiers = prepared
+        if records:
+            with self.lock:
+                self.generation += 1
+                self.sources.setdefault(source, []).append(records)
+                for index, additions in ((self.topics, topics), (self.identifiers, identifiers)):
+                    groups = index.setdefault(source, defaultdict(list))
+                    for key, items in additions.items():
+                        groups[key].extend(items)
+
+    def snapshot(self, source=None, fragment=None):
+        with self.lock:
+            if fragment is not None:
+                groups = (self.identifiers.get(source, {}),) if source is not None else self.identifiers.values()
+                return tuple(tuple(group.get(fragment, ())) for group in groups)
+            if source is not None:
+                return tuple(self.sources.get(source, ()))
+            return tuple(batch for batches in self.sources.values() for batch in batches)
+
+    def conversation(self, source, subject):
+        with self.lock:
+            return tuple(self.topics.get(source, {}).get(topic_key(subject), ()))
+
+    def search(self, question, filters, *, quick, limit):
+        text = normalized(question)
+        words = tuple(dict.fromkeys(text.replace(",", " ").split()))
+        require_all = "," in text
+        fragment = None
+        if len(words) == 1 or require_all:
+            match = next((part for word in words if (part := IDENTIFIER_FRAGMENT.search(word))), None)
+            fragment = match[1] if match else None
+        with self.lock:
+            groups = self.snapshot(filters.get("source") or None, fragment)
+            generation = self.generation
+        subject, sender, recipient = (normalized(filters.get(key, "")) for key in ("subject", "sender", "recipient"))
+        body = tuple(normalized(filters.get("body", "")).replace(",", " ").split())
+        tab = filters.get("tab")
+        kind = tab if tab in ("mail", "document", "pcf") else None
+        before, after = filters.get("before"), filters.get("after")
+        attach = filters.get("attachment")
+        exact_sender = filters.get("sender_address") and sender
+        sender_tag, sender_address = f"<{sender}>", f",{sender},"
+        regular = filters.get("regular_only")
+        best = (len(words), bool(words and not quick))
+        ranked = []
+        for records in groups:
+            for row in records:
+                if (fragment is None and len(ranked) == limit and ranked[0][:2] == best
+                        and (row.sent, row.id) <= ranked[0][2:]):
+                    break
+                if ((kind and row.kind != kind) or (regular and row.kind == "pcf")
+                        or (after and row.sent < after) or (before and (not row.sent or row.sent >= before))
+                        or (attach == "yes" and not row.attachment_names) or (attach == "no" and row.attachment_names)
+                        or (subject and subject not in row.subject_norm) or (recipient and recipient not in row.recipient_norm)
+                        or (sender and sender not in row.sender_norm)
+                        or (body and not all(word in row.body_norm for word in body))):
+                    continue
+                if exact_sender and sender_tag not in row.sender_norm and sender_address not in row.sender_addresses:
+                    continue
+                body_hits = False
+                if not words:
+                    hits = 0
+                elif len(words) == 1:
+                    word = words[0]
+                    body_hits = not quick and word in row.body_norm
+                    if not body_hits and word not in row.metadata_norm:
+                        continue
+                    hits = 1
+                else:
+                    body_count = hits = 0
+                    for word in words:
+                        in_body = not quick and word in row.body_norm
+                        body_count += in_body
+                        hits += in_body or word in row.metadata_norm
+                    if not hits or (require_all and hits != len(words)):
+                        continue
+                    body_hits = body_count == len(words)
+                candidate = (hits, body_hits, row.sent, row.id)
+                if len(ranked) < limit:
+                    heapq.heappush(ranked, candidate)
+                elif candidate > ranked[0]:
+                    heapq.heapreplace(ranked, candidate)
+        return [item[-1] for item in sorted(ranked, reverse=True)], words, generation
+
+
 class Store:
     def __init__(self, root):
         if sqlite3.sqlite_version_info < (3, 42, 0):
@@ -461,6 +640,8 @@ class Store:
         self.db = self.root / "mail.sqlite"
         self.local = local()
         self.vector_index = None
+        self.memory_index = MemoryIndex()
+        self.memory_load_lock = Lock()
         self.access_cache = OrderedDict()
         self.access_cache_lock = Lock()
         self.access_inflight = {}
@@ -476,6 +657,9 @@ class Store:
                 conn.execute("ALTER TABLE sources ADD COLUMN active_signature TEXT")
                 conn.execute("UPDATE sources SET active_signature=signature WHERE active IS NOT NULL AND pending IS NULL")
             columns = {row[1] for row in conn.execute("PRAGMA table_info(mails)")}
+            for column, datatype in (("body_prefix", "TEXT"), ("file_size", "INTEGER"), ("file_mtime_ns", "INTEGER")):
+                if column not in columns:
+                    conn.execute(f"ALTER TABLE mails ADD COLUMN {column} {datatype}")
             if "kind" not in columns:
                 # Tab scoping (mail vs document); older rows are classified by item suffix.
                 conn.execute("ALTER TABLE mails ADD COLUMN kind TEXT NOT NULL DEFAULT 'mail'")
@@ -508,6 +692,89 @@ class Store:
                     SELECT m.id,index_text(m.subject),index_text(m.sender || ' ' || m.recipient),
                            index_text(coalesce((SELECT group_concat(a.name, ' ') FROM attachments a WHERE a.mail=m.id),''))
                     FROM mails m''')
+
+        self.reload_memory()
+
+    @staticmethod
+    def read_memory(conn, where="", params=()):
+        for row in conn.execute(
+            f"""SELECT m.id,m.source,substr(m.fingerprint,instr(m.fingerprint,':')+1),m.topic,
+                       m.folder,m.subject,m.sender,m.recipient,m.sent,m.kind,m.item,
+                       (SELECT json_group_array(a.name) FROM attachments a WHERE a.mail=m.id),
+                       m.body_prefix, CASE WHEN m.body_prefix IS NULL AND m.kind='mail' THEN m.body END
+                FROM sources s JOIN mails m ON m.source=s.id AND m.version=coalesce(s.active,s.pending)
+                WHERE {VISIBLE_VERSION}{where}""", params,
+        ):
+            raw = tuple(row)
+            prefix = raw[12] if raw[12] is not None else mail_body_prefix(mail_sections(raw[13] or ""))
+            yield MemoryMail(*raw[:11], tuple(json.loads(raw[11])), prefix)
+
+    def reload_memory(self, source=None):
+        with self.memory_load_lock, self.connection() as conn:
+            where, params = ("", ()) if source is None else (" AND s.id=?", (source,))
+            by_source = defaultdict(list)
+            for row in self.read_memory(conn, where, params):
+                by_source[row.source].append(row)
+            keys = set(self.memory_index.sources) | set(by_source) if source is None else {source}
+            for key in keys:
+                self.memory_index.replace(key, self.memory_index.prepare(by_source[key]))
+
+    def append_pending_memory(self, source, ids):
+        if not ids:
+            return
+        with self.memory_load_lock, self.connection() as conn:
+            rows = self.read_memory(conn, " AND s.id=? AND s.active IS NULL AND m.id IN (SELECT value FROM json_each(?))",
+                                    (source, json.dumps(ids)))
+            self.memory_index.extend(source, self.memory_index.prepare(rows))
+
+    def commit_memory_revision(self, conn, source):
+        prepared = self.memory_index.prepare(self.read_memory(conn, " AND s.id=?", (source,)))
+        with self.memory_index.lock:
+            conn.commit()
+            self.memory_index.replace(source, prepared)
+
+    def memory_search(self, question, filters, *, quick, limit=20):
+        oversample = max(40, limit)
+        for _ in range(2):
+            ids, words, generation = self.memory_index.search(question, filters, quick=quick, limit=oversample)
+            results = []
+            if ids:
+                with self.connection() as conn:
+                    results = self.memory_passages(conn, ids, words, limit)
+            with self.memory_index.lock:
+                if generation == self.memory_index.generation:
+                    break
+        return results
+
+    def memory_passages(self, conn, ids, words, limit):
+        parts = defaultdict(list)
+        for row in conn.execute(
+            f"""WITH candidates(id) AS (SELECT value FROM json_each(?)),
+                      part_ids AS (
+                          SELECT (SELECT min(id) FROM passages WHERE mail=c.id) id FROM candidates c
+                          UNION SELECT p.id FROM candidates c JOIN passages p ON p.mail=c.id WHERE p.location='파일명'
+                      )
+                SELECT {MAIL_COLUMNS},p.id passage,p.text,p.location,p.start,a.name attachment
+                FROM part_ids JOIN passages p ON p.id=part_ids.id JOIN mails m ON m.id=p.mail {JOIN}
+                LEFT JOIN attachments a ON a.id=p.attachment WHERE {VISIBLE_VERSION} ORDER BY p.id""", (json.dumps(ids),),
+        ):
+            parts[row["id"]].append(row)
+        sources, documents, seen, results = {}, {}, set(), []
+        for mail in ids:
+            choices = parts[mail]
+            if not choices:
+                continue
+            row = next((part for part in choices if part["location"] == "파일명"
+                        and any(word in normalized(part["text"]) for word in words)), choices[0])
+            key = row["fingerprint"]
+            if key in seen or not self.readable(row, sources, documents):
+                continue
+            if not self.deferred_access():
+                seen.add(key)
+            results.append(dict(row))
+            if len(results) == limit:
+                break
+        return results
 
     @contextlib.contextmanager
     def thread_connection(self):
@@ -769,17 +1036,19 @@ class Store:
         return " AND ".join(clauses), params
 
     def add_mail(self, conn, source, version, item, mail):
+        segments, preview = tee(mail_sections(mail["body"]))
         cursor = conn.execute(
-            """INSERT INTO mails(source,version,item,fingerprint,folder,subject,sender,recipient,sent,message_id,topic,body)
-               VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+            """INSERT INTO mails(source,version,item,fingerprint,folder,subject,sender,recipient,sent,message_id,topic,body,body_prefix)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (source, version, item, fingerprint(mail, item), *(mail[k] for k in ("folder", "subject", "sender", "recipient", "sent", "message_id")),
-             topic_key(mail["subject"]), mail["body"]),
+             topic_key(mail["subject"]), mail["body"], mail_body_prefix(preview)),
         )
         mail_id = cursor.lastrowid
         parents = list(dict.fromkeys(re.findall(r"<[^<>\s]+>", mail["reply_ids"])))[:100]
         conn.executemany("INSERT INTO replies(mail,parent) VALUES(?,?)", ((mail_id, x) for x in parents))
         wrote_body = False
-        for start, text in mail_sections(mail["body"]):
+        del preview
+        for start, text in segments:
             self.add_passage(conn, mail_id, mail, None, "", "본문", start, text)
             wrote_body = True
         if not wrote_body:
@@ -855,8 +1124,10 @@ class Store:
     def adopt_mail(self, conn, version, old_id):
         """Copy an imported mail with its index and embeddings into a new version."""
         new_id = conn.execute(
-            """INSERT INTO mails(source,version,item,fingerprint,folder,subject,sender,recipient,sent,message_id,topic,body,kind)
-               SELECT source,?,item,fingerprint,folder,subject,sender,recipient,sent,message_id,topic,body,kind
+            """INSERT INTO mails(source,version,item,fingerprint,folder,subject,sender,recipient,sent,message_id,topic,body,kind,
+                                 body_prefix,file_size,file_mtime_ns)
+               SELECT source,?,item,fingerprint,folder,subject,sender,recipient,sent,message_id,topic,body,kind,
+                      body_prefix,file_size,file_mtime_ns
                FROM mails WHERE id=?""", (version, old_id)
         ).lastrowid
         conn.execute(
@@ -900,6 +1171,13 @@ class Store:
             return False
         self.adopt_mail(conn, version, old["id"])
         return True
+
+    @staticmethod
+    def mail_identities(conn, source, version):
+        return {row["item"]: row for row in conn.execute(
+            """SELECT id,item,folder,fingerprint,file_size,file_mtime_ns FROM mails
+               WHERE source=? AND version=? AND kind='mail'""", (source, version),
+        )} if version is not None else {}
 
     def carry_prefix(self, conn, source, previous, version, prefix):
         """Adopt previous-version mails under a PST prefix once per pending version."""

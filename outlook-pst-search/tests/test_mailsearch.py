@@ -20,6 +20,7 @@ from unittest.mock import MagicMock, patch
 from email.message import EmailMessage
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path, PureWindowsPath
+from types import SimpleNamespace
 
 from mailsearch.api_settings import ApiSettings, user_dpapi
 from mailsearch.answer import (AnswerSessions, LocalAI, answer_groups, answer_plan, combine_answer_evidence,
@@ -32,6 +33,7 @@ from mailsearch.intranet import CHAT_PATH, IntranetAI, LOCAL_EMBEDDING
 from mailsearch.indexer import ImportIssue, Indexer
 from mailsearch.ollama_setup import (InstallCommandError, install_ollama, package_progress,
                                     pull_model, run_install_command, winget_binary)
+from mailsearch.outlook import OutlookError, OutlookStore
 from mailsearch.server import (App, INSTANCE_FILE, SessionLock, existing_origin, gateway_defaults,
                                gateway_diagnostics, main, publish_instance)
 from mailsearch.store import VECTOR_LOOKUP_SQL, Store, fingerprint, local_midnight_utc, question_scope, read_signature, sections
@@ -1954,11 +1956,128 @@ class Integration(unittest.TestCase):
             semantic.assert_not_called()
             rerank.assert_not_called()
             status, hybrid = self.call("/api/search", {**query, "mode": "hybrid"})
-            self.assertEqual((status, hybrid), (200, found))
+            self.assertEqual(status, 200)
+            self.assertEqual({row["mail"] for row in hybrid["results"]}, {row["mail"] for row in found["results"]})
             semantic.assert_called_once()
             rerank.assert_not_called()
             self.assertEqual(self.call("/api/search", {**query, "mode": "hybrid", "rerank": True})[0], 200)
             rerank.assert_called_once()
+
+    def test_memory_search_groups_replies_and_matches_comma_and_without_fts(self):
+        folder = Path(self.workspace.name) / "memory-mail"
+        folder.mkdir()
+        for name, subject, body in (
+            ("first", "Re: Atlas", "assembly power work"),
+            ("second", "FW: 답장: Atlas", "assembly work"),
+            ("third", "답장: Atlas", "power work\n\n-----Original Message-----\nassembly"),
+        ):
+            mail = EmailMessage()
+            mail["Subject"] = subject
+            mail["From"] = "Operations <ops@example.invalid>"
+            mail.set_content(body)
+            (folder / f"{name}.eml").write_bytes(mail.as_bytes())
+        source = self.indexer.register(folder)
+        self.assertEqual(await_source(self.store, source, {"ready", "error"})["state"], "ready")
+        filters = {"source": source, "tab": "mail"}
+        with (patch.object(self.store, "quick_search", side_effect=AssertionError("quick FTS")),
+              patch.object(self.store, "lexical", side_effect=AssertionError("body FTS")),
+              patch.object(self.store, "snippets", side_effect=AssertionError("FTS snippet"))):
+            status, result = self.call("/api/search", {"mode": "keyword", "query": "ASSEMBLY, POWER", "filters": filters})
+            self.assertEqual(status, 200)
+            self.assertEqual([row["subject"] for row in result["results"]], ["Re: Atlas"])
+            status, result = self.call("/api/search", {"mode": "quick", "query": "LAS", "filters": filters})
+            self.assertEqual((status, len(result["results"])), (200, 3))
+            self.assertEqual(set(self.store.memory_index.conversation(source, "전달: Re: ATLAS")),
+                             {row["mail"] for row in result["results"]})
+            _, result = self.call("/api/search", {"mode": "keyword", "query": "", "filters": {**filters, "body": "power,assembly"}})
+            self.assertEqual([row["subject"] for row in result["results"]], ["Re: Atlas"])
+        reopened = Store(self.store.root)
+        rows = reopened.memory_search("assembly, power", filters, quick=False)
+        self.assertEqual([row["subject"] for row in rows], ["Re: Atlas"])
+
+    def test_eml_refresh_reuses_file_signature_and_updates_only_its_cache(self):
+        from mailsearch.indexer import parse_mail
+
+        source = self.import_mail()
+        other = Path(self.workspace.name) / "unrelated.eml"
+        other.write_text("Subject: Separate archive\n\nFixture body.", encoding="utf-8")
+        unrelated = self.indexer.register(other)
+        self.assertEqual(await_source(self.store, unrelated, {"ready", "error"})["state"], "ready")
+        snapshot = self.store.memory_index.snapshot(unrelated)[0]
+        fresh = self.mail / "new-snapshot.eml"
+        fresh.write_text("Subject: Re: index marker\n\nFirst visible result.", encoding="utf-8")
+        (self.mail / "request.eml").unlink()
+        with patch("mailsearch.indexer.parse_mail", wraps=parse_mail) as read:
+            self.indexer.command(source, "refresh")
+            self.assertEqual(await_source(self.store, source, {"ready", "error"})["state"], "ready")
+        self.assertEqual([call.args[0].name for call in read.call_args_list], [fresh.name])
+        self.assertIs(self.store.memory_index.snapshot(unrelated)[0], snapshot)
+        self.assertTrue(self.store.memory_search("index marker", {"source": source}, quick=True))
+        self.assertEqual(len(self.store.memory_search("A-17", {"source": source}, quick=True)), 2)
+        self.indexer.command(source, "remove")
+        self.assertEqual(self.store.memory_index.snapshot(source), ())
+
+    def test_mapi_refresh_opens_only_new_or_moved_items_and_keeps_passages(self):
+        class MapiFailure(Exception):
+            pass
+
+        class Table:
+            def __init__(self, entries):
+                self.entries = entries
+                self.Columns = MagicMock()
+
+            @property
+            def EndOfTable(self):
+                return not self.entries
+
+            def GetArray(self, count):
+                batch, self.entries = self.entries[:count], self.entries[count:]
+                return [(entry,) for entry in batch]
+
+        def folder(path, entries=(), children=()):
+            return SimpleNamespace(FolderPath=path, Folders=children, GetTable=lambda _: Table(entries))
+
+        def item(path, subject):
+            return SimpleNamespace(Parent=SimpleNamespace(FolderPath=path), Subject=subject, Body="Fixture content.",
+                                   SenderName="Operations", To="Warehouse", CC="", SentOn=None, Attachments=[])
+
+        original = {"same": item("/Inbox", "Same"), "move": item("/Inbox", "Move"),
+                    "deleted": item("/Inbox", "Deleted")}
+        changed = {"new": item("/Inbox", "New"), "move": item("/Archive", "Moved")}
+        namespace = SimpleNamespace(GetItemFromID=MagicMock(side_effect=lambda entry, _: original[entry]))
+        session = OutlookStore(namespace, "store-id", folder("/", children=[folder("/Inbox", tuple(original))]), MapiFailure)
+        with (patch("mailsearch.indexer.outlook_modules"), patch("mailsearch.indexer.outlook_store", return_value=nullcontext(session)),
+              patch("mailsearch.store.source_readable", return_value=True)):
+            status, data = self.call("/api/sources", {"kind": "outlook_mapi"})
+            self.assertEqual(status, 202)
+            source = data["source"]
+            first = await_source(self.store, source, {"ready", "error"})
+            self.assertEqual((first["state"], first["done"]), ("ready", 3))
+            before = self.store.memory_search("same", {"source": source}, quick=True)[0]
+
+            namespace.GetItemFromID.reset_mock()
+            namespace.GetItemFromID.side_effect = lambda entry, _: changed[entry]
+            session.root = folder("/", children=[folder("/Inbox", ("same", "new")), folder("/Archive", ("move",))])
+            self.indexer.command(source, "refresh")
+            current = await_source(self.store, source, {"ready", "error"})
+            self.assertEqual((current["state"], current["done"]), ("ready", 3))
+            self.assertCountEqual([call.args for call in namespace.GetItemFromID.call_args_list],
+                                  [("move", "store-id"), ("new", "store-id")])
+            rows = {row["subject"]: row for row in self.store.memory_search("", {"source": source}, quick=True)}
+            self.assertEqual(set(rows), {"Same", "Moved", "New"})
+            self.assertEqual(rows["Moved"]["folder"], "/Archive")
+            self.assertEqual(rows["Same"]["passage"], before["passage"])
+            self.assertEqual(current["embedding_done"], 3)
+
+            namespace.GetItemFromID.reset_mock()
+            self.indexer.command(source, "refresh")
+            again = await_source(self.store, source, {"ready", "error"})
+            self.assertEqual(again["active"], current["active"])
+            namespace.GetItemFromID.assert_not_called()
+
+    def test_mapi_registration_reports_missing_optional_component(self):
+        with patch("mailsearch.indexer.outlook_modules", side_effect=OutlookError("outlook_pywin32")):
+            self.assertEqual(self.call("/api/sources", {"kind": "outlook_mapi"}), (409, {"error": "outlook_pywin32"}))
 
     def test_quoted_exact_search_with_and_or(self):
         self.import_mail()
@@ -2466,10 +2585,15 @@ class Integration(unittest.TestCase):
         retry_at = time.monotonic() + 3
         while source in self.indexer.events and time.monotonic() < retry_at:
             time.sleep(.01)
+        with patch("mailsearch.indexer.subprocess.Popen", side_effect=AssertionError("unchanged PST was exported")):
+            self.assertEqual(self.call("/api/source-action", {"source": source, "action": "refresh"})[0], 202)
+            unchanged = await_source(self.store, source, {"empty", "ready", "error"})
+        self.assertEqual((unchanged["state"], unchanged["done"]), ("ready", 1))
+        pst.write_bytes(pst.read_bytes() + b"changed")
         with patch("mailsearch.indexer.subprocess.Popen", return_value=process):
             self.assertEqual(self.call("/api/source-action", {"source": source, "action": "refresh"})[0], 202)
             latest = await_source(self.store, source, {"empty", "ready", "error"})
-        self.assertEqual((latest["state"], latest["active"]), ("empty", first["active"]))
+        self.assertEqual((latest["state"], latest["active"]), ("empty", unchanged["active"]))
         self.assertEqual(len(self.call("/api/search", {"query": "A-17", "filters": {}})[1]["results"]), 1)
 
     def test_wrong_file_and_legacy_empty_source_have_distinct_status(self):
