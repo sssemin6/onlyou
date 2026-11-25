@@ -25,7 +25,7 @@ from types import SimpleNamespace
 
 from mailsearch.api_settings import ApiSettings, user_dpapi
 from mailsearch.answer import (QUERY_EMBEDDING_TIMEOUT, QUERY_REWRITE_TIMEOUT, AnswerSessions, LocalAI,
-                               answer_groups, answer_plan, combine_answer_evidence, delivery_date_answer,
+                               answer_groups, answer_plan, combine_answer_evidence, dedupe_by_content, delivery_date_answer,
                                evidence_for, latest_thread_decisions, needs_recency_boost, parse_evidence_gap, parse_rewrite,
                                reciprocal_rank, report_unconfirmed_aspects, rewritten_evidence,
                                supplemental_evidence, validate)
@@ -1571,7 +1571,7 @@ class Integration(unittest.TestCase):
                 msg["Message-ID"] = f"<{code}-{day}@example.invalid>"
                 if day > 1:
                     msg["In-Reply-To"] = f"<{code}-{day - 1}@example.invalid>"
-                msg.set_content(f"{code} 단가는 {number}만원입니다.")
+                msg.set_content(f"회신 기록 {day}.\n{code} 단가는 {number}만원입니다.")
                 (folder / f"{code}-{day}.eml").write_bytes(msg.as_bytes())
         source = self.indexer.register(folder)
         self.assertEqual(await_source(self.store, source, {"ready", "error"})["state"], "ready")
@@ -3042,6 +3042,31 @@ class RAGStability(unittest.TestCase):
     def gateway(self, *, answer="", embedding="", rerank=""):
         return IntranetAI("test-key", {"answer": answer, "embedding": embedding, "rerank": rerank})
 
+    def test_duplicate_attachments_leave_rerank_and_answer_slots_for_other_mail(self):
+        ai = MagicMock(spec=LocalAI)
+        ai.embedding_index = ""
+        ai.rerank_enabled = True
+        ai.rerank_candidates.side_effect = lambda query, rows, **options: rows
+        store = MagicMock(spec=Store)
+
+        def row(number, name, subject, text):
+            return {"id": number, "passage": number, "fingerprint": str(number), "attachment": name,
+                    "subject": subject, "text": text, "location": "본문", "kind": "mail"}
+
+        other = row(100, None, "A17 결정", "양산 범위를 별도로 확인했습니다.")
+        for count in (10, 90):
+            with self.subTest(copies=count):
+                copies = [row(i, "C:/shared/Atlas.PDF" if i else "atlas.pdf", f"mail {i}", "Atlas  approved")
+                          for i in range(count)]
+                store.lexical.return_value = [*copies, other]
+                store.related.return_value = [row(101, "Atlas.pdf", "Re: Atlas", " Atlas approved ")]
+                self.assertEqual(dedupe_by_content([*copies, other]), [copies[0], other])
+                evidence, _ = evidence_for(store, ai, "Atlas", {}, "")
+                self.assertEqual(ai.rerank_candidates.call_args.args[1], [copies[0], other])
+                self.assertEqual(evidence, [copies[0], other])
+        unrelated = row(102, None, "다른 프로젝트", other["text"])
+        self.assertEqual(dedupe_by_content([other, unrelated]), [other, unrelated])
+
     def test_latest_decision_is_retained_without_boosting_historical_questions(self):
         today = date.today().isoformat()
         draft = {"passage": 1, "source": 1, "subject": "A17 브래킷", "location": "본문",
@@ -3524,7 +3549,7 @@ class AttachmentsAndCitations(unittest.TestCase):
     def test_context_expansion_keeps_twelve_ranked_passages_and_caps_at_eighteen(self):
         def row(passage):
             return {"passage": passage, "id": passage, "fingerprint": str(passage), "kind": "document",
-                    "location": "본문", "attachment": None, "text": "Atlas"}
+                    "location": "본문", "attachment": None, "text": f"Atlas passage {passage}"}
         store = MagicMock()
         store.lexical.return_value = [row(i) for i in range(12)]
         store.related.return_value = []
