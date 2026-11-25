@@ -3243,6 +3243,34 @@ class RAGStability(unittest.TestCase):
             self.assertEqual(report_unconfirmed_aspects(verified, missing), verified)
             self.assertEqual(report_unconfirmed_aspects(verified, ("양산 BOM Rev.C",))["status"], "partial")
 
+    def test_supplemental_pass_reserves_slots_for_unique_content(self):
+        question = "A17 시제품 승인과 양산 BOM 비교"
+        first = [{"passage": n, "text": f"primary result {n}", "attachment": "BOM.pdf"} for n in range(9)]
+        duplicate = {**first[0], "passage": 90, "attachment": r"C:\files\bom.pdf"}
+        new = [{"passage": n, "text": f"new fact {n}", "attachment": "BOM.pdf"} for n in range(100, 104)]
+        registered = {row["passage"]: row for row in [*first, duplicate, *new]}
+        store = MagicMock(spec=Store)
+        store.search_profile = None
+        store.passages.side_effect = lambda ids, scope, **options: [registered[pid] for pid in ids]
+        ai = LocalAI("")
+        ai.rewrite_model = "fixture"
+        scope = {"source": 3, "before": "2026-06-01"}
+        gap = parse_evidence_gap({"sufficient": False, "follow_up_queries": ["양산 BOM"]}, question)
+        with (patch.dict(os.environ, {"MAILSEARCH_AGENTIC_RETRY": "1"}),
+              patch.object(ai, "diagnose_evidence_gap", return_value=gap) as diagnose,
+              patch("mailsearch.answer.evidence_for", return_value=([duplicate, *new], "keyword")) as search):
+            evidence, _, _, ran = supplemental_evidence(store, ai, question, scope, "", first, "keyword", 2, ceiling=9)
+            self.assertTrue(ran)
+            self.assertEqual(evidence, [*first[:4], *new, first[4]])
+            search.assert_called_once()
+            self.assertEqual(search.call_args.args[3], scope)
+            self.assertEqual(search.call_args.kwargs["sub_queries"], ("A17 양산 BOM",))
+            with patch.dict(os.environ, {"MAILSEARCH_QUERY_REWRITE": "0"}):
+                self.assertEqual(supplemental_evidence(store, ai, question, scope, "", first, "keyword", 2),
+                                 (first, "keyword", (), False))
+                self.assertIsNone(ai.rewrite_query(question))
+            diagnose.assert_called_once()
+
     def test_gateway_gap_diagnosis_transmits_coverage_without_mail_content(self):
         gateway = self.gateway(answer="answer-model-a")
         ai = LocalAI("", embedding_api=gateway)
