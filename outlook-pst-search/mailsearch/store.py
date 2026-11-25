@@ -520,16 +520,18 @@ class MemoryIndex:
         self.generation = 0
 
     @staticmethod
-    def prepare(records):
+    def prepare(records, progress=None):
         records = tuple(sorted(records, key=lambda row: (row.sent, row.id), reverse=True))
         topics, identifiers = defaultdict(list), defaultdict(list)
-        for row in records:
+        for done, row in enumerate(records, 1):
             if row.topic_key:
                 topics[row.topic_key].append(row.id)
             fragments = {fragment for field in (row.metadata_norm, row.body_norm)
                          for fragment in IDENTIFIER_FRAGMENT.findall(field)}
             for fragment in fragments:
                 identifiers[fragment].append(row)
+            if progress and done % 256 == 0:
+                progress(done)
         return records, topics, identifiers
 
     def replace(self, source, prepared):
@@ -727,9 +729,24 @@ class Store:
                                     (source, json.dumps(ids)))
             self.memory_index.extend(source, self.memory_index.prepare(rows))
 
-    def commit_memory_revision(self, conn, source):
-        prepared = self.memory_index.prepare(self.read_memory(conn, " AND s.id=?", (source,)))
+    def commit_memory_revision(self, conn, source, version, report):
+        report("count_memory")
+        total = conn.execute(
+            "SELECT COUNT(*) FROM mails WHERE source=? AND version=?", (source, version),
+        ).fetchone()[0]
+        report("load_memory", 0, total)
+        records = []
+        for done, mail in enumerate(self.read_memory(conn, " AND s.id=?", (source,)), 1):
+            records.append(mail)
+            if done % 256 == 0:
+                report("load_memory", done, total)
+        report("load_memory", len(records), total)
+        report("build_memory", 0, len(records))
+        prepared = self.memory_index.prepare(records, lambda done: report("build_memory", done, len(records)))
+        report("build_memory", len(records), len(records))
+        report("commit")
         with self.memory_index.lock:
+            report("commit")
             conn.commit()
             self.memory_index.replace(source, prepared)
 
