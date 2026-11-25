@@ -734,7 +734,9 @@ function showAnswer(data) {
     if (coverage.split && !coverage.synthesized) box.append(node("p", "나누어 처리한 구간별 답변입니다.", "answer-status"));
     if (coverage.failed) box.append(node("p", "일부 API 호출을 완료하지 못했습니다.", "answer-status"));
     for (const warning of coverage.warnings || []) box.append(node("p", warning, "answer-status"));
-    for (const unknown of data.unknowns || []) box.append(node("p", "확인 필요 · " + unknown, "answer-status"));
+  }
+  for (const unknown of data.unknowns || []) {
+    box.append(node("p", (data.pcf_coverage ? "확인 필요 · " : "해당 범위에서 미확인 · ") + unknown, "answer-status"));
   }
   box.hidden = false;
 }
@@ -768,7 +770,7 @@ async function localAnswer(payload, active) {
       if (active.signal.aborted) return;
       const labels = {
         planning: "질문을 분석하고 있습니다.",
-        retrieving: "근거 " + event.count + "건과 관련 회신을 확인했습니다.",
+        retrieving: (event.pass === 2 ? "추가 검색을 포함해 " : "") + "근거 " + event.count + "건과 관련 회신을 확인했습니다.",
         synthesizing: "로컬 AI가 근거를 정리하고 있습니다.",
         validating: "인용 원문과 수치를 대조하고 있습니다.",
       };
