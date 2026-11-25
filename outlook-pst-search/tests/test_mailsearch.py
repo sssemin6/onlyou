@@ -28,7 +28,7 @@ from mailsearch.answer import (QUERY_EMBEDDING_TIMEOUT, QUERY_REWRITE_TIMEOUT, A
                                evidence_for, latest_thread_decisions, needs_recency_boost, parse_rewrite,
                                reciprocal_rank, rewritten_evidence, validate)
 from mailsearch.embedding import EmbeddingAPI, GatewayRequestError, tls_context, warn_unverified
-from mailsearch.external import ExternalAI, Excerpt, Reviews, pcf_batches
+from mailsearch.external import ExternalAI, Excerpt, Reviews, pack_excerpts, pcf_batches
 from mailsearch.extract import convert_legacy, extract_attachment, extract_bytes
 from mailsearch.filesystem import DRIVE_REMOTE, is_unc_share, local_path, source_path
 from mailsearch.intranet import CHAT_PATH, RERANK_PATH, IntranetAI, LOCAL_EMBEDDING
@@ -38,7 +38,7 @@ from mailsearch.ollama_setup import (InstallCommandError, install_ollama, packag
 from mailsearch.outlook import OutlookError, OutlookStore
 from mailsearch.server import (App, INSTANCE_FILE, SessionLock, existing_origin, gateway_defaults,
                                gateway_diagnostics, main, publish_instance)
-from mailsearch.store import VECTOR_LOOKUP_SQL, Store, contextual_model_key, fingerprint, local_midnight_utc, question_scope, read_signature, sections
+from mailsearch.store import VECTOR_LOOKUP_SQL, Store, contextual_model_key, fingerprint, local_midnight_utc, pack_vector, question_scope, read_signature, sections
 from tools.demo import generate
 
 
@@ -769,8 +769,8 @@ class Integration(unittest.TestCase):
     def test_gateway_indexes_existing_archive_and_searches_with_the_same_backend(self):
         source = self.import_mail()
         with self.store.connection() as conn:
-            conn.execute("UPDATE vectors SET model='bge-m3' WHERE model='metadata-v1:embed'")
-            conn.execute("UPDATE vector_buckets SET model='bge-m3' WHERE model='metadata-v1:embed'")
+            conn.execute("UPDATE vectors SET model='bge-m3' WHERE model=?", (contextual_model_key("embed"),))
+            conn.execute("UPDATE vector_buckets SET model='bge-m3' WHERE model=?", (contextual_model_key("embed"),))
         self.ai.configure_embedding("", EmbeddingAPI("test-key"))
 
         def respond(_method, _path, body, _headers):
@@ -1214,7 +1214,8 @@ class Integration(unittest.TestCase):
         self.app.external = ExternalAI(url, "model", "key")
         query = {"query": "PX-421 검수기록", "filters": {"source": source}}
         legacy = self.call("/api/external/preview", query)[1]
-        self.assertFalse(any(tail in item["text"] for item in legacy["excerpts"]))
+        self.assertLessEqual(len(legacy["excerpts"]), 5)
+        self.assertTrue(all(len(item["text"]) <= 800 and item["context"] is None for item in legacy["excerpts"]))
         with patch.dict(os.environ, MAILSEARCH_INTERNAL_URL=url):
             status, wide = self.call("/api/external/preview", query)
             self.assertEqual(status, 200)
@@ -3005,6 +3006,55 @@ class RAGStability(unittest.TestCase):
         self.assertFalse(needs_recency_boost(question, {"before": "2024-06-01"}))
         self.assertEqual(reciprocal_rank((([draft, approved], 1),), 2, recent=True), [approved, draft])
         self.assertEqual(latest_thread_decisions(question, [draft], [draft, unrelated, approved], 1), [approved])
+
+    def test_contiguous_child_passages_support_cross_boundary_citations(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = Store(root / "index")
+            path = root / "Atlas.txt"
+            quote = "검수기록 " + "가나다라마바사" * 15 + " 시제품에만 적용합니다."
+            original = "A" * 355 + quote + "Z" * 620
+            path.write_text(original, encoding="utf-8")
+            chunks = list(sections(original))
+            self.assertTrue(all(len(text) <= 480 for _, text in chunks))
+            self.assertFalse(any(quote in text for _, text in chunks))
+            with store.connection() as conn:
+                source = conn.execute("INSERT INTO sources(path,kind,active) VALUES(?,'doc_file',1)",
+                                      (str(path),)).lastrowid
+                doc = {"name": path.name, "folder": "", "sent": "", "status": "완료", "sections": [("내용", original)]}
+                mail = store.add_document(conn, source, 1, path.name, doc)
+                anchor = conn.execute("SELECT id FROM passages WHERE mail=? ORDER BY start LIMIT 1 OFFSET 1", (mail,)).fetchone()[0]
+            raw, = store.passages([anchor], {"source": source})
+            window = store.expand_passage_window(raw)
+            self.assertTrue(window["window"])
+            self.assertEqual(window["start"], 0)
+            self.assertEqual(window["text"], original[window["start"]:window["start"] + len(window["text"])])
+            self.assertEqual(store.open_passage(anchor, window=True)["text"], window["text"])
+            result = {"status": "answered", "claims": [{"text": quote, "citations": [{"source": anchor, "quote": quote}]}]}
+            checked = validate(result, [window])
+            self.assertEqual(checked["claims"][0]["citations"][0]["quote"], quote)
+            excerpt, = pack_excerpts("검수기록", [window], 12000)
+            self.assertFalse(excerpt.original_in(raw))
+            self.assertTrue(excerpt.original_in(store.passages([anchor], windows={anchor})[0]))
+
+    def test_legacy_sections_v2_and_metadata_v1_still_search_and_open(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = Store(root / "index")
+            mail = {"subject": "Legacy Atlas", "sender": "", "recipient": "", "sent": "", "folder": "/",
+                    "attachments": [], "message_id": "", "reply_ids": "", "body": "Legacy approval evidence"}
+            with store.connection() as conn:
+                source = conn.execute("INSERT INTO sources(path,kind,active) VALUES(?,'eml_dir',1)", (str(root),)).lastrowid
+                item = store.add_mail(conn, source, 1, "old.eml", mail)
+                conn.execute("UPDATE mails SET fingerprint=? WHERE id=?",
+                             (fingerprint(mail, "old.eml", index_format="sections-v2"), item))
+                passage = conn.execute("SELECT id FROM passages WHERE mail=?", (item,)).fetchone()[0]
+                conn.execute("INSERT INTO vectors VALUES(?,?,?)", (passage, "metadata-v1:embed", pack_vector([1., 0.])))
+                conn.execute("INSERT INTO embedding_revisions VALUES(?,?,?)", (source, 1, "metadata-v1:embed"))
+            reopened = Store(root / "index")
+            self.assertEqual(reopened.lexical("Atlas", {"source": source})[0]["passage"], passage)
+            self.assertEqual(reopened.semantic_contextual([1., 0.], "embed", {})[0]["passage"], passage)
+            self.assertEqual(reopened.open_passage(passage)["text"], mail["body"])
 
     def test_rerank_timeout_and_redacted_fallback_for_80_candidates(self):
         client = self.gateway(rerank="bge-reranker-v2-m3")
