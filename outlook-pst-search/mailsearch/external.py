@@ -332,6 +332,8 @@ class Review:
     internal_budget: int = 0
     review_budget: int = 0
     review_chars: int = 0
+    filters: dict | None = None
+    gap_aspects: tuple[str, ...] = ()
 
 
 class Reviews:
@@ -340,7 +342,7 @@ class Reviews:
         self._lock = threading.Lock()
 
     def create(self, question, rows, generation=None, limit=MAX_EXCERPT_LENGTH, *, pcf=False, case=None,
-               internal_budget=0, review_budget=0, review_chars=0):
+               internal_budget=0, review_budget=0, review_chars=0, filters=None, gap_aspects=()):
         if case is not None:
             excerpts = tuple(Excerpt(n, row["passage"], row["text"]) for n, row in enumerate(rows, 1))
         else:
@@ -352,7 +354,7 @@ class Reviews:
         token = secrets.token_urlsafe(24)
         now = time.monotonic()
         review = Review(now + REVIEW_TTL, question, excerpts, generation, pcf, case,
-                        internal_budget, review_budget, review_chars)
+                        internal_budget, review_budget, review_chars, dict(filters or {}), gap_aspects)
         with self._lock:
             self._pending = {key: value for key, value in self._pending.items() if value.expires > now}
             if len(self._pending) >= 8:
