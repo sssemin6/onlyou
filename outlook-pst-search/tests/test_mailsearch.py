@@ -1872,17 +1872,19 @@ class Integration(unittest.TestCase):
             self.assertEqual(self.call("/api/search", payload)[0], 200)
             self.assertEqual(embed.call_count, 2)
 
-    def test_duplicate_attachment_extraction_is_shared_with_contextual_embeddings(self):
+    def test_fifty_mails_share_one_attachment_embedding_and_keep_their_origins(self):
         folder = Path(self.workspace.name) / "duplicate-attachments"
         folder.mkdir()
         body = "오늘 송부합니다.\n\n> 오래된 검토 98765\n\n새 회신입니다.\n-- \n서명비밀 19573"
         data = "공유 첨부문단 30719".encode()
-        for idx in range(2):
+        copies = 50
+        for idx in range(copies):
             msg = EmailMessage()
             msg["Subject"] = f"Message {idx}"
-            msg["From"] = "local@example.invalid"
+            msg["From"] = f"sender{idx}@example.invalid"
+            msg["Date"] = f"{idx % 28 + 1} {'May' if idx < 28 else 'Jun'} 2026 12:00:00 +0000"
             msg.set_content(body)
-            msg.add_attachment(data, maintype="text", subtype="plain", filename=f"file{idx}.txt")
+            msg.add_attachment(data, maintype="text", subtype="plain", filename="shared.txt")
             (folder / f"mail{idx}.eml").write_bytes(msg.as_bytes())
         from mailsearch.extract import extract_bytes
         with (patch("mailsearch.extract.extract_bytes", wraps=extract_bytes) as extract,
@@ -1891,20 +1893,17 @@ class Integration(unittest.TestCase):
             self.assertEqual(await_source(self.store, source, {"ready", "error"})["state"], "ready")
             extract.assert_called_once()
             inputs = [value for call in embed.call_args_list for value in call.args[0] if value.endswith(data.decode())]
-            self.assertEqual(len(inputs), 2)
-            for idx in range(2):
-                self.assertTrue(any(f"[Message {idx} | local@example.invalid | " in value
-                                    and f"file{idx}.txt" in value for value in inputs))
+            self.assertEqual(inputs, ["[shared.txt | 본문]\n" + data.decode()])
         with self.store.connection() as conn:
-            self.assertEqual(conn.execute("SELECT COUNT(*) FROM embedding_values").fetchone()[0], 2)
-            self.assertEqual(conn.execute("SELECT COUNT(*) FROM embedding_refs").fetchone()[0], 2)
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM embedding_values").fetchone()[0], 1)
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM embedding_refs").fetchone()[0], copies)
             self.assertTrue(all("98765" in row[0] for row in conn.execute("SELECT body FROM mails WHERE source=?", (source,))))
         filters = {"source": source}
         self.assertFalse(self.store.lexical("98765", filters))
         self.assertFalse(self.store.lexical("19573", filters))
-        self.assertEqual(len({row["id"] for row in self.store.lexical("30719", filters)}), 2)
-        rows = self.store.semantic_contextual([1, .05, .12], "embed", filters)
-        self.assertEqual(len({row["attachment"] for row in rows if "30719" in row["text"]}), 2)
+        self.assertEqual(len({row["id"] for row in self.store.lexical("30719", filters)}), copies)
+        rows = self.store.semantic_contextual([1, .05, .12], "embed", filters, limit=4 * copies)
+        self.assertEqual(len({row["id"] for row in rows if row["attachment"] and "30719" in row["text"]}), copies)
 
     def test_http11_reuses_sqlite_on_one_socket(self):
         self.import_mail()
