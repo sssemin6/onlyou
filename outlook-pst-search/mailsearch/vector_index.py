@@ -18,17 +18,24 @@ ACTIVE_SHARDS = "SELECT id,active FROM sources WHERE active IS NOT NULL AND stat
 def prune_vector_files(store, active=None):
     root = store.root / "vectors"
     if not root.is_dir():
-        return
-    try:
-        if active is None:
+        return True
+    if active is None:
+        try:
             with store.connection() as conn:
                 active = dict(conn.execute(ACTIVE_SHARDS))
-        for path in root.glob("*.usearch"):
-            match = SHARD_FILE.fullmatch(path.name)
-            if match and active.get(int(match[1])) != int(match[2]):
+        except sqlite3.Error as exc:
+            logger.warning("Vector shard cleanup deferred (%s)", type(exc).__name__)
+            return False
+    complete = True
+    for path in root.glob("*.usearch"):
+        match = SHARD_FILE.fullmatch(path.name)
+        if match and active.get(int(match[1])) != int(match[2]):
+            try:
                 path.unlink(missing_ok=True)
-    except (OSError, sqlite3.Error) as exc:
-        logger.warning("Vector shard cleanup deferred (%s)", type(exc).__name__)
+            except OSError as exc:
+                complete = False
+                logger.warning("Vector shard cleanup deferred (%s)", type(exc).__name__)
+    return complete
 
 
 class USearchIndex:
@@ -44,6 +51,7 @@ class USearchIndex:
         self.indices = {}
         self.building = set()
         self.failed = {}
+        self.prune_pending = False
         self.stop = Event()
         self.pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="vector-build")
         self.prune()
@@ -66,7 +74,7 @@ class USearchIndex:
             with self.store.connection() as conn:
                 active = dict(conn.execute(ACTIVE_SHARDS))
             self.indices = {key: index for key, index in self.indices.items() if active.get(key[1]) == key[2]}
-            prune_vector_files(self.store, active)
+            self.prune_pending = not prune_vector_files(self.store, active)
 
     def path(self, key):
         model, source, version, dimensions = key
@@ -137,6 +145,14 @@ class USearchIndex:
                 self.building.discard(key)
 
     def candidates(self, conn, vector, model, filters, limit):
+        try:
+            return self.collect_candidates(conn, vector, model, filters, limit)
+        finally:
+            # Windows can keep a retired file locked until a concurrent view is released.
+            if self.prune_pending:
+                self.prune()
+
+    def collect_candidates(self, conn, vector, model, filters, limit):
         wanted = []
         allowed_sources = filters.get("vector_sources")
         for row in conn.execute("""SELECT id,active FROM sources WHERE state<>'removing'
