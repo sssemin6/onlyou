@@ -25,7 +25,8 @@ from types import SimpleNamespace
 from mailsearch.api_settings import ApiSettings, user_dpapi
 from mailsearch.answer import (QUERY_EMBEDDING_TIMEOUT, QUERY_REWRITE_TIMEOUT, AnswerSessions, LocalAI,
                                answer_groups, answer_plan, combine_answer_evidence, delivery_date_answer,
-                               evidence_for, parse_rewrite, rewritten_evidence, validate)
+                               evidence_for, latest_thread_decisions, needs_recency_boost, parse_rewrite,
+                               reciprocal_rank, rewritten_evidence, validate)
 from mailsearch.embedding import EmbeddingAPI, GatewayRequestError, tls_context, warn_unverified
 from mailsearch.external import ExternalAI, Excerpt, Reviews, pcf_batches
 from mailsearch.extract import convert_legacy, extract_attachment, extract_bytes
@@ -2990,6 +2991,20 @@ class RAGStability(unittest.TestCase):
 
     def gateway(self, *, answer="", embedding="", rerank=""):
         return IntranetAI("test-key", {"answer": answer, "embedding": embedding, "rerank": rerank})
+
+    def test_latest_decision_is_retained_without_boosting_historical_questions(self):
+        today = date.today().isoformat()
+        draft = {"passage": 1, "source": 1, "subject": "A17 브래킷", "location": "본문",
+                 "sent": "2024-03-01", "text": "초안 검토 중입니다."}
+        approved = {**draft, "passage": 2, "sent": today, "text": "A17 양산 적용을 승인합니다."}
+        unrelated = {**approved, "passage": 3, "subject": "B23 브래킷"}
+        question = "A17 최종 승인일"
+        self.assertTrue(needs_recency_boost(question, {}))
+        for past in ("A17 2024년 초기안 승인", "A17 승인 타임라인", "A17 지난해 최종 승인"):
+            self.assertFalse(needs_recency_boost(past, {}))
+        self.assertFalse(needs_recency_boost(question, {"before": "2024-06-01"}))
+        self.assertEqual(reciprocal_rank((([draft, approved], 1),), 2, recent=True), [approved, draft])
+        self.assertEqual(latest_thread_decisions(question, [draft], [draft, unrelated, approved], 1), [approved])
 
     def test_rerank_timeout_and_redacted_fallback_for_80_candidates(self):
         client = self.gateway(rerank="bge-reranker-v2-m3")
