@@ -986,6 +986,17 @@ def rewritten_evidence(store, ai, question, filters, context, **options):
     return None
 
 
+def overlaps_evidence_window(row, window):
+    if (not window.get("window") or "start" not in row or row["id"] != window["id"]
+            or row["location"] != window["location"]
+            or row.get("attachment_id", row.get("attachment")) != window.get("attachment_id", window.get("attachment"))):
+        return False
+    start = max(row["start"], window["start"])
+    end = min(row["start"] + len(row["text"]), window["start"] + len(window["text"]))
+    return start < end and (row["text"][start - row["start"]:end - row["start"]]
+                            == window["text"][start - window["start"]:end - window["start"]])
+
+
 def evidence_for(store, ai, question, filters, context, semantic=True, limit=9, expand=False, *, thread_hops=1,
                  max_evidence=None, local_context="", sub_queries=(), keywords=(), check=None, intent=None,
                  allow_rerank=True, embedding_timeout=None):
@@ -1056,29 +1067,25 @@ def evidence_for(store, ai, question, filters, context, semantic=True, limit=9, 
     latest = {evidence_content_key(row): row for row in reserved}
     evidence = dedupe_by_content(latest.get(evidence_content_key(row), row) for row in ordered)[:limit]
     if expand:
-        # Reserve places for matched passages, related replies and their original context.
-        primary = evidence if max_evidence else evidence[:4]
-        expanded = {row["passage"]: row for row in primary}
-        ceiling = max_evidence or max(12, limit)
+        # Use a continuous window around hits and keep separate locations (such as worksheet rows).
         with store.measure("context"):
+            expanded_hits = [store.expand_passage_window(row) if index < 8 and "start" in row else row
+                             for index, row in enumerate(evidence)]
             contexts = [store.evidence_context(row, filters) for row in evidence[:8 if max_evidence else 6]]
+        leading = len(expanded_hits) if max_evidence else min(4, len(expanded_hits))
+        expanded = {row["passage"]: row for row in expanded_hits[:leading]}
+        ceiling = max_evidence or max(12, limit)
         for position in range(3):
             for group in contexts:
                 if position < len(group) and len(expanded) < ceiling:
                     row = group[position]
-                    expanded.setdefault(row["passage"], row)
-        for row in evidence[len(primary):]:
+                    if not any(overlaps_evidence_window(row, window) for window in expanded_hits):
+                        expanded.setdefault(row["passage"], row)
+        for row in expanded_hits[leading:]:
             if len(expanded) == ceiling:
                 break
             expanded.setdefault(row["passage"], row)
-        with store.measure("context"):
-            windows = {}
-            for index, row in enumerate(expanded.values()):
-                if index < 8 and "start" in row:
-                    row = store.expand_passage_window(row)
-                key = (row["id"], row["attachment"], row["location"], row.get("start"), row["text"])
-                windows.setdefault(key, row)
-            evidence = dedupe_by_content(windows.values())
+        evidence = dedupe_by_content(expanded.values())
     return evidence, mode
 
 
