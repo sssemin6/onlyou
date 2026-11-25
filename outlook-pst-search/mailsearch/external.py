@@ -1,4 +1,4 @@
-"""Optional HTTPS generation with explicit review of each outbound request."""
+"""Optional HTTPS generation and review of external requests."""
 import http.client
 import json
 import os
@@ -19,6 +19,8 @@ REVIEW_TTL = 300
 MAX_EXCERPTS = 5
 MAX_EXCERPT_LENGTH = 800
 MAX_INTERNAL_EXCERPTS = 24
+MAX_GATEWAY_EXCERPTS = 32
+MAX_GATEWAY_INPUT_BYTES = 192000
 MAX_PCF_CELLS = 1600
 MAX_PCF_BATCHES = 12
 MAX_RESPONSE = 128 * 1024
@@ -39,17 +41,20 @@ class ExternalRequestError(RuntimeError):
         self.status = status
 
 
-def evidence_chars(profile):
+def evidence_chars(profile, *, extended=False):
     value = os.environ.get(f"MAILSEARCH_{profile}_EVIDENCE_CHARS", "")
-    return int(value) if value in {"4000", "12000", "24000"} else 0
+    if value in {"4000", "12000", "24000"} or (extended and value == "48000"):
+        return int(value)
+    return 0
 
 
-def input_budget(profile, default):
-    chars = evidence_chars(profile)
+def input_budget(profile, default, *, extended=False):
+    maximum = MAX_GATEWAY_INPUT_BYTES if extended else 96000
+    chars = evidence_chars(profile, extended=extended)
     raw = os.environ.get(f"MAILSEARCH_{profile}_INPUT_BYTES")
     if raw is None:
-        return min(96000, 4 * chars + 8192) if chars else default
-    return int(raw) if re.fullmatch(r"[0-9]{4,6}", raw) and 3000 <= int(raw) <= 96000 else 0
+        return min(maximum, 4 * chars + 8192) if chars else default
+    return int(raw) if re.fullmatch(r"[0-9]{4,6}", raw) and 3000 <= int(raw) <= maximum else 0
 
 
 class ExternalAI:
@@ -116,7 +121,9 @@ class ExternalAI:
 
     @property
     def internal_budget(self):
-        if not self.intranet and os.environ.get("MAILSEARCH_INTERNAL_URL") != self.public["destination"]:
+        if self.intranet:
+            return input_budget("INTERNAL", 64000, extended=True)
+        if os.environ.get("MAILSEARCH_INTERNAL_URL") != self.public["destination"]:
             return 0
         return input_budget("INTERNAL", 24000)
 
@@ -126,19 +133,19 @@ class ExternalAI:
 
     @property
     def review_chars(self):
-        return evidence_chars("INTERNAL" if self.internal_budget else "EXTERNAL")
+        return evidence_chars("INTERNAL" if self.internal_budget else "EXTERNAL", extended=self.intranet)
 
     def answer_pcf(self, content):
         return self.complete(PCF_WORD_INSTRUCTIONS, compact_json(content), token_limit=2800, timeout=90)
 
-    def answer(self, question, excerpts, instructions=ANSWER_INSTRUCTIONS, token_limit=None, timeout=35):
+    def answer(self, question, excerpts, instructions=ANSWER_INSTRUCTIONS, token_limit=None, timeout=None):
         messages = evidence_payload(question, excerpts)
         if any(item.context for item in excerpts):
-            instructions += "\ncontext 필드는 사용자가 검토한 원문 위치와 메일 정보다. 발신자가 인용된 타인의 발언을 했다고 추정하지 않는다."
+            instructions += "\ncontext 필드는 원문 위치와 메일 정보다. 발신자가 인용된 타인의 발언을 했다고 추정하지 않는다."
 
         result = self.complete(instructions + JSON_INSTRUCTIONS, compact_json(messages),
                                token_limit=token_limit or (2800 if self.host == "api.openai.com" else 1500),
-                               timeout=timeout)
+                               timeout=(60 if self.intranet else 35) if timeout is None else timeout)
         return map_citations(result, {item.number: item.passage for item in excerpts})
 
     def test(self):
@@ -272,7 +279,8 @@ def prioritized_excerpts(rows, extended):
     return primary + remaining
 
 
-def pack_excerpts(question, rows, budget=0, *, with_context=False, chars=0, limit=MAX_EXCERPT_LENGTH):
+def pack_excerpts(question, rows, budget=0, *, with_context=False, chars=0, limit=MAX_EXCERPT_LENGTH,
+                  max_excerpts=MAX_INTERNAL_EXCERPTS):
     if not budget:
         return tuple(Excerpt(number, row["passage"], text[:limit], start=offset,
                              window_start=row["start"] if row.get("window") else None)
@@ -294,7 +302,7 @@ def pack_excerpts(question, rows, budget=0, *, with_context=False, chars=0, limi
         decision = next((match for pattern in EVENT_SIGNALS if (match := pattern.search(text))), None)
         if decision:
             focus = decision.start()
-        remaining = min(4, len(candidates) - position - 1, MAX_INTERNAL_EXCERPTS - len(items) - 1)
+        remaining = min(4, len(candidates) - position - 1, max_excerpts - len(items) - 1)
         room = min(len(text), max(0, chars - chars_used - 120 * remaining)) if chars else len(text)
         available = budget - (500 if with_context else 330) * remaining
 
@@ -316,7 +324,7 @@ def pack_excerpts(question, rows, budget=0, *, with_context=False, chars=0, limi
         if candidate and len(candidate.text) >= min(100, len(text)):
             items.append(candidate)
             chars_used += len(candidate.text)
-        if len(items) == MAX_INTERNAL_EXCERPTS or (chars and chars_used >= chars):
+        if len(items) == max_excerpts or (chars and chars_used >= chars):
             break
     return tuple(items)
 
@@ -342,13 +350,14 @@ class Reviews:
         self._lock = threading.Lock()
 
     def create(self, question, rows, generation=None, limit=MAX_EXCERPT_LENGTH, *, pcf=False, case=None,
-               internal_budget=0, review_budget=0, review_chars=0, filters=None, gap_aspects=()):
+               internal_budget=0, review_budget=0, review_chars=0, filters=None, gap_aspects=(),
+               max_excerpts=MAX_INTERNAL_EXCERPTS):
         if case is not None:
             excerpts = tuple(Excerpt(n, row["passage"], row["text"]) for n, row in enumerate(rows, 1))
         else:
             review_budget = review_budget or internal_budget
             excerpts = pack_excerpts(question, rows, review_budget, with_context=bool(internal_budget),
-                                     chars=review_chars, limit=limit)
+                                     chars=review_chars, limit=limit, max_excerpts=max_excerpts)
         if not excerpts:
             return None, None
         token = secrets.token_urlsafe(24)
