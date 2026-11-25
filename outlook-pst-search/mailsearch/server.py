@@ -785,6 +785,7 @@ class Handler(BaseHTTPRequestHandler):
                 evidence, mode, gap_aspects, _ = supplemental_evidence(
                     store, ai, query, filters, context, evidence, mode, query_count,
                     ceiling=32 if budget else 9, expand=bool(budget),
+                    review_slots=None if budget else MAX_EXCERPTS,
                 )
         if route in {"/api/external/preview", "/api/pcf/preview"}:
             with store.measure("context"):
