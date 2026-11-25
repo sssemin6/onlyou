@@ -63,6 +63,8 @@ const issueNames = {
   api_settings_save_failed: "설정을 저장하지 못했습니다. 앱 데이터 폴더에 쓸 수 있는지 확인하세요.",
   embedding_api_key: "사내 API 키에 공백이 있는지 확인하세요.",
   external_disabled: "상단의 API 설정에서 답변에 사용할 AI를 연결해 주세요.",
+  intranet_answer_disabled: "사내 API 즉시 답변을 사용하려면 사내 답변 모델을 선택해 주세요.",
+  intranet_budget: "사내 API의 입력 한도를 3,000~192,000바이트로 설정해 주세요.",
   external_url: "HTTPS 주소를 확인하세요. 주소는 /chat/completions 또는 /messages로 끝나야 합니다.",
   external_model: "제공자에서 안내한 모델명을 입력하세요.",
   external_key: "API 키에 공백이 있는지 확인하세요.",
@@ -71,7 +73,7 @@ const issueNames = {
   external_test_endpoint: "요청이 거부되었습니다. 주소, 모델명, JSON 모드 지원 여부를 확인하세요.",
   external_test_limit: "제공자의 요청 한도 또는 잔액을 확인하세요.",
   external_test_failed: "연결 테스트에 실패했습니다. 네트워크와 제공자의 응답을 확인하세요.",
-  external_busy: "외부 API가 다른 질문을 처리하고 있습니다. 잠시 후 다시 시도하세요.",
+  external_busy: "답변 API가 다른 질문을 처리하고 있습니다. 잠시 후 다시 시도하세요.",
   external_review_expired: "전송 검토가 만료되었습니다. 질문을 다시 실행해 주세요.",
   external_source_changed: "검토한 자료가 변경되었거나 원본에 접근할 수 없습니다. 질문을 다시 실행해 주세요.",
   source_path: "경로를 열 수 없습니다. 공유 폴더라면 파일 탐색기에서 연결 상태와 경로를 확인하세요.",
@@ -97,6 +99,7 @@ let previousQuestion = "";
 let localConversation = "";
 let localAnswerAvailable = false;
 let externalAnswerAvailable = false;
+let intranetAnswerAvailable = false;
 let request;
 let pendingReview;
 let sourceSnapshot = "";
@@ -117,7 +120,7 @@ function selectTab(value) {
     setQuestionContext("");
   }
   activeTab = value;
-  showLocalControls();
+  showAnswerControls();
   for (const [id, tab] of TABS) {
     element(id).classList.toggle("active", value === tab);
     element(id).setAttribute("aria-selected", String(value === tab));
@@ -173,10 +176,12 @@ async function call(route, data, signal) {
   return body;
 }
 
-function showLocalControls() {
+function showAnswerControls() {
   const enabled = localAnswerAvailable && activeTab !== "pcf";
   element("local-conversation").hidden = !enabled;
   element("submit-local-answer").hidden = !enabled;
+  element("submit-ask-label").textContent = intranetAnswerAvailable && activeTab !== "pcf"
+    ? "사내 AI 답변" : "AI 근거 찾기";
 }
 
 async function streamAnswer(payload, signal, progress) {
@@ -513,7 +518,8 @@ async function showSources() {
   const modelStatus = element("model-status");
   localAnswerAvailable = Boolean(data.model);
   externalAnswerAvailable = Boolean(data.external);
-  showLocalControls();
+  intranetAnswerAvailable = Boolean(data.intranet_answer);
+  showAnswerControls();
   modelStatus.parentElement.dataset.configured = Boolean(data.embedding);
   if (data.embedding_endpoint) {
     modelStatus.textContent = "사내 API 의미 검색 · " + data.embedding;
@@ -703,7 +709,8 @@ function showResults(rows, title, emptyMessage = "이 범위에서 일치하는 
 function showAnswer(data) {
   const box = element("answer");
   const statuses = {
-    answered: "선택한 근거로 찾은 답변", partial: "일부 근거만 확인했습니다",
+    answered: data.provider === "intranet" ? "원문 근거로 찾은 답변" : "선택한 근거로 찾은 답변",
+    partial: "일부 근거만 확인했습니다",
     ambiguous: data.claims.length ? "근거에 서로 다른 내용이 있습니다. 각 원문을 확인해 주세요." : "여러 건이 해당합니다. 품번이나 기간을 질문에 추가해 주세요.",
     insufficient: "검색된 자료에서 답을 확인하지 못했습니다.",
     model_busy: "로컬 AI가 다른 질문을 처리 중입니다. 잠시 후 다시 시도하세요.",
@@ -711,7 +718,7 @@ function showAnswer(data) {
     model_not_configured: "로컬 AI 모델을 연결하면 근거를 바탕으로 답변할 수 있습니다.",
     model_unavailable: "로컬 AI 모델을 열지 못했습니다. 아래 메일을 직접 확인할 수 있습니다.",
     index_unavailable: issueNames.index_unavailable,
-    external_unavailable: "외부 API 응답을 받지 못했습니다. 연결 주소, 키, 모델, 네트워크를 확인하세요.",
+    external_unavailable: "답변 API 응답을 받지 못했습니다. 연결 주소, 키, 모델, 네트워크를 확인하세요.",
   };
   const heading = node("h2", "AI 답변");
   box.replaceChildren(heading, node("p", statuses[data.status] || "", "answer-status"));
@@ -900,6 +907,13 @@ form.addEventListener("submit", async (event) => {
   try {
     if (!pcf && (intent === "local-answer" || (ask && localAnswerAvailable && !externalAnswerAvailable))) {
       await localAnswer(payload, active);
+    } else if (ask && !pcf && intranetAnswerAvailable) {
+      const data = await call("/api/intranet/answer", payload, active.signal);
+      if (active.signal.aborted) return;
+      showAnswer(data);
+      if (data.status !== "external_unavailable") showResults(data.results, "사용한 근거");
+      rememberQuestion(data, query);
+      notice("");
     } else if (ask) {
       await previewAnswer(pcf ? "/api/pcf/preview" : "/api/external/preview", payload, active, pcf);
     } else {
