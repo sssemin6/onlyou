@@ -162,7 +162,7 @@ SYNONYMS = {
 
 
 def contextual_model_key(model):
-    return "metadata-v1:" + model if model else ""
+    return "metadata-v2:" + model if model else ""
 
 
 def now():
@@ -350,7 +350,7 @@ def topic_key(subject):
     return re.sub(r"\s+", " ", subject)
 
 
-MAIL_INDEX_FORMAT = "sections-v2"
+MAIL_INDEX_FORMAT = "sections-v3"
 ACCESS_CHECK_TIMEOUT = .35
 MAX_ACCESS_CHECKS = 8
 
@@ -419,18 +419,36 @@ def document_readable(source_path, item):
         return False
 
 
-def sections(text, size=1100):
+def sections(text, size=480, *, overlap=80):
+    if not 0 <= overlap < size:
+        raise ValueError("section_overlap")
     position = 0
     while position < len(text):
         end = min(len(text), position + size)
         if end < len(text):
-            boundary = max(text.rfind("\n", position + 500, end), text.rfind(" ", position + 500, end))
-            if boundary > position:
-                end = boundary + 1
+            floor = position + max(overlap + 1, size // 2)
+            for separator in ("\r\n\r\n", "\n\n", "\n", " "):
+                boundary = text.rfind(separator, floor, end)
+                if boundary != -1:
+                    end = boundary + len(separator)
+                    break
         yield position, text[position:end]
         if end == len(text):
             break
-        position = end - 120
+        position = end - overlap
+
+
+def merge_contiguous_passages(left, right):
+    """Join by absolute offset when the available raw overlap agrees."""
+    start, text = left
+    next_start, next_text = right
+    offset = next_start - start
+    if offset <= 0 or offset > len(text):
+        return None
+    overlap = min(len(text) - offset, len(next_text))
+    if text[offset:offset + overlap] != next_text[:overlap]:
+        return None
+    return start, text + next_text[overlap:]
 
 
 REPLY_START = re.compile(
@@ -1157,7 +1175,7 @@ class Store:
         cursor = conn.execute(
             """INSERT INTO mails(source,version,item,fingerprint,folder,subject,sender,recipient,sent,message_id,topic,body,kind)
                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (source, version, item, fingerprint(mail, item, index_format=None), doc["folder"], doc["name"], "", "",
+            (source, version, item, fingerprint(mail, item), doc["folder"], doc["name"], "", "",
              doc["sent"], "", topic_key(doc["name"]), "",
              document_kind(doc["name"])),
         )
@@ -1184,7 +1202,8 @@ class Store:
             if is_pcf:
                 offsets.extend(match.start(1) for match in COMMENT_HEADER.finditer(text) if match.start(1))
             for begin, end in zip(offsets, [*offsets[1:], len(text)]):
-                for start, segment in sections(text[begin:end]):
+                chunks = sections(text[begin:end], 1100, overlap=120) if is_pcf else sections(text[begin:end])
+                for start, segment in chunks:
                     self.add_passage(conn, mail_id, mail, attachment_id, doc["name"], location, begin + start, segment)
         self.add_quick_terms(conn, mail_id, mail)
         return mail_id
@@ -1514,24 +1533,28 @@ class Store:
     def semantic_contextual(self, values, model, filters, limit=40, *, min_similarity=.28):
         """Use one input format per archive; keep legacy searches during migration."""
         contextual = contextual_model_key(model)
+        previous = "metadata-v1:" + model
         source = filters.get("source")
         with self.connection() as conn:
             archives = conn.execute(
-                """SELECT s.id,r.model FROM sources s LEFT JOIN embedding_revisions r
-                   ON r.source=s.id AND r.version=coalesce(s.active,s.pending) AND r.model=?
+                """SELECT s.id,coalesce(current.model,legacy.model,?) model
+                   FROM sources s LEFT JOIN embedding_revisions current
+                   ON current.source=s.id AND current.version=coalesce(s.active,s.pending) AND current.model=?
+                   LEFT JOIN embedding_revisions legacy
+                   ON legacy.source=s.id AND legacy.version=coalesce(s.active,s.pending) AND legacy.model=?
                    WHERE (? IS NULL OR s.id=?) AND (s.active IS NOT NULL OR s.pending IS NOT NULL)""",
-                (contextual, source, source),
+                (model, contextual, previous, source, source),
             ).fetchall()
-        modern = [row["id"] for row in archives if row["model"]]
-        legacy = [row["id"] for row in archives if not row["model"]]
-        if not modern or not legacy:
-            return self.semantic(values, contextual if modern else model, filters, limit, min_similarity=min_similarity)
-        current = self.semantic(values, contextual, {**filters, "vector_sources": modern},
-                                limit, min_similarity=min_similarity)
-        previous = self.semantic(values, model, {**filters, "vector_sources": legacy},
-                                 limit, min_similarity=min_similarity)
-        # Scores from different input formats are not directly comparable.
-        return [row for pair in zip_longest(current, previous) for row in pair if row is not None][:limit]
+        partitions = {key: [] for key in (contextual, previous, model)}
+        for row in archives:
+            partitions[row["model"]].append(row["id"])
+        partitions = {key: ids for key, ids in partitions.items() if ids}
+        if len(partitions) == 1:
+            return self.semantic(values, next(iter(partitions)), filters, limit, min_similarity=min_similarity)
+        pools = [self.semantic(values, key, {**filters, "vector_sources": ids}, limit, min_similarity=min_similarity)
+                 for key, ids in partitions.items()]
+        # Use ranks across formats because their similarity scores are not interchangeable.
+        return [row for group in zip_longest(*pools) for row in group if row is not None][:limit]
 
     def semantic(self, values, model, filters, limit=40, *, min_similarity=.28):
         vector = vector_array(pack_vector(values))
@@ -1586,12 +1609,12 @@ class Store:
             return "usearch(int8)"
         return "sqlite+numpy" if optional_numpy() is not None else "sqlite(pure-python)"
 
-    def passages(self, passages, filters=None, conn=None, *, checked=False):
+    def passages(self, passages, filters=None, conn=None, *, checked=False, windows=()):
         if not passages:
             return []
         if conn is None:
             with self.connection() as conn:
-                return self.passages(passages, filters, conn, checked=checked)
+                return self.passages(passages, filters, conn, checked=checked, windows=windows)
         where, params = self.scope(filters or {})
         rows = conn.execute(
             f"""SELECT {MAIL_COLUMNS},p.id passage,p.text,p.location,p.start,a.name attachment
@@ -1601,7 +1624,9 @@ class Store:
                 WHERE {where}""",
             (json.dumps(passages), *params),
         )
-        return [dict(row) for row in rows] if checked else self.visible_rows(rows)
+        visible = [dict(row) for row in rows] if checked else self.visible_rows(rows)
+        return [self.expand_passage_window(row, conn=conn) if row["passage"] in windows else row
+                for row in visible] if windows else visible
 
     def reply_links(self, mails):
         if not mails:
@@ -1691,6 +1716,41 @@ class Store:
             found = {row["passage"]: row for row in self.passages(picked, filters, conn)}
         return [found[item] for item in picked if item in found][:6]
 
+    def expand_passage_window(self, row, *, max_chars=1400, conn=None):
+        """Expand a visible passage within the same original part."""
+        if (row.get("kind") == "pcf" or row["location"] in {"파일명", "제목"} or row.get("window")
+                or "start" not in row or len(row["text"]) >= max_chars):
+            return row
+        if conn is None:
+            with self.connection() as conn:
+                return self.expand_passage_window(row, max_chars=max_chars, conn=conn)
+        anchor = row["passage"]
+        base = """SELECT start,text FROM passages WHERE mail=? AND location=? AND attachment IS
+                  (SELECT attachment FROM passages WHERE id=?) AND id"""
+        params = (row["id"], row["location"], anchor, anchor)
+        left = conn.execute(base + "<? ORDER BY id DESC LIMIT 4", params).fetchall()
+        right = conn.execute(base + ">? ORDER BY id LIMIT 4", params).fetchall()
+        window = (row["start"], row["text"])
+        right_start = row["start"]
+        extend_left = extend_right = True
+        for before, after in zip_longest(left, right):
+            if before is not None and extend_left:
+                merged = merge_contiguous_passages(tuple(before), window)
+                if merged and len(merged[1]) <= max_chars:
+                    window = merged
+                else:
+                    extend_left = False
+            if after is not None and extend_right:
+                merged = merge_contiguous_passages(window, tuple(after)) if after["start"] > right_start else None
+                if merged and len(merged[1]) <= max_chars:
+                    window = merged
+                    right_start = after["start"]
+                else:
+                    extend_right = False
+        if window == (row["start"], row["text"]):
+            return row
+        return {**row, "start": window[0], "text": window[1], "window": True}
+
     def evidence_context(self, row, filters):
         """Fetch reviewable context from the same mail part or worksheet."""
         location = row["location"]
@@ -1731,7 +1791,7 @@ class Store:
         near = ids[max(0, index - 1):index] + ids[index + 1:index + 2]
         return self.passages(near, conn=conn) if near else []
 
-    def open_passage(self, passage):
+    def open_passage(self, passage, *, window=False):
         where, params = self.scope({})
         with self.connection() as conn:
             row = conn.execute(
@@ -1742,6 +1802,8 @@ class Store:
             if row is None or not self.result_access(row, {}, {}, refresh=True):
                 return None
             result = dict(row)
+            if window:
+                result = self.expand_passage_window(result, conn=conn)
             result["attachments"] = [dict(item) for item in conn.execute(
                 """SELECT a.id,a.name,a.status,(SELECT min(id) FROM passages WHERE attachment=a.id AND location<>'파일명') passage
                    FROM attachments a WHERE a.mail=? ORDER BY a.id""", (row["id"],)
