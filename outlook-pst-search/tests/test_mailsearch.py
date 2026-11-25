@@ -23,13 +23,14 @@ from pathlib import Path, PureWindowsPath
 from types import SimpleNamespace
 
 from mailsearch.api_settings import ApiSettings, user_dpapi
-from mailsearch.answer import (AnswerSessions, LocalAI, answer_groups, answer_plan, combine_answer_evidence,
-                               delivery_date_answer, evidence_for, parse_rewrite, validate)
+from mailsearch.answer import (QUERY_EMBEDDING_TIMEOUT, QUERY_REWRITE_TIMEOUT, AnswerSessions, LocalAI,
+                               answer_groups, answer_plan, combine_answer_evidence, delivery_date_answer,
+                               evidence_for, parse_rewrite, rewritten_evidence, validate)
 from mailsearch.embedding import EmbeddingAPI, GatewayRequestError, tls_context, warn_unverified
 from mailsearch.external import ExternalAI, Excerpt, Reviews, pcf_batches
 from mailsearch.extract import convert_legacy, extract_attachment, extract_bytes
 from mailsearch.filesystem import DRIVE_REMOTE, is_unc_share, local_path, source_path
-from mailsearch.intranet import CHAT_PATH, IntranetAI, LOCAL_EMBEDDING
+from mailsearch.intranet import CHAT_PATH, RERANK_PATH, IntranetAI, LOCAL_EMBEDDING
 from mailsearch.indexer import ImportIssue, Indexer
 from mailsearch.ollama_setup import (InstallCommandError, install_ollama, package_progress,
                                     pull_model, run_install_command, winget_binary)
@@ -173,9 +174,15 @@ class Integration(unittest.TestCase):
                     value = {"results": [{"index": i, "relevance_score": i}
                                          for i in range(data["top_n"])]}
                 else:
-                    self.assertEqual(path, "/v1/chat/completions")
-                    self.assertEqual(model, "answer-model-a")
-                    content = '```json\n{"ok": true}\n```'
+                    self.assertEqual(path, CHAT_PATH)
+                    if data["max_tokens"] == 384:
+                        self.assertIn(model, ("answer-model-a", "answer-model-b"))
+                        question = json.loads(data["messages"][1]["content"])
+                        self.assertEqual(set(question), {"question", "today"})
+                        content = '{"sub_queries":["A-17 납기"],"keywords":["A-17"],"filters":{}}'
+                    else:
+                        self.assertEqual(model, "answer-model-a")
+                        content = '```json\n{"ok": true}\n```'
                     value = {"choices": [{"message": {"content": content}, "finish_reason": "stop"}]}
                 response.read.return_value = json.dumps(value).encode()
 
@@ -195,7 +202,8 @@ class Integration(unittest.TestCase):
             self.assertEqual((preview["destination"], preview["model"]), (CHAT_URL, "answer-model-a"))
             self.assertTrue(preview["excerpts"])
             self.assertIn("/v1/rerank", [args.args[1] for args in request.call_args_list])
-            self.assertNotIn("/v1/chat/completions", [args.args[1] for args in request.call_args_list])
+            rewrite, = [json.loads(call.args[2]) for call in request.call_args_list if call.args[1] == CHAT_PATH]
+            self.assertEqual((rewrite["model"], rewrite["max_tokens"]), ("answer-model-a", 384))
             request.reset_mock()
             status, _ = self.call("/api/intranet/settings", {"action": "apply", "selections": {
                 **selections, "answer": "answer-model-b"}})
@@ -207,6 +215,8 @@ class Integration(unittest.TestCase):
             status, new_review = self.call("/api/external/preview", query)
             self.assertEqual(status, 200)
             self.assertEqual(new_review["model"], "answer-model-b")
+            rewrite, = [json.loads(call.args[2]) for call in request.call_args_list if call.args[1] == CHAT_PATH]
+            self.assertEqual((rewrite["model"], rewrite["max_tokens"]), ("answer-model-b", 384))
             request.reset_mock(side_effect=True)
             response.read.return_value = json.dumps({"choices": [{"message": {
                 "content": '{"status":"insufficient","claims":[]}'
@@ -2969,6 +2979,98 @@ class ApiSettingsPersistence(unittest.TestCase):
         encrypted = user_dpapi(secret)
         self.assertNotIn(secret, encrypted)
         self.assertEqual(user_dpapi(encrypted, decrypt=True), secret)
+
+
+class RAGStability(unittest.TestCase):
+    def setUp(self):
+        self.enterContext(patch.dict(os.environ, {
+            **GATEWAY_ENV, "MAILSEARCH_QUERY_REWRITE": "1", "MAILSEARCH_QUERY_REWRITE_MODEL": "",
+            "MAILSEARCH_GATEWAY_REWRITE_MODEL": "",
+        }))
+
+    def gateway(self, *, answer="", embedding="", rerank=""):
+        return IntranetAI("test-key", {"answer": answer, "embedding": embedding, "rerank": rerank})
+
+    def test_rerank_timeout_and_redacted_fallback_for_80_candidates(self):
+        client = self.gateway(rerank="bge-reranker-v2-m3")
+        ai = LocalAI("", embedding_api=client)
+        rows = [{"subject": "Private email subject", "text": "Private email body"} for _ in range(80)]
+        with (patch.object(client, "request", side_effect=TimeoutError("Private failure details")) as request,
+              self.assertLogs("mailsearch.runtime", "WARNING") as logs):
+            self.assertIs(ai.rerank_candidates("Private query", rows, limit=80), rows)
+        path, payload, timeout = request.call_args.args
+        self.assertEqual((path, payload["top_n"], len(payload["documents"]), timeout), (RERANK_PATH, 80, 80, 15))
+        self.assertEqual([record.getMessage() for record in logs.records], ["Rerank skipped (docs=80, error=TimeoutError)"])
+
+    def test_gateway_only_rewrite_uses_small_budget_and_falls_back_on_timeout(self):
+        gateway = self.gateway(answer="answer-model-a")
+        ai = LocalAI("", embedding_api=gateway)
+        self.assertIsNotNone(gateway.answer_client)
+        self.assertFalse(ai.embedding_index)
+        question = "Atlas A17 승인과 BOM 비교"
+        raw = {"sub_queries": ["Atlas 승인", "Atlas BOM"], "keywords": ["A17"], "filters": {}}
+        reply = {"choices": [{"message": {"content": "```json\n" + json.dumps(raw) + "\n```"}}]}
+        with (patch.object(ai, "ensure_model", side_effect=AssertionError("No local model")),
+              patch.object(gateway, "request", return_value=reply) as request):
+            plan = ai.rewrite_query(question)
+            self.assertEqual(plan.sub_queries, ("A17 Atlas 승인", "A17 Atlas BOM"))
+            path, payload, timeout = request.call_args.args
+            self.assertEqual((path, payload["model"], payload["max_tokens"]), (CHAT_PATH, "answer-model-a", 384))
+            self.assertTrue(0 < timeout <= QUERY_REWRITE_TIMEOUT)
+            self.assertEqual(set(json.loads(payload["messages"][1]["content"])), {"question", "today"})
+            request.reset_mock()
+            with patch.dict(os.environ, {"MAILSEARCH_QUERY_REWRITE": "0"}):
+                self.assertIsNone(ai.rewrite_query(question))
+            request.assert_not_called()
+            request.side_effect = TimeoutError
+            self.assertIsNone(rewritten_evidence(MagicMock(spec=Store), ai, question, {}, ""))
+            request.assert_called_once()
+        with patch.dict(os.environ, {"MAILSEARCH_GATEWAY_REWRITE_MODEL": "lightweight-rewrite"}):
+            override = self.gateway(embedding="bge-m3")
+        with patch.object(override, "request", return_value=reply) as request:
+            self.assertEqual(LocalAI("", embedding_api=override).rewrite_query(question), plan)
+            self.assertEqual(request.call_args.args[1]["model"], "lightweight-rewrite")
+
+    def test_three_subqueries_use_one_batch_and_reuse_the_cached_vectors(self):
+        client = self.gateway(embedding="bge-m3")
+        ai = LocalAI("", embedding_api=client)
+        store = MagicMock(spec=Store)
+        hit = dict(id=1, passage=1, text="Atlas evidence", fingerprint="1", attachment=None, location="본문")
+        store.lexical.return_value = []
+        store.semantic_contextual.return_value = [hit]
+        store.related.return_value = []
+        queries = ("Atlas 승인", "Atlas BOM", "Atlas 누락")
+
+        with patch.object(client, "embed", return_value=[[1, 0], [0, 1], [1, 1]]) as embed:
+            for _ in range(2):
+                self.assertEqual(evidence_for(store, ai, "Atlas 종합", {}, "", sub_queries=queries), ([hit], "hybrid"))
+            embed.assert_called_once_with(list(queries), QUERY_EMBEDDING_TIMEOUT)
+            self.assertEqual([call.args[0] for call in store.semantic_contextual.call_args_list[:3]],
+                             [[1, 0], [0, 1], [1, 1]])
+        with patch.object(client, "embed", side_effect=TimeoutError) as embed:
+            revised = (queries[0], "Atlas 일정", "Atlas 발신자")
+            store.lexical.return_value = [hit]
+            self.assertEqual(evidence_for(store, ai, "Atlas 종합", {}, "", sub_queries=revised), ([hit], "keyword_only"))
+            embed.assert_called_once_with(list(revised[1:]), QUERY_EMBEDDING_TIMEOUT)
+
+    def test_related_passages_prioritize_keyword_count_and_use_decisions_for_ties(self):
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory)
+            store = Store(folder / "index")
+            mail = {"subject": "Atlas project", "sender": "", "recipient": "", "sent": "", "folder": "/",
+                    "attachments": [], "message_id": "<seed@example.invalid>", "reply_ids": "", "body": "질문입니다."}
+            with store.connection() as conn:
+                source = conn.execute("INSERT INTO sources(path,kind,active) VALUES(?,'eml_dir',1)", (str(folder),)).lastrowid
+                seed = store.add_mail(conn, source, 1, "seed.eml", mail)
+                reply = {**mail, "message_id": "<reply@example.invalid>", "reply_ids": mail["message_id"],
+                         "body": "검토 부탁드립니다."}
+                reply_id = store.add_mail(conn, source, 1, "reply.eml", reply)
+                store.add_passage(conn, reply_id, reply, None, "", "본문", 20, "Atlas bracket torque 값은 12 N·m입니다.")
+                store.add_passage(conn, reply_id, reply, None, "", "본문", 80, "Atlas bracket 승인 회신입니다.")
+            rows = store.related([seed], {}, question="Atlas bracket torque")
+            self.assertEqual([row["start"] for row in rows], [20, 80])
+            rows = store.related([seed], {}, question="Atlas bracket")
+            self.assertEqual([row["start"] for row in rows], [80, 20])
 
 
 class GatewayTLS(unittest.TestCase):
