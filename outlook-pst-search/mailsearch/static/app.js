@@ -574,7 +574,7 @@ async function downloadAttachment(attachment, button, status) {
 }
 
 let viewerRequest = 0;
-async function openEvidence(id, quote) {
+async function openEvidence(id, quote, window = false) {
   const version = ++viewerRequest;
   const dialog = element("viewer");
   element("viewer-title").textContent = "원문";
@@ -582,7 +582,7 @@ async function openEvidence(id, quote) {
   body.replaceChildren(node("p", "원문을 여는 중입니다."));
   if (!dialog.open) dialog.showModal();
   try {
-    const item = await call("/api/evidence/" + id);
+    const item = await call("/api/evidence/" + id + (window ? "?window=1" : ""));
     if (version !== viewerRequest || !dialog.open) return;
     element("viewer-title").textContent = item.subject || "제목 없는 메일";
     dialog.scrollTop = 0;
@@ -723,7 +723,7 @@ function showAnswer(data) {
       cite.type = "button";
       cite.title = ref.quote;
       cite.setAttribute("aria-label", "근거 " + count + " · " + ref.subject);
-      cite.addEventListener("click", () => openEvidence(ref.passage, ref.quote));
+      cite.addEventListener("click", () => openEvidence(ref.passage, ref.quote, ref.window));
       paragraph.append(cite);
     }
     box.append(paragraph);
@@ -833,7 +833,7 @@ function showReview(data, pcf) {
     label.append(checkbox, node("span", title.subject + " · " + title.location));
     const original = node("button", "원문 보기", "text-button");
     original.type = "button";
-    original.addEventListener("click", () => openEvidence(title.passage));
+    original.addEventListener("click", () => openEvidence(title.passage, null, title.window));
     card.append(label, original);
     if (excerpt.context) {
       const { subject, sender, sent, attachment, location } = excerpt.context;
