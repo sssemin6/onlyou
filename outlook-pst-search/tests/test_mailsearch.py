@@ -3291,11 +3291,19 @@ class RAGStability(unittest.TestCase):
             search.assert_called_once()
             self.assertEqual(search.call_args.args[3], scope)
             self.assertEqual(search.call_args.kwargs["sub_queries"], ("A17 양산 BOM",))
+            preview, _, _, _ = supplemental_evidence(
+                store, ai, question, scope, "", first, "keyword", 2, ceiling=9, review_slots=5,
+            )
+            self.assertEqual(preview[:5], [*first[:3], *new[:2]])
+            search.assert_called_with(store, ai, question, scope, "", sub_queries=("A17 양산 BOM",),
+                                      limit=9, semantic=True, expand=True, max_evidence=12,
+                                      check=unittest.mock.ANY, allow_rerank=False, embedding_timeout=unittest.mock.ANY)
             with patch.dict(os.environ, {"MAILSEARCH_QUERY_REWRITE": "0"}):
                 self.assertEqual(supplemental_evidence(store, ai, question, scope, "", first, "keyword", 2),
                                  (first, "keyword", (), False))
                 self.assertIsNone(ai.rewrite_query(question))
-            diagnose.assert_called_once()
+            self.assertEqual(diagnose.call_count, 2)
+            self.assertEqual(search.call_count, 2)
 
     def test_gateway_gap_diagnosis_transmits_coverage_without_mail_content(self):
         gateway = self.gateway(answer="answer-model-a")
