@@ -350,7 +350,8 @@ def topic_key(subject):
     return re.sub(r"\s+", " ", subject)
 
 
-MAIL_INDEX_FORMAT = "sections-v3"
+MAIL_INDEX_FORMAT = "sections-v4"
+MAIL_INDEX_PREFIXES = (f"{MAIL_INDEX_FORMAT}:", "sections-v3:", "sections-v2:")
 ACCESS_CHECK_TIMEOUT = .35
 MAX_ACCESS_CHECKS = 8
 
@@ -419,7 +420,7 @@ def document_readable(source_path, item):
         return False
 
 
-def sections(text, size=480, *, overlap=80):
+def sections(text, size=1100, *, overlap=120):
     if not 0 <= overlap < size:
         raise ValueError("section_overlap")
     position = 0
@@ -438,17 +439,24 @@ def sections(text, size=480, *, overlap=80):
         position = end - overlap
 
 
-def merge_contiguous_passages(left, right):
-    """Join by absolute offset when the available raw overlap agrees."""
-    start, text = left
-    next_start, next_text = right
-    offset = next_start - start
-    if offset <= 0 or offset > len(text):
+def merge_contiguous_passages(rows):
+    """Merge original offset/text pairs whose ranges touch and overlap agrees."""
+    pairs = iter(rows)
+    first = next(pairs, None)
+    if first is None:
         return None
-    overlap = min(len(text) - offset, len(next_text))
-    if text[offset:offset + overlap] != next_text[:overlap]:
-        return None
-    return start, text + next_text[overlap:]
+    start, text = first
+    previous = start
+    for next_start, next_text in pairs:
+        offset = next_start - start
+        if next_start <= previous or offset > len(text):
+            return None
+        overlap = min(len(text) - offset, len(next_text))
+        if text[offset:offset + overlap] != next_text[:overlap]:
+            return None
+        text += next_text[overlap:]
+        previous = next_start
+    return start, text
 
 
 REPLY_START = re.compile(
@@ -1252,13 +1260,14 @@ class Store:
             )
         return new_id
 
-    def try_adopt(self, conn, source, previous, version, item, mail, *, index_format=MAIL_INDEX_FORMAT):
+    def try_adopt(self, conn, source, previous, version, item, mail):
         """Reuse the previous version's work when the mail content is unchanged."""
         old = conn.execute(
-            "SELECT id FROM mails WHERE source=? AND version=? AND item=? AND fingerprint=?",
-            (source, previous, item, fingerprint(mail, item, index_format=index_format)),
+            "SELECT id,fingerprint FROM mails WHERE source=? AND version=? AND item=?",
+            (source, previous, item),
         ).fetchone()
-        if old is None:
+        if (old is None or (":" in old["fingerprint"] and not old["fingerprint"].startswith(MAIL_INDEX_PREFIXES))
+                or not matches_fingerprint(mail, item, old["fingerprint"])):
             return False
         self.adopt_mail(conn, version, old["id"])
         return True
@@ -1291,12 +1300,12 @@ class Store:
         if version is None or not labels:
             return set()
         labels = set(labels)
-        marker = MAIL_INDEX_FORMAT + ":"
         outdated = set()
         with self.connection() as conn:
             rows = conn.execute(
                 """SELECT item FROM mails WHERE source=? AND version=? AND kind='mail'
-                   AND substr(fingerprint,1,?)<>?""", (source, version, len(marker), marker),
+                   AND substr(fingerprint,1,?) NOT IN (SELECT value FROM json_each(?))""",
+                (source, version, len(MAIL_INDEX_PREFIXES[0]), json.dumps(MAIL_INDEX_PREFIXES)),
             )
             for row in rows:
                 if "" in labels:
@@ -1621,7 +1630,7 @@ class Store:
                 return self.passages(passages, filters, conn, checked=checked, windows=windows)
         where, params = self.scope(filters or {})
         rows = conn.execute(
-            f"""SELECT {MAIL_COLUMNS},p.id passage,p.text,p.location,p.start,a.name attachment
+            f"""SELECT {MAIL_COLUMNS},p.id passage,p.text,p.location,p.start,p.attachment attachment_id,a.name attachment
                 FROM json_each(?) ids CROSS JOIN passages p ON p.id=ids.value
                 CROSS JOIN mails m ON m.id=p.mail CROSS JOIN sources s ON s.id=m.source
                 LEFT JOIN attachments a ON a.id=p.attachment
@@ -1720,7 +1729,7 @@ class Store:
             found = {row["passage"]: row for row in self.passages(picked, filters, conn)}
         return [found[item] for item in picked if item in found][:6]
 
-    def expand_passage_window(self, row, *, max_chars=1400, conn=None):
+    def expand_passage_window(self, row, *, max_chars=1800, conn=None):
         """Expand a visible passage within the same original part."""
         if (row.get("kind") == "pcf" or row["location"] in {"파일명", "제목"} or row.get("window")
                 or "start" not in row or len(row["text"]) >= max_chars):
@@ -1739,21 +1748,30 @@ class Store:
         extend_left = extend_right = True
         for before, after in zip_longest(left, right):
             if before is not None and extend_left:
-                merged = merge_contiguous_passages(tuple(before), window)
-                if merged and len(merged[1]) <= max_chars:
+                merged = merge_contiguous_passages((tuple(before), window))
+                if merged:
                     window = merged
                 else:
                     extend_left = False
             if after is not None and extend_right:
-                merged = merge_contiguous_passages(window, tuple(after)) if after["start"] > right_start else None
-                if merged and len(merged[1]) <= max_chars:
+                merged = merge_contiguous_passages((window, tuple(after))) if after["start"] > right_start else None
+                if merged:
                     window = merged
                     right_start = after["start"]
                 else:
                     extend_right = False
-        if window == (row["start"], row["text"]):
+        start, text = window
+        if len(text) > max_chars:
+            anchor = row["start"] - start
+            spare = max_chars - len(row["text"])
+            after = len(text) - anchor - len(row["text"])
+            left_chars = min(anchor, max(spare // 2, spare - after))
+            offset = anchor - left_chars
+            start += offset
+            text = text[offset:offset + max_chars]
+        if (start, text) == (row["start"], row["text"]):
             return row
-        return {**row, "start": window[0], "text": window[1], "window": True}
+        return {**row, "start": start, "text": text, "window": True}
 
     def evidence_context(self, row, filters):
         """Fetch reviewable context from the same mail part or worksheet."""
