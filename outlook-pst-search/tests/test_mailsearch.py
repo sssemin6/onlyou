@@ -41,7 +41,7 @@ from mailsearch.outlook import OutlookError, OutlookStore
 from mailsearch.search_profile import SearchProfile
 from mailsearch.server import (App, INSTANCE_FILE, SessionLock, existing_origin, gateway_defaults,
                                gateway_diagnostics, main, publish_instance)
-from mailsearch.store import VECTOR_LOOKUP_SQL, Store, contextual_model_key, fingerprint, local_midnight_utc, mail_sections, pack_vector, question_scope, read_signature, sections
+from mailsearch.store import VECTOR_LOOKUP_SQL, Store, contextual_model_key, fingerprint, local_midnight_utc, mail_sections, merge_contiguous_passages, pack_vector, question_scope, read_signature, sections
 from tools.demo import generate
 
 
@@ -627,9 +627,11 @@ class Integration(unittest.TestCase):
             self.assertEqual(listing(source)["updates"], [])
             self.assertTrue(self.call("/api/search", {"query": '"a-locked updated"', "filters": {}})[1]["results"])
 
-    def test_refresh_reindexes_and_embeds_only_new_mail(self):
+    def test_refresh_reuses_v3_passages_and_embeds_only_new_mail(self):
         source = self.import_mail()
         with self.store.connection() as conn:
+            conn.execute("UPDATE mails SET fingerprint=replace(fingerprint,'sections-v4:','sections-v3:') WHERE source=?",
+                         (source,))
             vectors_before = conn.execute("SELECT count(*) FROM vectors").fetchone()[0]
         extra = EmailMessage()
         extra["From"] = "new@example.invalid"
@@ -3117,11 +3119,14 @@ class RAGStability(unittest.TestCase):
             root = Path(directory)
             store = Store(root / "index")
             path = root / "Atlas.txt"
-            quote = "검수기록 " + "가나다라마바사" * 15 + " 시제품에만 적용합니다."
-            original = "A" * 355 + quote + "Z" * 620
+            quote = "검수기록" + "가나다라마바사" * 30 + " 시제품에만 적용합니다."
+            original = "A" * 920 + quote + "Z" * 1600
             path.write_text(original, encoding="utf-8")
             chunks = list(sections(original))
-            self.assertTrue(all(len(text) <= 480 for _, text in chunks))
+            self.assertEqual(len(chunks[0][1]), 1100)
+            self.assertEqual(chunks[1][0], 980)
+            self.assertEqual(merge_contiguous_passages(chunks), (0, original))
+            self.assertIsNone(merge_contiguous_passages([(0, "abcdefgh"), (6, "xxghi")]))
             self.assertFalse(any(quote in text for _, text in chunks))
             with store.connection() as conn:
                 source = conn.execute("INSERT INTO sources(path,kind,active) VALUES(?,'doc_file',1)",
@@ -3131,11 +3136,12 @@ class RAGStability(unittest.TestCase):
                 anchor = conn.execute("SELECT id FROM passages WHERE mail=? ORDER BY start LIMIT 1 OFFSET 1", (mail,)).fetchone()[0]
             hits = store.lexical("검수기록", {"source": source}, fuzzy=True)
             self.assertTrue(hits)
-            self.assertTrue(all(len(hit["text"]) <= 480 for hit in hits))
+            self.assertTrue(all(len(hit["text"]) <= 1100 for hit in hits))
             raw, = store.passages([anchor], {"source": source})
             window = store.expand_passage_window(raw)
             self.assertTrue(window["window"])
-            self.assertEqual(window["start"], 0)
+            self.assertLess(window["start"], raw["start"])
+            self.assertEqual(len(window["text"]), 1800)
             self.assertEqual(window["text"], original[window["start"]:window["start"] + len(window["text"])])
             self.assertEqual(store.open_passage(anchor, window=True)["text"], window["text"])
             result = {"status": "answered", "claims": [{"text": quote, "citations": [{"source": anchor, "quote": quote}]}]}
@@ -3144,6 +3150,9 @@ class RAGStability(unittest.TestCase):
             excerpt, = pack_excerpts("검수기록", [window], 12000)
             self.assertFalse(excerpt.original_in(raw))
             self.assertTrue(excerpt.original_in(store.passages([anchor], windows={anchor})[0]))
+            with patch.object(store, "lexical", return_value=[raw]):
+                evidence, _ = evidence_for(store, None, "검수기록", {"source": source}, "", semantic=False, expand=True)
+            self.assertEqual(evidence, [window])
 
     def test_legacy_sections_v2_and_metadata_v1_still_search_and_open(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -3163,6 +3172,7 @@ class RAGStability(unittest.TestCase):
             self.assertEqual(reopened.lexical("Atlas", {"source": source})[0]["passage"], passage)
             self.assertEqual(reopened.semantic_contextual([1., 0.], "embed", {})[0]["passage"], passage)
             self.assertEqual(reopened.open_passage(passage)["text"], mail["body"])
+            self.assertEqual(reopened.outdated_pst_labels(source, 1, ("",)), set())
 
     def test_supplemental_search_recovers_bom_in_same_scope_and_checks_access(self):
         question = "A17 시제품 승인과 양산 BOM 반영 여부 비교"
