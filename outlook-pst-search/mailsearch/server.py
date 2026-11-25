@@ -33,7 +33,10 @@ from .answer import (ANSWER_CLAIM_LIMIT, ANSWER_EVIDENCE_LIMIT, ANSWER_TEXT_LIMI
 from .api_settings import ApiSettings, write_api_settings
 from .embedding import (CA_FILE_ENV, GatewayTLSOptions, MODEL as BGE_MODEL, PATH as EMBEDDING_PATH,
                         gateway_origin, logger as gateway_logger)
-from .external import DEFAULT_MODEL, DEFAULT_URL, MAX_EXCERPTS, MAX_INTERNAL_EXCERPTS, MAX_PCF_CELLS, ExternalAI, ExternalRequestError, Reviews, pcf_batches, pcf_input_fits
+from .external import (
+    DEFAULT_MODEL, DEFAULT_URL, MAX_EXCERPTS, MAX_GATEWAY_EXCERPTS, MAX_INTERNAL_EXCERPTS,
+    MAX_PCF_CELLS, ExternalAI, ExternalRequestError, Reviews, pack_excerpts, pcf_batches, pcf_input_fits,
+)
 from .extract import MAX_ATTACHMENT
 from .filesystem import local_path, source_path
 from .indexer import EMBEDDING_BATCH_SIZE, EMBEDDING_BATCH_TIMEOUT, ImportIssue, Indexer, runtime_logger
@@ -463,6 +466,7 @@ class Handler(BaseHTTPRequestHandler):
                 "embedding": embedding.model if use_gateway else self.server.ai.embedding_model,
                 "embedding_endpoint": embedding.endpoint if use_gateway else None,
                 "external": external.public if external else None,
+                "intranet_answer": bool(external and external.intranet),
             })
         elif re.fullmatch(r"/api/source-updates/\d{1,16}", route.path):
             source = int(route.path.rsplit("/", 1)[-1])
@@ -578,6 +582,13 @@ class Handler(BaseHTTPRequestHandler):
                             self.query(route, payload)
                     finally:
                         profile.log(runtime_logger, "external_answer" if send else "preview")
+            elif route == "/api/intranet/answer":
+                profile = SearchProfile("intranet_answer")
+                with self.server.store.search_session(profile):
+                    try:
+                        self.send_json(*self.intranet_answer(payload))
+                    finally:
+                        profile.log(runtime_logger, "intranet_answer")
             elif route == "/api/intranet/settings":
                 self.change_intranet_settings(payload)
             elif route == "/api/intranet/defaults":
@@ -761,37 +772,25 @@ class Handler(BaseHTTPRequestHandler):
         internal_budget = external.internal_budget if route == "/api/external/preview" else 0
         budget = external.review_budget if route == "/api/external/preview" else 0
         chars = external.review_chars if budget else 0
-        if internal_budget:
-            filters["regular_only"] = True
         if pcf:
             filters["tab"] = "pcf"
             if self.preview_pcf_word(payload.get("passage"), query, context, filters, external):
                 return
-            evidence, mode = pcf_retrieval(store, ai, query, filters, context)
+            evidence, _ = pcf_retrieval(store, ai, query, filters, context)
             evidence = [row for row in evidence if not pcf_word(row)]
+        elif route == "/api/external/preview":
+            evidence, filters, gap_aspects = self.retrieve_external_evidence(
+                query, context, filters, external, budget, internal_budget,
+            )
         else:
             search_text, filters = question_scope(query, filters)
-            options = {"limit": MAX_INTERNAL_EXCERPTS if budget else 9, "expand": bool(budget),
-                       "max_evidence": 32 if budget else None, "intent": query}
-            rewrite = (rewritten_evidence(store, ai, query, filters, context, **options)
-                       if route == "/api/external/preview" else None)
-            query_count = 1
-            if rewrite:
-                evidence, mode, filters, query_count = rewrite
-            else:
-                evidence, mode = evidence_for(store, ai, search_text, filters, context,
-                                              semantic=route == "/api/external/preview", **options)
-            if route == "/api/external/preview":
-                evidence, mode, gap_aspects, _ = supplemental_evidence(
-                    store, ai, query, filters, context, evidence, mode, query_count,
-                    ceiling=32 if budget else 9, expand=bool(budget),
-                    review_slots=None if budget else MAX_EXCERPTS,
-                )
+            evidence, _ = evidence_for(store, ai, search_text, filters, context, semantic=False, intent=query)
         if route in {"/api/external/preview", "/api/pcf/preview"}:
             with store.measure("context"):
                 token, review = self.server.reviews.create(
                     query, evidence, external.review_generation, pcf=pcf, internal_budget=internal_budget,
                     review_budget=budget, review_chars=chars, filters=filters, gap_aspects=gap_aspects,
+                    max_excerpts=MAX_GATEWAY_EXCERPTS if external.intranet and not pcf else MAX_INTERNAL_EXCERPTS,
                 )
             by_passage = {row["passage"]: public_row(row) for row in evidence}
             self.send_json(200, {
@@ -803,6 +802,57 @@ class Handler(BaseHTTPRequestHandler):
             })
             return
         self.send_json(200, {"results": [public_row(row) for row in evidence]})
+
+    def retrieve_external_evidence(self, question, context, filters, external, budget, internal_budget):
+        store, ai = self.server.store, self.server.ai
+        if internal_budget:
+            filters = {**filters, "regular_only": True}
+        search_text, filters = question_scope(question, filters)
+        limit = MAX_GATEWAY_EXCERPTS if external.intranet else MAX_INTERNAL_EXCERPTS
+        options = {"limit": limit if budget else 9, "expand": bool(budget),
+                   "max_evidence": 32 if budget else None, "intent": question}
+        rewrite = rewritten_evidence(store, ai, question, filters, context, **options)
+        query_count = 1
+        if rewrite:
+            evidence, mode, filters, query_count = rewrite
+        else:
+            evidence, mode = evidence_for(store, ai, search_text, filters, context, **options)
+        evidence, _, aspects, _ = supplemental_evidence(
+            store, ai, question, filters, context, evidence, mode, query_count,
+            ceiling=32 if budget else 9, expand=bool(budget),
+            review_slots=None if budget else MAX_EXCERPTS, allow_intranet_evidence=external.intranet,
+        )
+        return evidence, filters, aspects
+
+    def intranet_answer(self, payload):
+        question, context, filters = self.question_input(payload)
+        if not question:
+            return 400, {"error": "question_required"}
+        if filters.get("tab") == "pcf":
+            return 400, {"error": "pcf_review_required"}
+        server = self.server
+        if not server.outbound.acquire(blocking=False):
+            return 409, {"error": "external_busy"}
+        try:
+            external = server.external
+            if not external or not external.intranet:
+                return 403, {"error": "intranet_answer_disabled"}
+            budget = external.internal_budget
+            if not budget:
+                return 400, {"error": "intranet_budget"}
+            evidence, scope, aspects = self.retrieve_external_evidence(
+                question, context, filters, external, budget, budget,
+            )
+            with server.store.measure("context"):
+                excerpts = pack_excerpts(question, evidence, budget, with_context=True,
+                                         chars=external.review_chars, max_excerpts=MAX_GATEWAY_EXCERPTS)
+            if not excerpts:
+                result = report_unconfirmed_aspects({"status": "insufficient", "claims": []}, aspects)
+                return 200, {**result, "results": [], "provider": "intranet"}
+            return self.generate_external_answer(external, question, excerpts, scope, gap_aspects=aspects,
+                                                 provider="intranet")
+        finally:
+            server.outbound.release()
 
     def stream_answer_event(self, stage, **fields):
         event = json.dumps({"stage": stage, **fields}, ensure_ascii=False)
@@ -1120,7 +1170,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         token, selected = payload.get("review"), payload.get("excerpts")
         if (not isinstance(token, str) or not re.fullmatch(r"[\w-]{32}", token, re.ASCII)
-                or not isinstance(selected, list) or not 1 <= len(selected) <= (MAX_PCF_CELLS if pcf else MAX_INTERNAL_EXCERPTS)
+                or not isinstance(selected, list) or not 1 <= len(selected) <= (MAX_PCF_CELLS if pcf else MAX_GATEWAY_EXCERPTS)
                 or any(type(number) is not int for number in selected)):
             raise ValueError("external_review")
         if not server.outbound.acquire(blocking=False):
@@ -1146,40 +1196,43 @@ class Handler(BaseHTTPRequestHandler):
                             or (review.review_budget and review.review_chars != external.review_chars)):
                 self.send_json(409, {"error": "external_review_expired"})
                 return
-            if len(excerpts) > (MAX_INTERNAL_EXCERPTS if review.review_budget else MAX_EXCERPTS):
+            extended = MAX_GATEWAY_EXCERPTS if external.intranet and not pcf else MAX_INTERNAL_EXCERPTS
+            if len(excerpts) > (extended if review.review_budget else MAX_EXCERPTS):
                 raise ValueError("external_excerpts")
-            ids = [item.passage for item in excerpts]
             scope = {"tab": "pcf"} if pcf else review.filters or {}
-            window_ids = {item.passage for item in excerpts if item.window_start is not None}
-            rows = {row["passage"]: row for row in server.store.passages(ids, scope, windows=window_ids)}
-            if any(item.passage not in rows or not item.original_in(rows[item.passage]) for item in excerpts):
-                self.send_json(409, {"error": "external_source_changed"})
-                return
-            try:
-                with server.store.measure("generation"):
-                    if pcf:
-                        result = external.answer(review.question, excerpts,
-                                                 instructions=PCF_INSTRUCTIONS, token_limit=2800, timeout=90)
-                    else:
-                        result = external.answer(review.question, excerpts)
-            except (OSError, ValueError, RuntimeError, KeyError, IndexError, TypeError, http.client.HTTPException) as exc:
-                self.send_json(200, {
-                    "status": "external_unavailable", "claims": [], "results": [], "provider": "external",
-                    "reason": type(exc).__name__,
-                })
-                return
-            visible = {row["passage"]: row for row in server.store.passages(ids, scope, windows=window_ids)}
-            verified = [{**visible[item.passage], "text": item.text,
-                         "start": visible[item.passage]["start"] + item.start,
-                         "reviewed_sender": (item.context or {}).get("sender", "")}
-                        for item in excerpts if item.passage in visible and item.original_in(visible[item.passage])]
-            with server.store.measure("validation"):
-                checked = validate(result, verified, review.question, text_for=lambda row: row["text"], pcf=pcf)
-            checked = report_unconfirmed_aspects(checked, review.gap_aspects)
-            reply = {**checked, "results": [public_row(row) for row in verified], "provider": "external"}
+            status, reply = self.generate_external_answer(
+                external, review.question, excerpts, scope, pcf=pcf, gap_aspects=review.gap_aspects,
+            )
         finally:
             server.outbound.release()
-        self.send_json(200, reply)
+        self.send_json(status, reply)
+
+    def generate_external_answer(self, external, question, excerpts, scope, *, pcf=False, gap_aspects=(),
+                                 provider="external"):
+        store = self.server.store
+        ids = [item.passage for item in excerpts]
+        windows = {item.passage for item in excerpts if item.window_start is not None}
+        rows = {row["passage"]: row for row in store.passages(ids, scope, windows=windows)}
+        if any(item.passage not in rows or not item.original_in(rows[item.passage]) for item in excerpts):
+            return 409, {"error": "external_source_changed"}
+        try:
+            with store.measure("generation"):
+                if pcf:
+                    result = external.answer(question, excerpts, instructions=PCF_INSTRUCTIONS, token_limit=2800, timeout=90)
+                else:
+                    result = external.answer(question, excerpts)
+        except (OSError, ValueError, RuntimeError, KeyError, IndexError, TypeError, http.client.HTTPException) as exc:
+            return 200, {"status": "external_unavailable", "claims": [], "results": [], "provider": provider,
+                         "reason": type(exc).__name__}
+        visible = {row["passage"]: row for row in store.passages(ids, scope, windows=windows)}
+        verified = [{**visible[item.passage], "text": item.text,
+                     "start": visible[item.passage]["start"] + item.start,
+                     "reviewed_sender": (item.context or {}).get("sender", "")}
+                    for item in excerpts if item.passage in visible and item.original_in(visible[item.passage])]
+        with store.measure("validation"):
+            checked = validate(result, verified, question, text_for=lambda row: row["text"], pcf=pcf)
+        checked = report_unconfirmed_aspects(checked, gap_aspects)
+        return 200, {**checked, "results": [public_row(row) for row in verified], "provider": provider}
 
     def intranet_settings(self):
         local, current = self.server.ai.embedding_config
