@@ -3,6 +3,7 @@ import datetime
 import http.client
 import json
 import logging
+import math
 import os
 import re
 import shutil
@@ -891,28 +892,34 @@ def message_date(row):
 
 
 def latest_thread_decisions(question, ranked, candidates, limit):
+    codes = {normalized(code) for code in REWRITE_IDENTIFIER.findall(question) if re.search("[A-Za-z]", code)}
+
     def group(row):
         topic = topic_key(row.get("subject", ""))
-        return row.get("source"), topic
+        parts = codes.intersection(REWRITE_IDENTIFIER.findall(topic + " " + normalized(row["text"])))
+        if not topic or (codes and not parts):
+            return None
+        return row.get("source"), topic, frozenset(parts)
 
-    codes = {normalized(code) for code in REWRITE_IDENTIFIER.findall(question) if re.search("[A-Za-z]", code)}
-    groups = {group(row) for row in ranked[:limit] if row.get("subject")}
+    groups = dict.fromkeys(group(row) for row in ranked[:limit])
+    groups.pop(None, None)
     newest = {}
     for row in candidates:
         key = group(row)
         sent = message_date(row)
-        if key not in groups or not sent or (codes and not codes.intersection(REWRITE_IDENTIFIER.findall(key[1]))):
-            continue
-        if row.get("location") != "본문":
+        if key not in groups or not sent or row.get("location") != "본문":
             continue
         decisions = (match[0] for match in CLAUSE.finditer(row["text"]))
-        if any((APPROVAL_SENTENCE.search(line) or WITHDRAWN_DECISION.search(line))
-               and not UNSETTLED.search(line) and not re.search(r"하지 않|not\s+(?:yet\s+)?(?:withdrawn|revoked|cancelled|rejected)", line, re.I)
+        if any((WITHDRAWN_DECISION.search(line) or (
+                    (APPROVAL_SENTENCE.search(line) or re.search(r"\b(?:approved|confirmed)\b", line, re.I))
+                    and not NEGATED.search(line)))
+               and not UNSETTLED.search(line)
+               and not re.search(r"하지 않|여부|예정|not\s+(?:yet\s+)?(?:withdrawn|revoked|cancelled|rejected)", line, re.I)
                for line in decisions):
             stamp = sent, row["sent"]
             if key not in newest or stamp > newest[key][0]:
                 newest[key] = (stamp, row)
-    return [newest[key][1] for key in dict.fromkeys(group(row) for row in ranked[:limit]) if key in newest]
+    return [newest[key][1] for key in groups if key in newest]
 
 
 def reciprocal_rank(pools, limit, *, recent=False):
@@ -926,7 +933,7 @@ def reciprocal_rank(pools, limit, *, recent=False):
     def rank(item):
         score, row = item
         sent = message_date(row) if recent else None
-        return score * (1 + .12 * 2 ** (-max(0, (today - sent).days) / 270)) if sent else score
+        return score * (1 + .15 * math.exp(-max(0, (today - sent).days) / 270.0)) if sent else score
 
     return [row for _, row in sorted(scores.values(), key=rank, reverse=True)[:limit]]
 
@@ -1045,7 +1052,9 @@ def evidence_for(store, ai, question, filters, context, semantic=True, limit=9, 
         linked = store.related(list(dict.fromkeys(row["id"] for row in chosen[:7])), filters, hops=thread_hops, question=search_text)
     reserved = latest_thread_decisions(intent, chosen, [*ranked, *linked], min(4, limit)) if recent else []
     leading = max(0, min(4, limit - len(reserved)))
-    evidence = dedupe_by_content([*chosen[:leading], *reserved, *chosen[leading:4], *linked[:4], *chosen[4:]])[:limit]
+    ordered = [*chosen[:leading], *reserved, *chosen[leading:4], *linked[:4], *chosen[4:]]
+    latest = {evidence_content_key(row): row for row in reserved}
+    evidence = dedupe_by_content(latest.get(evidence_content_key(row), row) for row in ordered)[:limit]
     if expand:
         # Reserve places for matched passages, related replies and their original context.
         primary = evidence if max_evidence else evidence[:4]
