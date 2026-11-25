@@ -628,7 +628,10 @@ class Integration(unittest.TestCase):
             self.assertTrue(self.call("/api/search", {"query": '"a-locked updated"', "filters": {}})[1]["results"])
 
     def test_refresh_reuses_v3_passages_and_embeds_only_new_mail(self):
-        source = self.import_mail()
+        # Seed an archive that still uses the older embedding namespace.
+        with patch("mailsearch.indexer.contextual_model_keys",
+                   side_effect=lambda model: ("metadata-v1:" + model, contextual_model_key(model))):
+            source = self.import_mail()
         with self.store.connection() as conn:
             conn.execute("UPDATE mails SET fingerprint=replace(fingerprint,'sections-v4:','sections-v3:') WHERE source=?",
                          (source,))
@@ -640,9 +643,14 @@ class Integration(unittest.TestCase):
         extra["Message-ID"] = "<incremental@example.invalid>"
         extra.set_content("새로 도착한 증분 색인 대상 메일입니다.")
         (self.mail / "incremental.eml").write_bytes(extra.as_bytes())
-        self.call("/api/source-action", {"source": source, "action": "refresh"})
-        updated = await_source(self.store, source, {"ready", "error"})
+        with patch.object(self.ai, "embed", wraps=self.ai.embed) as embed:
+            self.assertEqual(self.call("/api/source-action", {"source": source, "action": "refresh"})[0], 202)
+            updated = await_source(self.store, source, {"ready", "error"})
+            embed.assert_called_once()
+            self.assertEqual(len(embed.call_args.args[0]), 1)
+            self.assertIn("새로 도착한", embed.call_args.args[0][0])
         self.assertEqual((updated["state"], updated["done"]), ("ready", 5))
+        self.assertEqual(updated["embedding_model_key"], "metadata-v1:embed")
         with self.store.connection() as conn:
             vectors_after = conn.execute("SELECT count(*) FROM vectors").fetchone()[0]
         # The four unchanged mails keep their embeddings; only the new mail is embedded.
@@ -1873,6 +1881,24 @@ class Integration(unittest.TestCase):
             self.ai.configure_embedding("embed", None)
             self.assertEqual(self.call("/api/search", payload)[0], 200)
             self.assertEqual(embed.call_count, 2)
+
+    def test_outlook_attachment_copies_get_a_shared_content_key(self):
+        message = EmailMessage()
+        message.set_content("테스트 회신")
+        message.add_attachment(b"same attachment", maintype="text", subtype="plain", filename="Shared.txt")
+        part, = message.iter_attachments()
+        mail = {"subject": "Outlook 공유 첨부", "sender": "", "recipient": "", "sent": "", "folder": "/",
+                "attachments": [("Shared.txt", part)], "message_id": "", "reply_ids": "", "body": "본문"}
+        from mailsearch.extract import extract_bytes
+        with (self.store.connection() as conn, patch("mailsearch.extract.extract_bytes", wraps=extract_bytes) as extract):
+            source = conn.execute("INSERT INTO sources(path,kind,active) VALUES(?,'eml_dir',1)",
+                                  (str(self.mail),)).lastrowid
+            for item in ("mail1.eml", "mail2.eml"):
+                mail_id = self.store.add_mail(conn, source, 1, item, mail)
+                self.indexer.index_outlook_attachments(conn, mail_id, mail, self.mail, threading.Event())
+            keys = [row[0] for row in conn.execute("SELECT embedding_key FROM passages WHERE embedding_key IS NOT NULL")]
+            self.assertEqual((len(keys), len(set(keys))), (2, 1))
+            extract.assert_called_once()
 
     def test_fifty_mails_share_one_attachment_embedding_and_keep_their_origins(self):
         folder = Path(self.workspace.name) / "duplicate-attachments"
