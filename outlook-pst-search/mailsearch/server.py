@@ -875,7 +875,7 @@ class Handler(BaseHTTPRequestHandler):
             if reply_sender:
                 anchors = follow_up_replies(store, anchors, filters, reply_sender)
         options = {"limit": 12, "expand": True, "thread_hops": 3, "max_evidence": ANSWER_EVIDENCE_LIMIT,
-                   "local_context": follow_up, "check": check}
+                   "local_context": follow_up, "check": check, "intent": query}
         rewritten = None
         if not reply_sender and filters.get("tab") != "pcf":
             rewritten = rewritten_evidence(store, ai, query, filters, context, **options)
