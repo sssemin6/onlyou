@@ -2,6 +2,7 @@
 import datetime
 import http.client
 import json
+import logging
 import os
 import re
 import shutil
@@ -19,6 +20,9 @@ from secrets import token_urlsafe
 from .extract import CREATE_FLAGS
 from .pcf import PCF_CELL, WORD_SUFFIXES, comment_number
 from .store import normalized, pack_vector, prioritize_attachments, query_words, rewritten_scope, topic_key
+
+runtime_logger = logging.getLogger("mailsearch.runtime")
+MODEL_ERRORS = (OSError, ValueError, RuntimeError, KeyError, IndexError, TypeError, OverflowError, http.client.HTTPException)
 
 QUOTE_LIMIT = 300
 ANSWER_CLAIM_LIMIT = 8
@@ -113,6 +117,7 @@ PCF_INSTRUCTIONS = """너는 조선소 선주 교신문(PCF) 검토 도우미다
 
 
 QUERY_REWRITE_TIMEOUT = 2.5
+QUERY_REWRITE_TOKEN_LIMIT = 384
 REWRITE_IDENTIFIER = re.compile(
     r"(?<![A-Za-z0-9_-])(?=[A-Za-z0-9_-]*[0-9])[A-Za-z0-9]+(?:[-_][A-Za-z0-9]+)*(?![A-Za-z0-9_-])",
 )
@@ -321,27 +326,45 @@ class LocalAI:
                     self.embed_ready.pop(model, None)
             raise
 
-    def semantic_search(self, store, query, filters, *, limit=40, min_similarity=.28):
+    def prefetch_query_embeddings(self, store, queries):
+        """Warm the query cache in one request and return this search's vectors."""
         with self.query_cache_lock:
             configuration = self.embedding_config
             index, embed = self.embedding_backend()
-            cached = self.query_cache.get(query)
-            if cached is not None:
-                self.query_cache.move_to_end(query)
-        if not index:
-            return []
-        if cached is None:
+            if not index:
+                return "", {}
+            vectors = {}
+            missing = []
+            for query in dict.fromkeys(queries):
+                if query in self.query_cache:
+                    vectors[query] = self.query_cache[query]
+                    self.query_cache.move_to_end(query)
+                else:
+                    missing.append(query)
+        if missing:
             with store.measure("embed"):
-                cached = embed([query], QUERY_EMBEDDING_TIMEOUT)[0]
-                pack_vector(cached)
+                batch = embed(missing, QUERY_EMBEDDING_TIMEOUT)
+                if len(batch) != len(missing):
+                    raise ValueError("embedding_response")
+                for vector in batch:
+                    pack_vector(vector)
+            entries = dict(zip(missing, batch, strict=True))
+            vectors.update(entries)
             with self.query_cache_lock:
                 if self.embedding_config is configuration:
-                    self.query_cache[query] = cached
-                    self.query_cache.move_to_end(query)
-                    if len(self.query_cache) > 128:
+                    for query, vector in entries.items():
+                        self.query_cache[query] = vector
+                        self.query_cache.move_to_end(query)
+                    while len(self.query_cache) > 128:
                         self.query_cache.popitem(last=False)
+        return index, vectors
+
+    def semantic_search(self, store, query, filters, *, limit=40, min_similarity=.28, prefetched=None):
+        index, vectors = self.prefetch_query_embeddings(store, (query,)) if prefetched is None else prefetched
+        if not index:
+            return []
         with store.measure("vector"):
-            return store.semantic_contextual(cached, index, filters, limit, min_similarity=min_similarity)
+            return store.semantic_contextual(vectors[query], index, filters, limit, min_similarity=min_similarity)
 
     @property
     def rerank_enabled(self):
@@ -361,37 +384,48 @@ class LocalAI:
             documents.append(header + "\n\n" + row["text"][:text_limit])
         try:
             order = provider.rerank(query, documents)
-        except (OSError, ValueError, RuntimeError, http.client.HTTPException):
+        except MODEL_ERRORS as exc:
+            runtime_logger.warning("Rerank skipped (docs=%d, error=%s)", len(documents), type(exc).__name__)
             return rows
         return [batch[index] for index in order] + rows[len(batch):]
 
     def rewrite_query(self, question):
-        if not self.rewrite_model or not self.rewrite_slot.acquire(blocking=False):
+        if os.environ.get("MAILSEARCH_QUERY_REWRITE", "").strip() == "0":
+            return None
+        local_model = self.rewrite_model
+        gateway = self.embedding_api
+        if not (local_model or getattr(gateway, "rewrite_model", "")):
+            return None
+        if not self.rewrite_slot.acquire(blocking=False):
             return None
         result = Future()
         deadline = time.monotonic() + QUERY_REWRITE_TIMEOUT
 
         def run():
+            plan = None
             try:
-                # Only use an already installed local model. A cold or busy
-                # service can fall back without starting a new Ollama instance.
-                model = self.ensure_model(self.rewrite_model)
+                # Use an installed local model without starting Ollama solely for rewriting.
+                model = self.ensure_model(local_model) if local_model else ""
+                prompt = json.dumps({"question": question, "today": datetime.date.today().isoformat()},
+                                    ensure_ascii=False)
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    result.set_result(None)
                     return
-                payload = self.call("/api/generate", {
-                    "model": model, "system": REWRITE_INSTRUCTIONS,
-                    "prompt": json.dumps({"question": question, "today": datetime.date.today().isoformat()},
-                                         ensure_ascii=False),
-                    "format": "json", "stream": False, "think": False,
-                    "options": {"num_ctx": 2048, "num_predict": 384, "temperature": 0},
-                }, timeout=remaining)
-                result.set_result(parse_rewrite(json.loads(payload["response"]), question))
-            except (OSError, ValueError, RuntimeError, KeyError, TypeError, http.client.HTTPException):
-                result.set_result(None)
+                if model:
+                    payload = self.call("/api/generate", {
+                        "model": model, "system": REWRITE_INSTRUCTIONS, "prompt": prompt,
+                        "format": "json", "stream": False, "think": False,
+                        "options": {"num_ctx": 2048, "num_predict": QUERY_REWRITE_TOKEN_LIMIT, "temperature": 0},
+                    }, timeout=remaining)
+                    raw = json.loads(payload["response"])
+                else:
+                    raw = gateway.rewrite_query(REWRITE_INSTRUCTIONS, prompt, timeout=remaining)
+                plan = parse_rewrite(raw, question)
+            except MODEL_ERRORS:
+                pass
             finally:
                 self.rewrite_slot.release()
+                result.set_result(plan)
 
         worker = threading.Thread(target=run, name="query-rewrite", daemon=True)
         try:
@@ -400,7 +434,7 @@ class LocalAI:
             self.rewrite_slot.release()
             return None
         try:
-            return result.result(timeout=QUERY_REWRITE_TIMEOUT)
+            return result.result(timeout=max(0, deadline - time.monotonic()))
         except TimeoutError:
             return None
 
@@ -792,10 +826,21 @@ def evidence_for(store, ai, question, filters, context, semantic=True, limit=9, 
     candidate_limit = max(RAG_CANDIDATE_LIMIT if rerank else 40, limit)
     pools = []
     mode = "keyword"
-    for sub_query in sub_queries or (question,):
+    questions = sub_queries or (question,)
+    queries = [f"{sub_query} {context}".strip() for sub_query in questions]
+    semantic_options = {"limit": RAG_CANDIDATE_LIMIT, "min_similarity": RAG_MIN_SIMILARITY}
+    use_semantic = semantic and bool(ai.embedding_index)
+    if use_semantic and len(queries) > 1:
         if check:
             check()
-        query = f"{sub_query} {context}".strip()
+        try:
+            semantic_options["prefetched"] = ai.prefetch_query_embeddings(store, (query for query in queries if query))
+        except MODEL_ERRORS:
+            use_semantic = False
+            mode = "keyword_only"
+    for sub_query, query in zip(questions, queries, strict=True):
+        if check:
+            check()
         lexical_query = f"{query} {local_context}".strip()
         required = keywords
         if len(sub_queries) > 1:
@@ -809,14 +854,13 @@ def evidence_for(store, ai, question, filters, context, semantic=True, limit=9, 
             else:
                 lexical = store.lexical(lexical_query, filters, fuzzy=True)
         pools.append((lexical, 1.2))
-        if semantic and query and ai.embedding_index:
+        if use_semantic and query:
             try:
-                semantic_rows = ai.semantic_search(store, query, filters,
-                                                   limit=RAG_CANDIDATE_LIMIT, min_similarity=RAG_MIN_SIMILARITY)
+                semantic_rows = ai.semantic_search(store, query, filters, **semantic_options)
                 if semantic_rows:
                     mode = "hybrid"
                     pools.append((semantic_rows, 1.0))
-            except (OSError, ValueError, RuntimeError, KeyError, IndexError, TypeError, http.client.HTTPException):
+            except MODEL_ERRORS:
                 if mode != "hybrid":
                     mode = "keyword_only"
     seeds = reciprocal_rank(pools, candidate_limit)
