@@ -1354,8 +1354,8 @@ class Store:
         return results
 
     def scoped_lexical(self, conn, statement, filters, columns, window):
-        # Prefer a bounded mail range, then check FTS by rowid. Source/date
-        # predicates use the same index and ordering as the mail shortlist.
+        # Restrict a single FTS scan by the shortlisted rowid range. Reopening
+        # an FTS cursor per row would recompute global BM25 term statistics.
         coarse = {key: filters[key] for key in ("source", "after", "before") if filters.get(key)}
         base, base_params = self.scope(coarse)
         where, params = self.scope(filters)
@@ -1374,10 +1374,15 @@ class Store:
             f"""WITH mail_range AS MATERIALIZED ({mail_range}), shortlist AS MATERIALIZED (
                     SELECT p.id FROM mail_range r CROSS JOIN mails m ON m.id=r.id
                     CROSS JOIN sources s ON s.id=m.source CROSS JOIN passages p ON p.mail=m.id
-                    WHERE {where} LIMIT 12000)
-                SELECT {columns} FROM shortlist c CROSS JOIN terms ON terms.rowid=c.id AND terms MATCH ?
-                CROSS JOIN passages p ON p.id=c.id CROSS JOIN mails m ON m.id=p.mail {JOIN}
-                ORDER BY bm25(terms,7.0,2.0,4.0,1.0),p.id LIMIT ?""",
+                    WHERE {where} LIMIT 12000),
+                bounds AS (SELECT min(id) first,max(id) last FROM shortlist),
+                matches AS MATERIALIZED (
+                    SELECT terms.rowid id,bm25(terms,7.0,2.0,4.0,1.0) score
+                    FROM bounds CROSS JOIN terms ON terms MATCH ? AND terms.rowid BETWEEN bounds.first AND bounds.last
+                    ORDER BY terms.rowid DESC LIMIT 16000)
+                SELECT {columns} FROM matches f CROSS JOIN passages p ON p.id=f.id
+                CROSS JOIN mails m ON m.id=p.mail {JOIN}
+                WHERE f.id IN (SELECT id FROM shortlist) ORDER BY f.score,p.id LIMIT ?""",
             (*base_params, *params, statement, window),
         )
 
@@ -1430,8 +1435,8 @@ class Store:
                 ).fetchall()
                 candidate_ids = [row[0] for row in candidates]
                 scoped = conn.execute(
-                    f"""SELECT {columns} FROM json_each(?) ids JOIN passages p ON p.id=ids.value
-                        JOIN mails m ON m.id=p.mail {JOIN} WHERE {where}
+                    f"""SELECT {columns} FROM json_each(?) ids CROSS JOIN passages p ON p.id=ids.value
+                        CROSS JOIN mails m ON m.id=p.mail CROSS JOIN sources s ON s.id=m.source WHERE {where}
                         ORDER BY ids.key""",
                     (json.dumps(candidate_ids), *params),
                 ).fetchall() if candidate_ids else []
