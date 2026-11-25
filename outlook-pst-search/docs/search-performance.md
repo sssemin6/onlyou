@@ -9,7 +9,7 @@ $searchLog = Join-Path $env:LOCALAPPDATA 'OutlookMailSearch\app-runtime.log'
 Select-String -Path $searchLog -Pattern 'Search profile' | Select-Object -Last 30
 ```
 
-로그의 같은 id로 검색과 원본 확인을 연결합니다. phase=query는 최초 검색, phase=verify는 원본 확인, phase=answer는 로컬 생성 요청이며, phase=preview와 phase=external_answer는 검토용 발췌 및 외부 생성 요청입니다. rewrite_ms는 선택형 질의 분해, fts_ms는 키워드 검색과 결과 미리보기, embed_ms는 검색어 벡터 요청, vector_ms는 후보 조회와 비교, rerank_ms는 재정렬, access_ms는 실제 파일·폴더 접근 확인입니다. 로컬 답변에는 context_ms, generation_ms, validation_ms도 기록합니다. 병렬 구간과 별도 요청이 있으므로 구간을 더한 값은 전체 시간과 다를 수 있습니다. 검색어와 메일 내용은 계측 로그에 기록하지 않습니다.
+로그의 같은 id로 검색과 원본 확인을 연결합니다. phase=query는 최초 검색, phase=verify는 원본 확인, phase=answer는 로컬 생성 요청이며, phase=preview와 phase=external_answer는 검토용 발췌 및 외부 생성 요청입니다. rewrite_ms는 선택형 질의 분해, followup_ms는 누락 진단과 동일 범위의 추가 검색, fts_ms는 키워드 검색과 결과 미리보기, embed_ms는 검색어 벡터 요청, vector_ms는 후보 조회와 비교, rerank_ms는 재정렬, access_ms는 실제 파일·폴더 접근 확인입니다. 로컬 답변에는 context_ms, generation_ms, validation_ms도 기록합니다. 병렬 구간과 별도 요청이 있으므로 구간을 더한 값은 전체 시간과 다를 수 있습니다. 검색어와 메일 내용은 계측 로그에 기록하지 않습니다.
 
 동일한 검색어·보관함 범위를 사용하고 처음 실행과 반복 실행을 구별해 비교하세요. 공유폴더의 첫 확인은 검색과 별도 요청으로 실행됩니다. 원본 보관함을 병렬로 검사하고, 확인된 결과를 먼저 돌려줍니다. 응답 기한을 넘긴 경로의 검사는 백그라운드에서 완료되면 캐시에 반영됩니다. 최근 확인이 성공한 결과는 최대 10초간 재사용합니다. 원문·첨부 열기와 답변 API 전송 전에는 접근을 다시 확인합니다. 기존 API 호출은 두 번째 요청 없이 접근 확인까지 마친 결과를 돌려줍니다. 브라우저는 defer_access를 지정해 분리된 경로를 씁니다.
 
@@ -134,3 +134,27 @@ $env:PYTHONPATH = 'C:\work\after\outlook-pst-search'
 py -3 C:\work\after\outlook-pst-search\tools\rag_benchmark.py --per-shard 2250 --dimensions 128 --repetitions 12
 Remove-Item Env:\PYTHONPATH
 ```
+
+
+## 10. 최신 결정, 연속 원문과 추가 검색
+
+- 현재·최종 결정을 묻는 질의에는 최대 12%의 시간 가중치와 270일 반감기를 적용합니다. 비교·이력·과거 시점·종료일 필터가 있는 질의는 관련도 중심으로 조회합니다. 같은 주제·품번에서 확인한 최신 승인·철회는 근거에 포함하되 기존 인용 검증과 상충 판단을 따릅니다.
+- 새 색인은 480자 구간과 80자 중첩을 사용합니다. 원문 위치가 연속되고 중첩 문자가 일치하는 구간은 최대 1,400자까지 답변에 사용할 수 있습니다. **갱신** 시 `sections-v3`와 새 임베딩 키로 전환합니다. 이전 색인도 검색과 인용을 지원합니다. 구조화 PCF는 기존 셀 단위를 사용합니다.
+- 추가 검색은 질의 분해용 모델을 설정한 경우 복합·결정·이력 질문에 한해 사용합니다. `MAILSEARCH_AGENTIC_RETRY=0`으로 끌 수 있습니다. 진단은 최대 2.5초, 진단과 추가 검색 전체는 간단 결정 질문 최대 4초, 복합 질문 최대 6초이며 생성 시간을 남겨 두고 실행합니다. 게이트웨이 진단에서는 질문과 항목별 근거 건수를 사용합니다. 로컬 진단의 원문 발췌는 로컬 모델에만 전달합니다. 답변에 남은 미확인 항목은 적용한 보관함·기간 범위에 대한 결과입니다.
+
+합성 RAG 질문 6건의 구간별 중앙값입니다. 비교 기준은 `5c2755d`이며, 같은 `tools/rag_benchmark.py`와 모델 테스트 대역을 사용했습니다.
+
+| 구간 | 적용 전 | 적용 후 |
+| --- | ---: | ---: |
+| 질의 분해 | 0.01 ms | 0.01 ms |
+| FTS | 1.38 ms | 1.42 ms |
+| 임베딩 | 0.01 ms | 0.01 ms |
+| 벡터 후보 | 1.31 ms | 1.25 ms |
+| 재정렬 | 0.24 ms | 0.28 ms |
+| 원문 접근 확인 | 0.08 ms | 0.11 ms |
+| 근거 문맥 | 1.83 ms | 2.40 ms |
+| 답변 생성 | 0.15 ms | 0.13 ms |
+| 인용 검증 | 0.10 ms | 0.11 ms |
+| 전체 | 5.29 ms | 6.06 ms |
+
+1차 근거 및 검증된 사실은 전후 모두 12/12였습니다. 별도 PRD 시제품·양산 BOM 회귀 테스트에서 `followup_ms`는 2.24 ms였으며, 1차 시제품 승인에 양산 BOM 근거가 추가됐습니다. 테스트 대역으로 측정한 지연에는 운영 모델 호출 시간이 포함되지 않습니다. PRD의 전체 응답 20초·40초 목표는 실제 PST와 운영 모델에서 실측해야 합니다.
