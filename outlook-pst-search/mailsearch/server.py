@@ -1151,12 +1151,10 @@ class Handler(BaseHTTPRequestHandler):
                         for item in excerpts if item.passage in visible and item.original_in(visible[item.passage])]
             with server.store.measure("validation"):
                 checked = validate(result, verified, review.question, text_for=lambda row: row["text"], pcf=pcf)
-            self.send_json(200, {
-                **checked, "results": [public_row(row) for row in verified], "provider": "external",
-            })
+            reply = {**checked, "results": [public_row(row) for row in verified], "provider": "external"}
         finally:
             server.outbound.release()
-
+        self.send_json(200, reply)
 
     def intranet_settings(self):
         local, current = self.server.ai.embedding_config
