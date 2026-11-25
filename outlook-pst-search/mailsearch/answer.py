@@ -25,6 +25,8 @@ ANSWER_EVIDENCE_LIMIT = 18
 DEFAULT_ANSWER_NUM_CTX = 16384
 BASE_ANSWER_NUM_CTX = 8192
 QUERY_EMBEDDING_TIMEOUT = 6
+RAG_CANDIDATE_LIMIT = 80
+RAG_MIN_SIMILARITY = .18
 SYNTHESIS_QUESTION = re.compile(r"종합|비교|타임라인|시간\s*순|경과|흐름|이력|각각|항목별|쟁점별|상충")
 TIMELINE_QUESTION = re.compile(r"타임라인|시간\s*순|경과|흐름|이력")
 PROJECT_CODE = re.compile(r"(?<![A-Za-z0-9_-])[A-Za-z0-9]+(?:[-_][A-Za-z0-9]+)+(?![A-Za-z0-9_-])")
@@ -258,7 +260,7 @@ class LocalAI:
                     self.embed_ready.pop(model, None)
             raise
 
-    def semantic_search(self, store, query, filters):
+    def semantic_search(self, store, query, filters, *, limit=40, min_similarity=.28):
         with self.query_cache_lock:
             configuration = self.embedding_config
             index, embed = self.embedding_backend()
@@ -278,14 +280,24 @@ class LocalAI:
                     if len(self.query_cache) > 128:
                         self.query_cache.popitem(last=False)
         with store.measure("vector"):
-            return store.semantic_contextual(cached, index, filters)
+            return store.semantic_contextual(cached, index, filters, limit, min_similarity=min_similarity)
+
+    @property
+    def rerank_enabled(self):
+        return bool(getattr(self.embedding_api, "models", {}).get("rerank"))
 
     def rerank_candidates(self, query, rows, *, limit=10, text_limit=512):
         provider = self.embedding_api
         if not getattr(provider, "models", {}).get("rerank") or len(rows) < 2:
             return rows
         batch = rows[:limit]
-        documents = [f"{row['subject'][:160]}\n{row['text'][:text_limit]}" for row in batch]
+        documents = []
+        for row in batch:
+            header = "\n".join(f"{label}: {row[field][:length]}" for label, field, length in (
+                ("Subject", "subject", 160), ("Sent", "sent", 40), ("From", "sender", 180),
+                ("Attachment", "attachment", 180),
+            ) if row.get(field))
+            documents.append(header + "\n\n" + row["text"][:text_limit])
         try:
             order = provider.rerank(query, documents)
         except (OSError, ValueError, RuntimeError, http.client.HTTPException):
@@ -663,21 +675,24 @@ def evidence_for(store, ai, question, filters, context, semantic=True, limit=9, 
     mode = "keyword"
     if semantic and search_text and ai.embedding_index:
         try:
-            semantic_rows = ai.semantic_search(store, search_text, filters)
+            semantic_rows = ai.semantic_search(store, search_text, filters,
+                                               limit=RAG_CANDIDATE_LIMIT, min_similarity=RAG_MIN_SIMILARITY)
             mode = "hybrid" if semantic_rows else "keyword"
         except (OSError, ValueError, RuntimeError, KeyError, IndexError, TypeError, http.client.HTTPException):
             mode = "keyword_only"
-    seeds = merge_rows(lexical, semantic_rows, limit=max(24, limit))
-    if semantic and search_text:
+    rerank = semantic and search_text and ai.rerank_enabled
+    candidate_limit = max(RAG_CANDIDATE_LIMIT if rerank else 40, limit)
+    seeds = merge_rows(lexical, semantic_rows, limit=candidate_limit)
+    if rerank:
         with store.measure("rerank"):
-            seeds = ai.rerank_candidates(search_text, seeds, limit=24, text_limit=1100)
+            seeds = ai.rerank_candidates(search_text, seeds, limit=candidate_limit, text_limit=1100)
     seeds = prioritize_attachments(seeds, filters)
     chosen = []
     counts = {}
     for row in seeds:
         group = row["fingerprint"]
         counts[group] = counts.get(group, 0) + 1
-        per_document = 8 if expand and row.get("kind") == "document" else 2
+        per_document = 4 if expand and row.get("kind") == "document" else 2
         if counts[group] <= per_document or (limit > 9 and PCF_CELL.fullmatch(row["location"])):
             chosen.append(row)
     with store.measure("context"):
@@ -695,7 +710,7 @@ def evidence_for(store, ai, question, filters, context, semantic=True, limit=9, 
         # Reserve places for matched passages, related replies and their original context.
         primary = evidence if max_evidence else evidence[:4]
         expanded = {row["passage"]: row for row in primary}
-        ceiling = max_evidence or 12
+        ceiling = max_evidence or max(12, limit)
         with store.measure("context"):
             contexts = [store.evidence_context(row, filters) for row in evidence[:8 if max_evidence else 6]]
         for position in range(3):
@@ -704,6 +719,8 @@ def evidence_for(store, ai, question, filters, context, semantic=True, limit=9, 
                     row = group[position]
                     expanded.setdefault(row["passage"], row)
         for row in evidence[len(primary):]:
+            if len(expanded) == ceiling:
+                break
             expanded.setdefault(row["passage"], row)
         evidence = list(expanded.values())
     return evidence, mode
