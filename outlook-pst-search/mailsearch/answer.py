@@ -681,7 +681,7 @@ def evidence_for(store, ai, question, filters, context, semantic=True, limit=9, 
         if counts[group] <= per_document or (limit > 9 and PCF_CELL.fullmatch(row["location"])):
             chosen.append(row)
     with store.measure("context"):
-        linked = store.related(list(dict.fromkeys(row["id"] for row in chosen[:7])), filters, hops=thread_hops)
+        linked = store.related(list(dict.fromkeys(row["id"] for row in chosen[:7])), filters, hops=thread_hops, question=search_text)
     seen = set()
     evidence = []
     for row in [*chosen[:4], *linked[:4], *chosen[4:]]:
