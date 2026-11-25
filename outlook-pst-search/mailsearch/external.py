@@ -225,9 +225,11 @@ class Excerpt:
     text: str
     context: dict | None = None
     start: int = 0
+    window_start: int | None = None
 
     def original_in(self, row):
-        return row["text"][self.start:self.start + len(self.text)] == self.text
+        return ((self.window_start is None or row.get("window") and row["start"] == self.window_start)
+                and row["text"][self.start:self.start + len(self.text)] == self.text)
 
 
 def evidence_payload(question, excerpts):
@@ -272,7 +274,8 @@ def prioritized_excerpts(rows, extended):
 
 def pack_excerpts(question, rows, budget=0, *, with_context=False, chars=0, limit=MAX_EXCERPT_LENGTH):
     if not budget:
-        return tuple(Excerpt(number, row["passage"], text[:limit], start=offset)
+        return tuple(Excerpt(number, row["passage"], text[:limit], start=offset,
+                             window_start=row["start"] if row.get("window") else None)
                      for number, (row, text, offset) in enumerate(prioritized_excerpts(rows, False)[:MAX_EXCERPTS], 1))
 
     items = []
@@ -297,7 +300,8 @@ def pack_excerpts(question, rows, budget=0, *, with_context=False, chars=0, limi
 
         def make_excerpt(length):
             start = max(0, min(len(text) - length, focus - length // 3))
-            return Excerpt(len(items) + 1, row["passage"], text[start:start + length], context, offset + start)
+            return Excerpt(len(items) + 1, row["passage"], text[start:start + length], context, offset + start,
+                           row["start"] if row.get("window") else None)
 
         low, high = 1, room
         candidate = None
