@@ -881,9 +881,13 @@ class Store:
         finally:
             self.local.search = previous
 
-    def measure(self, stage):
+    @property
+    def search_profile(self):
         state = getattr(self.local, "search", None)
-        profile = state["profile"] if state else None
+        return state["profile"] if state else None
+
+    def measure(self, stage):
+        profile = self.search_profile
         return profile.measure(stage) if profile else contextlib.nullcontext()
 
     def deferred_access(self):
