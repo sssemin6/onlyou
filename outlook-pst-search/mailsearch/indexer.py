@@ -28,6 +28,7 @@ PST_DEFERRED = ("pst_in_use", "pst_changed")
 PST_PROGRESS_INTERVAL = 5
 EMBEDDING_BATCH_SIZE = 24
 EMBEDDING_BATCH_TIMEOUT = 60
+FINALIZATION_BATCH_SIZE = 256
 runtime_logger = logging.getLogger("mailsearch.runtime")
 
 
@@ -75,6 +76,8 @@ class Indexer:
         self.lock = threading.RLock()
         self.events = {}
         self.pst_reads = {}
+        self.finalizations = {}
+        self.finalization_lock = threading.Lock()
         self.original_thread = None
         self.original_event = threading.Event()
         self.original_failure = None
@@ -318,6 +321,8 @@ class Indexer:
                         self.worker = None
                     return
             finally:
+                with self.finalization_lock:
+                    self.finalizations.pop(source, None)
                 with self.lock:
                     self.events.pop(source, None)
                     self.pst_reads.pop(source, None)
@@ -769,9 +774,7 @@ class Indexer:
         self.state(source, "attachments")
         self.index_attachments(root, temp, source, version, event, extras=extras)
         issue = self.embed_revision(source, version, event)
-        self.check(event)
-        with self.store.connection() as conn:
-            conn.execute("UPDATE sources SET index_stage='finalizing' WHERE id=? AND pending=?", (source, version))
+        self.start_finalization(source, version, event, "verify_source")
         if source_signature(path, kind) != signature:
             raise ImportIssue("changed")
         self.publish_revision(source, version, signature, event, issue, empty_eml=empty_eml, signatures=signatures)
@@ -794,26 +797,84 @@ class Indexer:
                             WHERE id=? AND pending=?""", (source, version))
         return None
 
+    def start_finalization(self, source, version, event, phase):
+        self.check(event)
+        started = time.monotonic()
+        with self.finalization_lock:
+            self.finalizations[source] = {
+                "version": version, "phase": phase, "done": None, "total": None,
+                "started": started, "phase_started": started, "updated": started,
+            }
+        with self.store.connection() as conn:
+            conn.execute("UPDATE sources SET index_stage='finalizing' WHERE id=? AND pending=?", (source, version))
+
+    def update_finalization(self, source, phase, done=None, total=None):
+        timestamp = time.monotonic()
+        with self.finalization_lock:
+            progress = self.finalizations[source]
+            if (phase, done, total) != (progress["phase"], progress["done"], progress["total"]):
+                if phase != progress["phase"]:
+                    progress["phase_started"] = timestamp
+                progress.update(phase=phase, done=done, total=total, updated=timestamp)
+
+    def finalization_progress(self, row):
+        if row["index_stage"] != "finalizing" or row["state"] not in ("attachments", "embeddings", "headers"):
+            return None
+        with self.finalization_lock:
+            progress = self.finalizations.get(row["id"])
+            if not progress or progress["version"] != row["pending"]:
+                return None
+            timestamp = time.monotonic()
+            return {**{key: progress[key] for key in ("phase", "done", "total")},
+                    "elapsed": int(timestamp - progress["started"]),
+                    "phase_elapsed": int(timestamp - progress["phase_started"]),
+                    "idle": int(timestamp - progress["updated"])}
+
     def publish_revision(self, source, version, signature, event, issue, *, empty_eml=False, signatures=None,
                          retain=False, unchanged=None):
-        with self.lock:
+        def report(phase, done=None, total=None):
             self.check(event)
-            active = version if unchanged is None else unchanged
-            with self.store.connection() as conn:
-                if retain and unchanged is None:
-                    conn.execute("UPDATE mails SET version=? WHERE id IN (SELECT id FROM outlook_retained)", (version,))
-                conn.execute(
-                    """UPDATE sources SET active=?,active_signature=?,pending=NULL,state=?,updated=?,issue=?,
-                       index_stage=? WHERE id=?""",
-                    (active, signature, "empty" if empty_eml else "ready", now(), issue or ("eml_no_mail" if empty_eml else None),
-                     "headers" if empty_eml else "complete", source),
-                )
-                conn.execute("DELETE FROM mails WHERE source=? AND version<>?", (source, active))
-                conn.execute("DELETE FROM problems WHERE source=? AND version<>?", (source, active))
-                if signatures is not None:
-                    self.store.save_pst_files(conn, source, signatures)
-                if unchanged is None:
-                    self.store.commit_memory_revision(conn, source)
+            self.update_finalization(source, phase, done, total)
+
+        active = version if unchanged is None else unchanged
+        report("prepare_switch")
+        with self.store.connection() as conn:
+            changed = conn.execute(
+                """UPDATE sources SET active=?,active_signature=?,pending=NULL,state=?,updated=?,issue=?,
+                   index_stage=? WHERE id=? AND pending=? AND state NOT IN ('paused','removing')""",
+                (active, signature, "empty" if empty_eml else "ready", now(), issue or ("eml_no_mail" if empty_eml else None),
+                 "headers" if empty_eml else "complete", source, version),
+            )
+            if not changed.rowcount:
+                raise Paused()
+            if retain and unchanged is None:
+                report("reuse_mail")
+                conn.execute("UPDATE mails SET version=? WHERE id IN (SELECT id FROM outlook_retained)", (version,))
+            report("count_old")
+            previous = conn.execute(
+                "SELECT version,COUNT(*) FROM mails WHERE source=? AND version<>? GROUP BY version",
+                (source, active),
+            ).fetchall()
+            total = sum(count for _, count in previous)
+            done = 0
+            for old_version, count in previous:
+                report("remove_old", done, total)
+                for _ in range(0, count, FINALIZATION_BATCH_SIZE):
+                    deleted = conn.execute(
+                        """DELETE FROM mails WHERE id IN (SELECT id FROM mails
+                           WHERE source=? AND version=? ORDER BY id LIMIT ?)""",
+                        (source, old_version, FINALIZATION_BATCH_SIZE),
+                    )
+                    done += deleted.rowcount
+                    report("remove_old", done, total)
+            report("save_metadata")
+            conn.execute("DELETE FROM problems WHERE source=? AND version<>?", (source, active))
+            if signatures is not None:
+                self.store.save_pst_files(conn, source, signatures)
+            if unchanged is None:
+                self.store.commit_memory_revision(conn, source, active, report)
+            else:
+                report("commit")
 
     def process_outlook(self, row, temporary, event):
         source, version, previous = row["id"], row["pending"], row["active"]
@@ -883,9 +944,7 @@ class Indexer:
                              (omitted, partial, source, version))
 
         issue = self.embed_revision(source, version, event, retain=True)
-        self.check(event)
-        with self.store.connection() as conn:
-            conn.execute("UPDATE sources SET index_stage='finalizing' WHERE id=? AND pending=?", (source, version))
+        self.start_finalization(source, version, event, "prepare_switch")
         unchanged = previous if len(retained) == len(old) == len(folders) and row["active_signature"] == signature else None
         self.publish_revision(source, version, signature, event, issue or (None if folders else "outlook_no_mail"),
                               empty_eml=not folders, retain=True, unchanged=unchanged)
