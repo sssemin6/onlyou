@@ -3094,6 +3094,24 @@ class RAGStability(unittest.TestCase):
         self.assertEqual(reciprocal_rank((([draft, approved], 1),), 2, recent=True), [approved, draft])
         self.assertEqual(latest_thread_decisions(question, [draft], [draft, unrelated, approved], 1), [approved])
 
+        # Reranking can favor the older copy even within the same day.
+        older = {**approved, "passage": 10, "id": 10, "attachment": None, "fingerprint": "10",
+                 "sent": f"{today}T06:00:00+00:00", "subject": "브래킷 사양"}
+        newest = {**older, "passage": 11, "id": 11, "fingerprint": "11", "sent": f"{today}T17:00:00+00:00"}
+        other = {**older, "passage": 12, "id": 12, "fingerprint": "12", "text": "A17 예외를 검토 중입니다."}
+        ai = MagicMock(spec=LocalAI)
+        ai.embedding_index = ""
+        ai.rerank_enabled = True
+        ai.rerank_candidates.side_effect = lambda query, rows, **options: rows
+        store = MagicMock(spec=Store)
+        store.lexical.return_value = [older, newest, other]
+        store.related.return_value = []
+        rows, _ = evidence_for(store, ai, question, {}, "")
+        self.assertTrue(ai.rerank_candidates.called)
+        self.assertEqual([row["passage"] for row in rows], [11, 12])
+        rows, _ = evidence_for(store, ai, "A17 승인 타임라인", {}, "")
+        self.assertEqual([row["passage"] for row in rows], [10, 12])
+
     def test_contiguous_child_passages_support_cross_boundary_citations(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
