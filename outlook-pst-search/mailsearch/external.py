@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from urllib.parse import urlsplit
 
 from .embedding import GatewayRequestError, gateway_origin, request_gateway_json
-from .store import query_words
+from .store import normalized, query_words, topic_key
 from .answer import ANSWER_INSTRUCTIONS, MODEL_NAME, map_citations
 
 DEFAULT_URL = "https://api.openai.com/v1/chat/completions"
@@ -18,7 +18,7 @@ DEFAULT_MODEL = "gpt-4.1-mini"
 REVIEW_TTL = 300
 MAX_EXCERPTS = 5
 MAX_EXCERPT_LENGTH = 800
-MAX_INTERNAL_EXCERPTS = 16
+MAX_INTERNAL_EXCERPTS = 24
 MAX_PCF_CELLS = 1600
 MAX_PCF_BATCHES = 12
 MAX_RESPONSE = 128 * 1024
@@ -37,6 +37,19 @@ class ExternalRequestError(RuntimeError):
     def __init__(self, status):
         super().__init__("external_api_http")
         self.status = status
+
+
+def evidence_chars(profile):
+    value = os.environ.get(f"MAILSEARCH_{profile}_EVIDENCE_CHARS", "")
+    return int(value) if value in {"4000", "12000", "24000"} else 0
+
+
+def input_budget(profile, default):
+    chars = evidence_chars(profile)
+    raw = os.environ.get(f"MAILSEARCH_{profile}_INPUT_BYTES")
+    if raw is None:
+        return min(96000, 4 * chars + 8192) if chars else default
+    return int(raw) if re.fullmatch(r"[0-9]{4,6}", raw) and 3000 <= int(raw) <= 96000 else 0
 
 
 class ExternalAI:
@@ -105,8 +118,15 @@ class ExternalAI:
     def internal_budget(self):
         if not self.intranet and os.environ.get("MAILSEARCH_INTERNAL_URL") != self.public["destination"]:
             return 0
-        raw = os.environ.get("MAILSEARCH_INTERNAL_INPUT_BYTES", "24000")
-        return int(raw) if re.fullmatch(r"[0-9]{4,6}", raw) and 3000 <= int(raw) <= 96000 else 0
+        return input_budget("INTERNAL", 24000)
+
+    @property
+    def review_budget(self):
+        return self.internal_budget or input_budget("EXTERNAL", 0)
+
+    @property
+    def review_chars(self):
+        return evidence_chars("INTERNAL" if self.internal_budget else "EXTERNAL")
 
     def answer_pcf(self, content):
         return self.complete(PCF_WORD_INSTRUCTIONS, compact_json(content), token_limit=2800, timeout=90)
@@ -204,6 +224,10 @@ class Excerpt:
     passage: int
     text: str
     context: dict | None = None
+    start: int = 0
+
+    def original_in(self, row):
+        return row["text"][self.start:self.start + len(self.text)] == self.text
 
 
 def evidence_payload(question, excerpts):
@@ -213,34 +237,82 @@ def evidence_payload(question, excerpts):
     ]}
 
 
-def internal_excerpts(question, rows, budget):
-    items = []
-    seen = set()
+# Prefer one original passage per dated decision before filling with more of the same event.
+EVENT_SIGNALS = tuple(re.compile(pattern, re.I) for pattern in (
+    r"철회|번복|취소|반려|withdraw|revok|cancel|reject",
+    r"승인|확정|합의|approv|confirm|decid",
+    r"검토|보류|review|defer",
+    r"요청|제안|초안|request|propos|draft",
+))
+
+
+def prioritized_excerpts(rows, extended):
+    primary, remaining = [], []
+    seen, events = set(), set()
     for row in rows:
-        text = row["text"].strip()
+        raw = row["text"]
+        text = raw.strip()
         if row["location"] in {"파일명", "제목"} or not text or text == "본문 없음":
             continue
-        key = (row["fingerprint"], row["attachment"], row["location"], text)
+        thread = (row.get("source"), topic_key(row.get("subject", "")) or row.get("id"))
+        key = (thread if extended else None, normalized(" ".join(text.split())))
         if key in seen:
             continue
         seen.add(key)
-        context = {field: row[field][:240] for field in ("subject", "sender", "sent", "attachment", "location") if row.get(field)}
-        if row.get("attachment"):
-            context["attachment"] = re.split(r"[/\\]", row["attachment"])[-1][:240]
-        candidate = Excerpt(len(items) + 1, row["passage"], text, context)
-        if len(compact_json(evidence_payload(question, [*items, candidate])).encode("utf-8")) <= budget:
+        entry = (row, text, len(raw) - len(raw.lstrip()))
+        if not extended:
+            primary.append(entry)
+            continue
+        state = next((n for n, pattern in enumerate(EVENT_SIGNALS) if pattern.search(text)), len(EVENT_SIGNALS))
+        event = (thread, row.get("sent", "")[:10], state)
+        (remaining if event in events else primary).append(entry)
+        events.add(event)
+    return primary + remaining
+
+
+def pack_excerpts(question, rows, budget=0, *, with_context=False, chars=0, limit=MAX_EXCERPT_LENGTH):
+    if not budget:
+        return tuple(Excerpt(number, row["passage"], text[:limit], start=offset)
+                     for number, (row, text, offset) in enumerate(prioritized_excerpts(rows, False)[:MAX_EXCERPTS], 1))
+
+    items = []
+    candidates = prioritized_excerpts(rows, True)
+    words = sorted(query_words(question, fuzzy=True), key=len, reverse=True)
+    chars_used = 0
+    for position, (row, text, offset) in enumerate(candidates):
+        context = None
+        if with_context:
+            context = {field: row[field][:240] for field in ("subject", "sender", "sent", "attachment", "location")
+                       if row.get(field)}
+            if context.get("attachment"):
+                context["attachment"] = re.split(r"[/\\]", row["attachment"])[-1][:240]
+        focus = next((match.start() for word in words
+                      if (match := re.search(re.escape(word), text, re.I))), 0)
+        decision = next((match for pattern in EVENT_SIGNALS if (match := pattern.search(text))), None)
+        if decision:
+            focus = decision.start()
+        remaining = min(4, len(candidates) - position - 1, MAX_INTERNAL_EXCERPTS - len(items) - 1)
+        room = min(len(text), max(0, chars - chars_used - 120 * remaining)) if chars else len(text)
+        available = budget - (500 if with_context else 330) * remaining
+
+        def make_excerpt(length):
+            start = max(0, min(len(text) - length, focus - length // 3))
+            return Excerpt(len(items) + 1, row["passage"], text[start:start + length], context, offset + start)
+
+        low, high = 1, room
+        candidate = None
+        while low <= high:
+            length = (low + high) // 2
+            excerpt = make_excerpt(length)
+            if len(compact_json(evidence_payload(question, [*items, excerpt])).encode("utf-8")) <= available:
+                candidate = excerpt
+                low = length + 1
+            else:
+                high = length - 1
+        if candidate and len(candidate.text) >= min(100, len(text)):
             items.append(candidate)
-        elif not items:
-            # Keep the matching portion of a single passage on very small budgets.
-            tokens = query_words(question, fuzzy=True)
-            center = next((text.lower().index(term) for term in tokens if term in text.lower()), 0)
-            for length in (700, 350, 175):
-                start = max(0, min(len(text) - length, center - length // 3))
-                short = Excerpt(1, row["passage"], text[start:start + length], context)
-                if len(compact_json(evidence_payload(question, [short])).encode("utf-8")) <= budget:
-                    items.append(short)
-                    break
-        if len(items) == MAX_INTERNAL_EXCERPTS:
+            chars_used += len(candidate.text)
+        if len(items) == MAX_INTERNAL_EXCERPTS or (chars and chars_used >= chars):
             break
     return tuple(items)
 
@@ -254,6 +326,8 @@ class Review:
     pcf: bool = False
     case: dict | None = None
     internal_budget: int = 0
+    review_budget: int = 0
+    review_chars: int = 0
 
 
 class Reviews:
@@ -261,27 +335,20 @@ class Reviews:
         self._pending = {}
         self._lock = threading.Lock()
 
-    def create(self, question, rows, generation=None, limit=MAX_EXCERPT_LENGTH, *, pcf=False, case=None, internal_budget=0):
+    def create(self, question, rows, generation=None, limit=MAX_EXCERPT_LENGTH, *, pcf=False, case=None,
+               internal_budget=0, review_budget=0, review_chars=0):
         if case is not None:
             excerpts = tuple(Excerpt(n, row["passage"], row["text"]) for n, row in enumerate(rows, 1))
-        elif internal_budget:
-            excerpts = internal_excerpts(question, rows, internal_budget)
         else:
-            texts = {}
-            for row in rows:
-                if row["location"] in {"파일명", "제목"}:
-                    continue
-                text = row["text"].strip()[:limit]
-                if text and text != "본문 없음":
-                    texts.setdefault(text, row["passage"])
-                if len(texts) == MAX_EXCERPTS:
-                    break
-            excerpts = tuple(Excerpt(n, passage, text) for n, (text, passage) in enumerate(texts.items(), 1))
+            review_budget = review_budget or internal_budget
+            excerpts = pack_excerpts(question, rows, review_budget, with_context=bool(internal_budget),
+                                     chars=review_chars, limit=limit)
         if not excerpts:
             return None, None
         token = secrets.token_urlsafe(24)
         now = time.monotonic()
-        review = Review(now + REVIEW_TTL, question, excerpts, generation, pcf, case, internal_budget)
+        review = Review(now + REVIEW_TTL, question, excerpts, generation, pcf, case,
+                        internal_budget, review_budget, review_chars)
         with self._lock:
             self._pending = {key: value for key, value in self._pending.items() if value.expires > now}
             if len(self._pending) >= 8:
