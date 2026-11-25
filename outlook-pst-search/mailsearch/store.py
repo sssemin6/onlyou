@@ -1679,8 +1679,8 @@ class Store:
             for part in passages:
                 text = normalized(part["text"] + " " + (part["name"] or ""))
                 matches = sum(word in text for word in words)
-                score = (part["location"] != "파일명", bool(DECISION_SIGNAL.search(part["text"])),
-                         matches, bool(part["name"] and filters.get("prefer_attachment")), -part["id"])
+                score = (part["location"] != "파일명", matches, bool(DECISION_SIGNAL.search(part["text"])),
+                         bool(part["name"] and filters.get("prefer_attachment")), -part["id"])
                 choices = best[part["mail"]]
                 choices.append((score, part["id"]))
                 choices.sort(reverse=True)
