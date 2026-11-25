@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 from threading import Lock, RLock, Thread, local
 from datetime import date, datetime, time as midnight, timedelta, timezone
 from functools import lru_cache
-from itertools import tee
+from itertools import tee, zip_longest
 from pathlib import Path
 
 from .pcf import COMMENT_HEADER, PCF_CELL, PCF_FIELDS, case_key, cell_location, pcf_field_value
@@ -96,6 +96,10 @@ CREATE INDEX IF NOT EXISTS bucket_passage ON vector_buckets(passage);
 CREATE TABLE IF NOT EXISTS attachment_extracts (
     digest BLOB PRIMARY KEY, locations TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS embedding_revisions (
+    source INTEGER NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+    version INTEGER NOT NULL, model TEXT NOT NULL, PRIMARY KEY(source,version,model)
+) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS embedding_values (
     model TEXT NOT NULL, digest BLOB NOT NULL, value BLOB NOT NULL,
     PRIMARY KEY(model,digest)
@@ -155,6 +159,10 @@ SYNONYMS = {
     "정해": ("확정", "승인"), "결정": ("확정", "승인"), "견적": ("단가", "금액"),
     "반려": ("거절", "취소"), "취소": ("번복", "철회"), "회신": ("답변",),
 }
+
+
+def contextual_model_key(model):
+    return "metadata-v1:" + model if model else ""
 
 
 def now():
@@ -1023,6 +1031,9 @@ class Store:
         if filters.get("source"):
             clauses.append("m.source=?")
             params.append(filters["source"])
+        if "vector_sources" in filters:
+            clauses.append("m.source IN (SELECT value FROM json_each(?))")
+            params.append(json.dumps(filters["vector_sources"]))
         if filters.get("regular_only"):
             clauses.append("m.kind IN ('mail','document')")
         for name, col in {"sender": "m.sender", "recipient": "m.recipient", "subject": "m.subject"}.items():
@@ -1456,6 +1467,26 @@ class Store:
                 key = (row["fingerprint"], row["source"]) if self.deferred_access() else row["fingerprint"]
                 selected.setdefault(key, row)
         return list(selected.values())
+
+    def semantic_contextual(self, values, model, filters, **options):
+        """Use one input format per archive; keep legacy searches during migration."""
+        contextual = contextual_model_key(model)
+        source = filters.get("source")
+        with self.connection() as conn:
+            archives = conn.execute(
+                """SELECT s.id,r.model FROM sources s LEFT JOIN embedding_revisions r
+                   ON r.source=s.id AND r.version=coalesce(s.active,s.pending) AND r.model=?
+                   WHERE (? IS NULL OR s.id=?) AND (s.active IS NOT NULL OR s.pending IS NOT NULL)""",
+                (contextual, source, source),
+            ).fetchall()
+        modern = [row["id"] for row in archives if row["model"]]
+        legacy = [row["id"] for row in archives if not row["model"]]
+        if not modern or not legacy:
+            return self.semantic(values, contextual if modern else model, filters, **options)
+        current = self.semantic(values, contextual, {**filters, "vector_sources": modern}, **options)
+        previous = self.semantic(values, model, {**filters, "vector_sources": legacy}, **options)
+        # Scores from different input formats are not directly comparable.
+        return [row for pair in zip_longest(current, previous) for row in pair if row is not None][:options.get("limit", 40)]
 
     def semantic(self, values, model, filters, limit=40):
         vector = vector_array(pack_vector(values))
