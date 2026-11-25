@@ -1361,6 +1361,71 @@ class Integration(unittest.TestCase):
             self.assertEqual(self.call("/api/external/send", approval)[0], 409)
             self.assertEqual(connection.request.call_count, 1)
 
+    def test_intranet_one_click_validates_citations_and_external_still_requires_review(self):
+        source = self.import_mail()
+        quote = "요청 주신 4월 25일 납품으로 최종 승인합니다."
+        payload = {"query": "A-17 납품일은 언제 최종 승인됐어?", "filters": {"source": source, "tab": "mail"}}
+        route = "/api/intranet/answer"
+        self.assertEqual(self.call(route, payload, token=False)[0], 403)
+        self.assertEqual(self.call(route, payload)[0], 403)
+        selections = {"answer": "answer-model-a", "embedding": "", "rerank": ""}
+        self.assertEqual(self.call("/api/intranet/settings", {"action": "apply", "key": "key",
+                                                               "selections": selections})[0], 200)
+        self.assertTrue(self.call("/api/sources")[1]["intranet_answer"])
+
+        def complete(_instructions, content, *, token_limit, timeout):
+            evidence = next(item for item in json.loads(content)["evidence"] if quote in item["text"])
+            return {"status": "answered", "claims": [
+                {"text": "최종 승인 납품일은 4월 25일입니다.", "citations": [{"source": evidence["source"], "quote": quote}]},
+                {"text": "납품일은 4월 30일입니다.", "citations": [
+                    {"source": evidence["source"], "quote": "4월 30일 납품을 승인합니다."}]},
+            ]}
+
+        gateway = self.ai.embedding_api
+        with (patch.dict(os.environ, MAILSEARCH_AGENTIC_RETRY="1"),
+              patch.object(gateway, "rewrite_query", return_value={
+                  "sub_queries": ["A-17 납기"], "keywords": ["A-17"], "filters": {},
+              }) as rewrite,
+              patch.object(gateway, "diagnose_evidence_gap", return_value={"sufficient": True}) as diagnose,
+              patch.object(self.app.external, "complete", side_effect=complete) as wire):
+            self.assertEqual(self.call(route, {**payload, "filters": {"tab": "pcf"}})[0], 400)
+            status, result = self.call(route, payload)
+            self.assertEqual((status, result["provider"]), (200, "intranet"))
+            self.assertIn(result["status"], ("answered", "partial"))
+            claim, = result["claims"]
+            citation, = claim["citations"]
+            self.assertEqual(citation["quote"], quote)
+            self.assertIn(quote, self.call(f"/api/evidence/{citation['passage']}")[1]["text"])
+            self.assertNotIn("review", result)
+            rewrite.assert_called_once()
+            diagnose.assert_called_once()
+            wire.assert_called_once()
+            self.assertEqual(wire.call_args.kwargs["timeout"], 60)
+            self.assertTrue(all(item.get("context") for item in json.loads(wire.call_args.args[1])["evidence"]))
+
+        options = {"action": "apply", "destination": CHAT_URL, "model": "generic-model", "key": "generic-key"}
+        self.assertEqual(self.call("/api/external/settings", options)[0], 200)
+        self.assertFalse(self.call("/api/sources")[1]["intranet_answer"])
+        with (patch.dict(os.environ, MAILSEARCH_QUERY_REWRITE="1", MAILSEARCH_AGENTIC_RETRY="1",
+                         MAILSEARCH_INTERNAL_URL="", MAILSEARCH_QUERY_REWRITE_MODEL="",
+                         MAILSEARCH_EXTERNAL_INPUT_BYTES="", MAILSEARCH_EXTERNAL_EVIDENCE_CHARS=""),
+              patch.object(gateway, "rewrite_query", return_value=None),
+              patch.object(gateway, "diagnose_evidence_gap", return_value={"sufficient": True}) as diagnose,
+              patch.object(self.app.external, "complete", side_effect=complete) as wire):
+            self.assertEqual(self.call(route, {**payload, "intranet": True})[0], 403)
+            self.assertEqual(self.call("/api/external/send", {"excerpts": [1]})[0], 400)
+            status, preview = self.call("/api/external/preview", payload)
+            self.assertEqual(status, 200)
+            item = next(item for item in preview["excerpts"] if quote in item["text"])
+            self.assertIsNone(item["context"])
+            self.assertEqual(set(json.loads(diagnose.call_args.args[1])), {"question", "coverage"})
+            wire.assert_not_called()
+            status, result = self.call("/api/external/send", {"review": preview["review"], "excerpts": [item["id"]]})
+            self.assertEqual((status, result["provider"]), (200, "external"))
+            self.assertEqual(result["claims"][0]["citations"][0]["quote"], quote)
+            wire.assert_called_once()
+            self.assertEqual(wire.call_args.kwargs["timeout"], 35)
+
     def test_external_review_refuses_changed_archive_and_unreviewed_selection(self):
         self.import_mail()
         self.app.external = ExternalAI("https://gateway.example.invalid/v1/chat/completions", "test-model", "placeholder-token")
@@ -3305,11 +3370,13 @@ class RAGStability(unittest.TestCase):
             self.assertEqual(diagnose.call_count, 2)
             self.assertEqual(search.call_count, 2)
 
-    def test_gateway_gap_diagnosis_transmits_coverage_without_mail_content(self):
+    def test_gateway_gap_diagnosis_transmits_bounded_excerpts_only_when_allowed(self):
         gateway = self.gateway(answer="answer-model-a")
         ai = LocalAI("", embedding_api=gateway)
         question = "A17 시제품 승인과 양산 BOM 비교"
-        evidence = [{"text": "Private body 시제품 승인합니다.", "sender": "Private sender", "subject": "Private subject"}]
+        evidence = [{"text": f"Private body {n} 시제품 승인합니다. " + "근거" * 180,
+                     "sender": "Private sender", "subject": "Private subject", "sent": "2026-11-25",
+                     "location": "표 2", "attachment": "BOM.xlsx"} for n in range(10)]
         raw = {"sufficient": False, "missing_aspects": ["양산 BOM"], "follow_up_queries": ["양산 BOM"]}
         reply = {"choices": [{"message": {"content": json.dumps(raw)}}]}
         with patch.object(gateway, "request", return_value=reply) as request:
@@ -3320,10 +3387,86 @@ class RAGStability(unittest.TestCase):
         self.assertGreater(timeout, 0)
         self.assertLessEqual(timeout, 2.5)
         data = json.loads(payload["messages"][1]["content"])
+        self.assertEqual(set(data), {"question", "evidence"})
+        self.assertEqual(data["evidence"], [
+            {**{key: value for key, value in row.items() if key != "text"}, "excerpt": row["text"][:350]}
+            for row in evidence[:8]
+        ])
+        with patch.object(gateway, "request", return_value=reply) as request:
+            ai.diagnose_evidence_gap(question, evidence, allow_intranet_evidence=False)
+        data = json.loads(request.call_args.args[1]["messages"][1]["content"])
         self.assertEqual(set(data), {"question", "coverage"})
-        self.assertEqual((data["coverage"]["prototype"], data["coverage"]["production"]), (1, 0))
-        self.assertNotIn("Private", json.dumps(payload))
+        self.assertEqual((data["coverage"]["prototype"], data["coverage"]["production"]), (10, 0))
+        self.assertNotIn("Private", json.dumps(data))
         self.assertIsNone(parse_evidence_gap({**raw, "sufficient": True}, question))
+
+    def test_trusted_followup_batches_vectors_and_reranks_combined_scope_once(self):
+        gateway = self.gateway(answer="answer-model-a", embedding="bge-m3", rerank="bge-reranker-v2-m3")
+        ai = LocalAI("", embedding_api=gateway)
+        ai.rewrite_model = "fixture"
+        question = "A17 시제품 승인과 양산 BOM 비교"
+        gap = parse_evidence_gap({"sufficient": False, "follow_up_queries": ["양산 BOM", "양산 단가"]}, question)
+        scope = {"source": 3, "before": "2026-11-25"}
+
+        def row(number, text):
+            return {"passage": number, "id": number, "fingerprint": str(number), "subject": "Atlas",
+                    "text": text, "location": "본문", "kind": "mail"}
+
+        primary = [row(n, f"시제품 검토 근거 {n}") for n in range(1, 36)]
+        lexical, vector = row(101, "양산 BOM이 승인되었습니다."), row(102, "양산 단가는 1만원입니다.")
+        forbidden = row(103, "범위 밖 자료")
+        visible = {item["passage"]: item for item in [*primary, lexical, vector]}
+        store = MagicMock(spec=Store)
+        store.search_profile = SearchProfile("answer")
+        store.search_profile.started -= 22
+        store.lexical.return_value = [lexical]
+        store.semantic_contextual.return_value = [vector, forbidden]
+        store.related.return_value = []
+        store.passages.side_effect = lambda ids, filters, **options: [
+            visible[pid] for pid in ids if pid in visible and filters == scope
+        ]
+
+        def rank(_query, docs, *, timeout):
+            self.assertEqual(len(docs), 32)
+            self.assertGreaterEqual(timeout, 2)
+            self.assertLessEqual(timeout, 5)
+            self.assertTrue(any(vector["text"] in doc for doc in docs))
+            self.assertTrue(all(forbidden["text"] not in doc for doc in docs))
+            return sorted(range(len(docs)), key=lambda idx: any(hit["text"] in docs[idx] for hit in (lexical, vector)))
+
+        with (patch.dict(os.environ, MAILSEARCH_AGENTIC_RETRY="1", MAILSEARCH_FOLLOWUP_TIMEOUT="5"),
+              patch.object(ai, "diagnose_evidence_gap", return_value=gap),
+              patch.object(gateway, "embed", return_value=[[1.0, .05], [0.9, .1]]) as embed,
+              patch.object(gateway, "rerank", side_effect=rank) as rerank):
+            evidence, mode, _, ran = supplemental_evidence(
+                store, ai, question, scope, "", primary, "keyword", 2, ceiling=8,
+            )
+            embed.assert_called_once()
+            self.assertEqual(embed.call_args.args[0], list(gap.queries))
+            self.assertEqual(store.semantic_contextual.call_count, 2)
+            rerank.assert_called_once()
+            self.assertEqual((ran, mode), (True, "hybrid"))
+            self.assertEqual(evidence[:6], primary[:6])
+            self.assertEqual(set(row["passage"] for row in evidence[6:]), {101, 102})
+
+            embed.reset_mock()
+            rerank.reset_mock()
+            store.search_profile.started = time.perf_counter()
+            evidence, mode, _, ran = supplemental_evidence(
+                store, ai, question, scope, "", primary, "keyword", 2, ceiling=8,
+                allow_intranet_evidence=False,
+            )
+            self.assertEqual((ran, mode), (True, "keyword"))
+            embed.assert_not_called()
+            rerank.assert_not_called()
+            self.assertNotIn(vector, evidence)
+            with patch.dict(os.environ, MAILSEARCH_FOLLOWUP_TIMEOUT="1.5"):
+                evidence, mode, _, ran = supplemental_evidence(
+                    store, ai, question, scope, "", primary, "keyword", 2, ceiling=8,
+                )
+            self.assertEqual((ran, mode), (True, "hybrid"))
+            self.assertIn(vector, evidence)
+            rerank.assert_not_called()
 
     def test_rerank_timeout_and_redacted_fallback_for_80_candidates(self):
         client = self.gateway(rerank="bge-reranker-v2-m3")
