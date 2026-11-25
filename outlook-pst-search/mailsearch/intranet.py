@@ -1,10 +1,12 @@
 """Configured gateway text model roles and reranking calls."""
 import http.client
+import json
 import os
+import re
 import socket
 import ssl
 
-from .answer import MODEL_NAME
+from .answer import MODEL_NAME, QUERY_REWRITE_TOKEN_LIMIT
 from .embedding import EmbeddingAPI, GatewayRequestError, MODEL, gateway_origin
 from .external import ExternalAI, ExternalRequestError
 
@@ -39,6 +41,8 @@ class IntranetAI(EmbeddingAPI):
         validate_selections(selections, answer_models)
         self.models = dict(selections)
         self.model = MODEL if selections["embedding"] == MODEL else ""
+        override = os.environ.get("MAILSEARCH_GATEWAY_REWRITE_MODEL", "").strip()
+        self.rewrite_model = override if MODEL_NAME.fullmatch(override) else selections["answer"]
         self.answer_client = None
         if selections["answer"]:
             self.answer_client = ExternalAI(self.origin + CHAT_PATH, selections["answer"], key,
@@ -55,7 +59,18 @@ class IntranetAI(EmbeddingAPI):
             return None
         return cls(key, selections, origin=origin, answer_models=answer_models, tls=tls)
 
-    def rerank(self, query, documents, timeout=6):
+    def rewrite_query(self, instructions, prompt, *, timeout):
+        response = self.request(CHAT_PATH, {
+            "model": self.rewrite_model,
+            "messages": [{"role": "system", "content": instructions}, {"role": "user", "content": prompt}],
+            "max_tokens": QUERY_REWRITE_TOKEN_LIMIT,
+            "stream": False,
+        }, timeout)
+        content = response["choices"][0]["message"]["content"]
+        fenced = re.fullmatch(r"\s*```(?:json)?\s*(.*?)\s*```\s*", content, re.S | re.I)
+        return json.loads(fenced[1] if fenced else content)
+
+    def rerank(self, query, documents, timeout=15):
         data = self.request(RERANK_PATH, {
             "model": self.models["rerank"], "query": query, "documents": documents, "top_n": len(documents),
         }, timeout)
