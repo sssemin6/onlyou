@@ -341,6 +341,8 @@ function sourceIndexStatuses(source, embeddingEnabled) {
       detail: embeddingProgress ? "" : "전체 구간 집계 중" };
   } else if (embeddingProgress && embeddingProgress.done === embeddingProgress.total && !stopped) {
     semantic = { mark: "O", status: "완료", progress: embeddingProgress };
+  } else if (running && stage === "finalizing" && embeddingProgress) {
+    semantic = { mark: "△", status: "저장된 임베딩 반영 중", progress: embeddingProgress };
   } else if (source.embedding_total === 0 && state === "ready") {
     semantic = { mark: "—", status: "대상 구간 없음" };
   } else {
