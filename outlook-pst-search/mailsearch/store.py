@@ -47,6 +47,7 @@ CREATE INDEX IF NOT EXISTS mail_source_version_id ON mails(source,version,id);
 CREATE INDEX IF NOT EXISTS mail_message_id ON mails(message_id);
 CREATE INDEX IF NOT EXISTS mail_topic ON mails(topic);
 CREATE INDEX IF NOT EXISTS mail_sent ON mails(sent DESC, id DESC);
+CREATE INDEX IF NOT EXISTS mail_source_version_sent ON mails(source,version,sent DESC,id DESC);
 CREATE TABLE IF NOT EXISTS replies (
     mail INTEGER NOT NULL REFERENCES mails(id) ON DELETE CASCADE, parent TEXT NOT NULL,
     PRIMARY KEY(mail, parent)
@@ -251,6 +252,12 @@ def question_scope(question, filters, *, today=None):
     for start, end in sorted(removed, reverse=True):
         question = question[:start] + " " + question[end:]
     return " ".join(question.split()) if removed else question, scope
+
+
+DECISION_SIGNAL = re.compile(
+    r"철회|번복|취소|반려|승인|확정|합의|채택|보류|제안|검토|"
+    r"\b(?:approv\w*|reject\w*|withdraw\w*|cancel\w*|confirm\w*|propos\w*)\b", re.I,
+)
 
 
 def prioritize_attachments(rows, filters):
@@ -1305,6 +1312,34 @@ class Store:
                     results.append({**dict(row), **dict(part)})
         return results
 
+    def scoped_lexical(self, conn, statement, filters, columns, window):
+        # Prefer a bounded mail range, then check FTS by rowid. Source/date
+        # predicates use the same index and ordering as the mail shortlist.
+        coarse = {key: filters[key] for key in ("source", "after", "before") if filters.get(key)}
+        base, base_params = self.scope(coarse)
+        where, params = self.scope(filters)
+        if coarse.get("source"):
+            mail_range = f"""SELECT m.id FROM sources s CROSS JOIN mails m INDEXED BY mail_source_version_sent
+                             ON m.source=s.id AND m.version=coalesce(s.active,s.pending)
+                             WHERE s.id=? AND {base} ORDER BY m.sent DESC,m.id DESC LIMIT 4096"""
+            base_params = [coarse["source"], *base_params]
+        elif not coarse and filters.get("sender") and (words := query_words(filters["sender"])):
+            mail_range = """SELECT rowid id FROM quick_terms WHERE quick_terms MATCH ? LIMIT 4096"""
+            base_params = ["people : (" + fts_query(words, "grams") + ")"]
+        else:
+            mail_range = f"""SELECT m.id FROM mails m INDEXED BY mail_sent CROSS JOIN sources s ON s.id=m.source
+                             WHERE {base} ORDER BY m.sent DESC,m.id DESC LIMIT 4096"""
+        return conn.execute(
+            f"""WITH mail_range AS MATERIALIZED ({mail_range}), shortlist AS MATERIALIZED (
+                    SELECT p.id FROM mail_range r CROSS JOIN mails m ON m.id=r.id
+                    CROSS JOIN sources s ON s.id=m.source CROSS JOIN passages p ON p.mail=m.id
+                    WHERE {where} LIMIT 12000)
+                SELECT {columns} FROM shortlist c CROSS JOIN terms ON terms.rowid=c.id AND terms MATCH ?
+                CROSS JOIN passages p ON p.id=c.id CROSS JOIN mails m ON m.id=p.mail {JOIN}
+                ORDER BY bm25(terms,7.0,2.0,4.0,1.0),p.id LIMIT ?""",
+            (*base_params, *params, statement, window),
+        )
+
     def lexical(self, question, filters, fuzzy=False, limit=100):
         where, params = self.scope(filters)
         words = query_words(question, fuzzy)
@@ -1329,6 +1364,10 @@ class Store:
         strategies = [(term_statement, 1.5), (gram_statement, 1.0)]
         if term_statement == gram_statement:
             strategies = [(term_statement, 2.5)]
+        filtered = bool(params or filters.get("regular_only"))
+        window = max(limit * 3, 256)
+        if filtered:
+            window = max(window, min(2000, max(1024, limit * 6)))
         with self.connection() as conn:
             for position, (statement, weight) in enumerate(strategies):
                 if position and exact_identifier and ranked and not fuzzy:
@@ -1338,7 +1377,7 @@ class Store:
                 columns = "p.id" if defer else "p.id,m.source,m.kind,m.item,s.path,s.kind source_kind"
                 candidates = conn.execute(
                     "SELECT rowid FROM terms WHERE terms MATCH ? ORDER BY bm25(terms,7.0,2.0,4.0,1.0) LIMIT ?",
-                    (statement, max(limit * 3, 256)),
+                    (statement, window),
                 ).fetchall()
                 candidate_ids = [row[0] for row in candidates]
                 scoped = conn.execute(
@@ -1354,19 +1393,13 @@ class Store:
                         top.append(row)
                     if len(top) == limit:
                         break
-                if len(top) < limit and len(candidate_ids) == max(limit * 3, 256):
-                    # A narrow date, sender or source filter can exhaust the initial window.
-                    # Rank within the full scope in that case to retain the usual results.
-                    top = []
-                    cursor = conn.execute(
-                        f"""SELECT {columns} FROM terms JOIN passages p ON p.id=terms.rowid
-                            JOIN mails m ON m.id=p.mail {JOIN} WHERE terms MATCH ? AND {where}
-                            ORDER BY bm25(terms,7.0,2.0,4.0,1.0)""",
-                        (statement, *params),
-                    )
+                if len(top) < limit and len(candidate_ids) == window:
+                    # Keep globally ranked hits and fill from the bounded scope.
+                    cursor = self.scoped_lexical(conn, statement, filters, columns, window)
+                    seen = {row["id"] for row in top}
                     try:
                         for row in cursor:
-                            if self.readable(row, sources, documents):
+                            if row["id"] not in seen and self.readable(row, sources, documents):
                                 top.append(row)
                             if len(top) == limit:
                                 break
@@ -1504,7 +1537,7 @@ class Store:
                 (json.dumps(sorted(mails)),),
             ).fetchall()
 
-    def related(self, seeds, filters, *, hops=1):
+    def related(self, seeds, filters, *, hops=1, question=""):
         if not seeds:
             return []
         where, params = self.scope(filters)
@@ -1526,8 +1559,7 @@ class Store:
             frontier = set(identifiers)
             for hop in range(max(1, min(hops, 3))):
                 hits = conn.execute(
-                    f"""SELECT m.id,m.message_id,m.topic,m.sender,m.recipient,
-                               (SELECT min(id) FROM passages WHERE mail=m.id) passage
+                    f"""SELECT m.id,m.message_id,m.topic,m.sender,m.recipient
                         FROM mails m {JOIN} WHERE {where} AND
                         (m.message_id IN (SELECT value FROM json_each(?))
                          OR m.id IN (SELECT mail FROM replies WHERE parent IN (SELECT value FROM json_each(?)))
@@ -1556,9 +1588,32 @@ class Store:
         for row in candidates.values():
             emails = set(re.findall(r"[\w.+-]+@[\w.-]+", (row["sender"] + " " + row["recipient"]).lower()))
             if row["id"] not in seeds and (row["message_id"] in identifiers or row["id"] in reply_ids or refs[row["topic"]] & emails):
-                linked.append(row["passage"])
-        found = {row["passage"]: row for row in self.passages(linked[:24], filters)}
-        return [found[item] for item in linked[:24] if item in found][:6]
+                linked.append(row["id"])
+        if not linked:
+            return []
+        words = [word for word in query_words(question, fuzzy=True) if len(word) > 1]
+        best = defaultdict(list)
+        linked = linked[:24]
+        with self.connection() as conn:
+            passages = conn.execute(
+                """SELECT p.id,p.mail,p.text,p.location,a.name FROM json_each(?) ids
+                   CROSS JOIN passages p ON p.mail=ids.value LEFT JOIN attachments a ON a.id=p.attachment""",
+                (json.dumps(linked),),
+            )
+            for part in passages:
+                text = normalized(part["text"] + " " + (part["name"] or ""))
+                matches = sum(word in text for word in words)
+                score = (part["location"] != "파일명", bool(DECISION_SIGNAL.search(part["text"])),
+                         matches, bool(part["name"] and filters.get("prefer_attachment")), -part["id"])
+                choices = best[part["mail"]]
+                choices.append((score, part["id"]))
+                choices.sort(reverse=True)
+                del choices[2:]
+            picked = [best[mail][0][1] for mail in linked if best[mail]]
+            picked.extend(best[mail][1][1] for mail in linked if len(best[mail]) > 1
+                          and best[mail][1][0][0] and any(best[mail][1][0][1:4]))
+            found = {row["passage"]: row for row in self.passages(picked, filters, conn)}
+        return [found[item] for item in picked if item in found][:6]
 
     def evidence_context(self, row, filters):
         """Fetch reviewable context from the same mail part or worksheet."""
