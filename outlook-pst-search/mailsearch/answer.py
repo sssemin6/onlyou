@@ -786,13 +786,31 @@ def follow_up_replies(store, anchors, filters, sender):
     return [replies.pop(row["passage"]) for row in rows if row["passage"] in replies]
 
 
+def evidence_content_key(row):
+    text = normalized(" ".join(row["text"].split()))
+    if row.get("kind") == "pcf":
+        return "pcf", row["passage"]
+    name = row.get("attachment")
+    if name:
+        return "attachment", normalized(re.split(r"[/\\]", name)[-1]), text
+    return "mail", topic_key(row.get("subject", "")), text
+
+
+def dedupe_by_content(rows):
+    """Choose the first ranked visible representative of each excerpt."""
+    unique = {}
+    for row in rows:
+        unique.setdefault(evidence_content_key(row), row)
+    return list(unique.values())
+
+
 def combine_answer_evidence(pools, anchors=()):
     """Interleave ranked hits so one project cannot consume the whole evidence window."""
     found = {}
     duplicates = set()
     for row in [*anchors, *(pool[index] for index in range(max(map(len, pools), default=0))
                             for pool in pools if index < len(pool))]:
-        key = (row["fingerprint"], row["location"], row["attachment"], row["text"])
+        key = evidence_content_key(row)
         if row["passage"] not in found and key not in duplicates:
             found[row["passage"]] = row
             duplicates.add(key)
@@ -1009,7 +1027,8 @@ def evidence_for(store, ai, question, filters, context, semantic=True, limit=9, 
                     mode = "keyword_only"
     intent = question if intent is None else intent
     recent = needs_recency_boost(intent, filters)
-    seeds = reciprocal_rank(pools, candidate_limit, recent=recent)
+    ranked = reciprocal_rank(pools, None, recent=recent)
+    seeds = dedupe_by_content(ranked)[:candidate_limit]
     if rerank and len(seeds) > 1:
         with store.measure("rerank"):
             seeds = ai.rerank_candidates(search_text, seeds, limit=candidate_limit, text_limit=1100)
@@ -1024,17 +1043,9 @@ def evidence_for(store, ai, question, filters, context, semantic=True, limit=9, 
             chosen.append(row)
     with store.measure("context"):
         linked = store.related(list(dict.fromkeys(row["id"] for row in chosen[:7])), filters, hops=thread_hops, question=search_text)
-    reserved = latest_thread_decisions(intent, chosen, [*seeds, *linked], min(4, limit)) if recent else []
-    seen = set()
-    evidence = []
+    reserved = latest_thread_decisions(intent, chosen, [*ranked, *linked], min(4, limit)) if recent else []
     leading = max(0, min(4, limit - len(reserved)))
-    for row in [*chosen[:leading], *reserved, *chosen[leading:4], *linked[:4], *chosen[4:]]:
-        key = (row["fingerprint"], row["attachment"], row["location"], row["text"])
-        if key not in seen:
-            seen.add(key)
-            evidence.append(row)
-        if len(evidence) == limit:
-            break
+    evidence = dedupe_by_content([*chosen[:leading], *reserved, *chosen[leading:4], *linked[:4], *chosen[4:]])[:limit]
     if expand:
         # Reserve places for matched passages, related replies and their original context.
         primary = evidence if max_evidence else evidence[:4]
@@ -1058,7 +1069,7 @@ def evidence_for(store, ai, question, filters, context, semantic=True, limit=9, 
                     row = store.expand_passage_window(row)
                 key = (row["id"], row["attachment"], row["location"], row.get("start"), row["text"])
                 windows.setdefault(key, row)
-            evidence = list(windows.values())
+            evidence = dedupe_by_content(windows.values())
     return evidence, mode
 
 
