@@ -138,9 +138,11 @@ class USearchIndex:
 
     def candidates(self, conn, vector, model, filters, limit):
         wanted = []
+        allowed_sources = filters.get("vector_sources")
         for row in conn.execute("""SELECT id,active FROM sources WHERE state<>'removing'
                                   AND (active IS NOT NULL OR pending IS NOT NULL)"""):
-            if filters.get("source") and filters["source"] != row["id"]:
+            if ((filters.get("source") and filters["source"] != row["id"])
+                    or (allowed_sources is not None and row["id"] not in allowed_sources)):
                 continue
             if row["active"] is None:
                 # A first import is mutable until its version is published.
