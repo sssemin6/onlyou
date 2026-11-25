@@ -9,7 +9,7 @@ $searchLog = Join-Path $env:LOCALAPPDATA 'OutlookMailSearch\app-runtime.log'
 Select-String -Path $searchLog -Pattern 'Search profile' | Select-Object -Last 30
 ```
 
-로그의 같은 id로 검색과 원본 확인을 연결합니다. phase=query는 최초 검색, phase=verify는 원본 확인, phase=answer는 로컬 생성 요청이며, phase=preview와 phase=external_answer는 검토용 발췌 및 외부 생성 요청입니다. rewrite_ms는 선택형 질의 분해, followup_ms는 누락 진단과 동일 범위의 추가 검색, fts_ms는 키워드 검색과 결과 미리보기, embed_ms는 검색어 벡터 요청, vector_ms는 후보 조회와 비교, rerank_ms는 재정렬, access_ms는 실제 파일·폴더 접근 확인입니다. 로컬 답변에는 context_ms, generation_ms, validation_ms도 기록합니다. 병렬 구간과 별도 요청이 있으므로 구간을 더한 값은 전체 시간과 다를 수 있습니다. 검색어와 메일 내용은 계측 로그에 기록하지 않습니다.
+로그의 같은 id로 검색과 원본 확인을 연결합니다. phase=query는 최초 검색, phase=verify는 원본 확인, phase=answer는 로컬 생성, phase=intranet_answer는 사내 즉시 답변 요청입니다. phase=preview와 phase=external_answer는 검토용 발췌 및 검토 후 생성 요청입니다. rewrite_ms는 질의 분해, followup_ms는 누락 진단과 동일 범위의 추가 검색 및 통합 재정렬, fts_ms는 키워드 검색과 결과 미리보기, embed_ms는 검색어 벡터 요청, vector_ms는 후보 조회와 비교, rerank_ms는 재정렬, access_ms는 실제 파일·폴더 접근 확인입니다. 답변 생성 경로에는 context_ms, generation_ms, validation_ms도 기록합니다. 병렬 구간과 겹치는 계측이 있으므로 구간을 더한 값은 전체 시간과 다를 수 있습니다. 검색어와 메일 내용은 계측 로그에 기록하지 않습니다.
 
 동일한 검색어·보관함 범위를 사용하고 처음 실행과 반복 실행을 구별해 비교하세요. 공유폴더의 첫 확인은 검색과 별도 요청으로 실행됩니다. 원본 보관함을 병렬로 검사하고, 확인된 결과를 먼저 돌려줍니다. 응답 기한을 넘긴 경로의 검사는 백그라운드에서 완료되면 캐시에 반영됩니다. 최근 확인이 성공한 결과는 최대 10초간 재사용합니다. 원문·첨부 열기와 답변 API 전송 전에는 접근을 다시 확인합니다. 기존 API 호출은 두 번째 요청 없이 접근 확인까지 마친 결과를 돌려줍니다. 브라우저는 defer_access를 지정해 분리된 경로를 씁니다.
 
@@ -95,8 +95,9 @@ WHERE model = 'bge-m3' AND passage IN (SELECT value FROM json_each('[1,2,3]'));
 ## 8. 질의 확장과 근거 예산 설정
 
 - 질의 분해는 `MAILSEARCH_QUERY_REWRITE_MODEL`의 로컬 Ollama 모델을 우선합니다. 이 설정이 비어 있으면 사내 게이트웨이의 답변 모델 또는 `MAILSEARCH_GATEWAY_REWRITE_MODEL`을 사용합니다. 게이트웨이에는 질문과 현지 날짜가 전달됩니다. `MAILSEARCH_QUERY_REWRITE=0`으로 질의 분해를 끌 수 있습니다. 2.5초 안에 결과를 받지 못하면 기존 규칙 기반 검색을 실행합니다. 최대 3개 하위 질의 중 캐시에 없는 항목은 한 번에 임베딩합니다. 추정 필터는 직접 지정한 조건을 우선하며, 적중이 없으면 추정 조건을 풀어 다시 찾습니다.
-- 검토용 근거량은 `MAILSEARCH_INTERNAL_EVIDENCE_CHARS` 또는 `MAILSEARCH_EXTERNAL_EVIDENCE_CHARS`의 `4000`, `12000`, `24000` 값으로 바꿔 비교할 수 있습니다. JSON 요청의 별도 UTF-8 한도는 `MAILSEARCH_INTERNAL_INPUT_BYTES` 또는 `MAILSEARCH_EXTERNAL_INPUT_BYTES`로 지정합니다. 사내 프로필은 등록된 사내 API에 사용됩니다. 일반 외부 프로필에는 선택한 원문 발췌와 질문만 전송합니다.
-- 일반 외부 프로필을 별도로 설정하지 않으면 기존 기본값인 5개·각 800자를 사용합니다. 사내 프로필의 기본 입력 예산은 24,000바이트입니다. 본문 길이와 JSON 메타데이터에 따라 실제 채우는 글자 수는 달라집니다.
+- 근거량은 `MAILSEARCH_INTERNAL_EVIDENCE_CHARS` 또는 `MAILSEARCH_EXTERNAL_EVIDENCE_CHARS`의 `4000`, `12000`, `24000` 값으로 바꿔 비교할 수 있습니다. 사내 게이트웨이는 `48000`도 지원합니다. JSON 요청의 UTF-8 한도는 `MAILSEARCH_INTERNAL_INPUT_BYTES` 또는 `MAILSEARCH_EXTERNAL_INPUT_BYTES`로 지정합니다.
+- 사내 게이트웨이의 기본 입력 예산은 64,000바이트이며 상한은 192,000바이트입니다. 일반 외부 프로필은 기본 5개·각 800자를 검토 화면에 표시하며, 선택한 원문과 질문을 보냅니다. 본문 길이와 JSON 메타데이터에 따라 실제 채우는 글자 수가 달라집니다.
+- 사내 게이트웨이의 추가 검색 예산은 복합 질문 10초, 일반 결정 질문 6초입니다. `MAILSEARCH_FOLLOWUP_TIMEOUT`을 초 단위로 지정할 수 있으며 전체 요청에서 생성에 배정한 시간을 먼저 제외합니다. 남은 시간이 2초 이상이면 최대 32개 통합 후보를 한 번 더 재정렬합니다.
 - 날짜·보관함 범위가 좁은 FTS 요청은 상위 결과가 부족하면 범위 안의 추가 후보를 조회합니다. 이 경로는 최대 4,096개 메일과 12,000개 구간을 후보로 사용합니다. 관련 회신에서는 결정 표현과 질문 용어를 기준으로 본문·첨부 구간을 선택합니다.
 
 ## 9. 6개 과제 적용 전후 벤치마크
