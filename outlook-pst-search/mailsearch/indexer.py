@@ -19,7 +19,7 @@ from .extract import CREATE_FLAGS, DOCUMENT_SUFFIXES, MAX_ATTACHMENT, extract_at
 from .filesystem import local_path, source_path, stable_input
 from .outlook import DEFAULT_OUTLOOK, OutlookError, outlook_modules, outlook_store
 from .pcf import WORD_SUFFIXES
-from .store import (MAIL_INDEX_FORMAT, buckets, contextual_model_key, document_kind, document_identity, matches_fingerprint, now,
+from .store import (MAIL_INDEX_PREFIXES, buckets, contextual_model_key, document_kind, document_identity, matches_fingerprint, now,
                     pack_vector, read_signature, sections, vector_array)
 from .vector_index import prune_vector_files
 
@@ -950,7 +950,7 @@ class Indexer:
             self.check(event)
             retained = {entry: old[entry]["id"] for entry, folder in folders.items()
                         if entry in old and old[entry]["folder"] == folder
-                        and old[entry]["fingerprint"].startswith(MAIL_INDEX_FORMAT + ":")}
+                        and old[entry]["fingerprint"].startswith(MAIL_INDEX_PREFIXES)}
             pending_ids = {entry for entry, item in pending.items()
                            if entry not in retained and folders.get(entry) == item["folder"]}
             with self.store.connection() as conn:
@@ -1117,7 +1117,7 @@ class Indexer:
                     stat_result = path.stat()
                     signature = (stat_result.st_size, stat_result.st_mtime_ns)
                     old = old_mails.get(item)
-                    if (old and old["folder"] == folder and old["fingerprint"].startswith(MAIL_INDEX_FORMAT + ":")
+                    if (old and old["folder"] == folder and old["fingerprint"].startswith(MAIL_INDEX_PREFIXES)
                             and (old["file_size"], old["file_mtime_ns"]) == signature):
                         mail_id = self.store.adopt_mail(conn, version, old["id"])
                     else:
@@ -1125,7 +1125,7 @@ class Indexer:
                         current_stat = path.stat()
                         if (current_stat.st_size, current_stat.st_mtime_ns) != signature:
                             raise ImportIssue("changed")
-                        if (old and old["folder"] == folder and old["fingerprint"].startswith(MAIL_INDEX_FORMAT + ":")
+                        if (old and old["folder"] == folder and old["fingerprint"].startswith(MAIL_INDEX_PREFIXES)
                                 and matches_fingerprint(mail, item, old["fingerprint"])):
                             mail_id = self.store.adopt_mail(conn, version, old["id"])
                         else:
