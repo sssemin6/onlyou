@@ -7,7 +7,7 @@ from time import perf_counter
 from uuid import uuid4
 
 
-STAGES = ("rewrite", "fts", "embed", "vector", "rerank", "access", "context", "generation", "validation")
+STAGES = ("rewrite", "followup", "fts", "embed", "vector", "rerank", "access", "context", "generation", "validation")
 
 
 class SearchProfile:
