@@ -466,7 +466,8 @@ class LocalAI:
 
     @property
     def retrieval_model_available(self):
-        return bool(self.rewrite_model or getattr(self.embedding_api, "rewrite_model", ""))
+        return (os.environ.get("MAILSEARCH_QUERY_REWRITE", "").strip() != "0"
+                and bool(self.rewrite_model or getattr(self.embedding_api, "rewrite_model", "")))
 
     def retrieval_completion(self, instructions, prompt, remote_method, *, token_limit, timeout):
         local_model = self.rewrite_model
@@ -489,7 +490,7 @@ class LocalAI:
         return bounded_task(self.rewrite_slot, timeout, complete, "retrieval-model")
 
     def rewrite_query(self, question):
-        if os.environ.get("MAILSEARCH_QUERY_REWRITE", "").strip() == "0" or not self.retrieval_model_available:
+        if not self.retrieval_model_available:
             return None
         prompt = json.dumps({"question": question, "today": datetime.date.today().isoformat()}, ensure_ascii=False)
         raw = self.retrieval_completion(REWRITE_INSTRUCTIONS, prompt, "rewrite_query",
@@ -1141,12 +1142,14 @@ def supplemental_evidence(store, ai, question, filters, context, evidence, mode,
     if extra is None:
         return unchanged
     supplemental, extra_mode, aspects = extra
-    seen = {row["passage"] for row in evidence}
-    # Keep high-ranking first-pass evidence and reserve slots for previously unseen matches.
-    new = [row for row in supplemental if row["passage"] not in seen]
-    keep = min(4, max(0, ceiling - min(4, len(evidence))))
-    order = [*evidence[:4], *new[:keep], *evidence[4:], *new[keep:]]
-    merged = list({row["passage"]: row for row in order}.values())[:ceiling]
+    primary = dedupe_by_content(evidence)
+    seen = {evidence_content_key(row) for row in primary}
+    ids = {row["passage"] for row in primary}
+    # Reserve up to four slots for new content without replacing the first pass's strongest hits.
+    new = [row for row in dedupe_by_content(supplemental)
+           if row["passage"] not in ids and evidence_content_key(row) not in seen]
+    leading = min(4, len(primary), max(0, ceiling - min(4, len(new))))
+    merged = [*primary[:leading], *new[:4], *primary[leading:], *new[4:]][:ceiling]
     return merged, "hybrid" if extra_mode == "hybrid" and new else mode, aspects, True
 
 
