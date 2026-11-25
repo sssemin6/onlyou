@@ -369,19 +369,24 @@ class LocalAI:
         if not self.rewrite_model or not self.rewrite_slot.acquire(blocking=False):
             return None
         result = Future()
+        deadline = time.monotonic() + QUERY_REWRITE_TIMEOUT
 
         def run():
             try:
                 # Only use an already installed local model. A cold or busy
                 # service can fall back without starting a new Ollama instance.
                 model = self.ensure_model(self.rewrite_model)
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    result.set_result(None)
+                    return
                 payload = self.call("/api/generate", {
                     "model": model, "system": REWRITE_INSTRUCTIONS,
                     "prompt": json.dumps({"question": question, "today": datetime.date.today().isoformat()},
                                          ensure_ascii=False),
                     "format": "json", "stream": False, "think": False,
                     "options": {"num_ctx": 2048, "num_predict": 384, "temperature": 0},
-                }, timeout=QUERY_REWRITE_TIMEOUT)
+                }, timeout=remaining)
                 result.set_result(parse_rewrite(json.loads(payload["response"]), question))
             except (OSError, ValueError, RuntimeError, KeyError, TypeError, http.client.HTTPException):
                 result.set_result(None)
