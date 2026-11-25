@@ -34,10 +34,13 @@ runtime_logger = logging.getLogger("mailsearch.runtime")
 
 
 def embedding_input(row):
-    location = " / ".join(filter(None, (row["name"], row["location"])))
-    metadata = (row["subject"], row["sender"], row["sent"][:10], location)
-    header = "[" + " | ".join(" ".join(value.split())[:180] for value in metadata) + "]"
     key = row["embedding_key"]
+    if key is None:
+        location = " / ".join(filter(None, (row["name"], row["location"])))
+        metadata = (row["subject"], row["sender"], row["sent"][:10], location)
+    else:
+        metadata = (row["name"] or "", row["location"])
+    header = "[" + " | ".join(" ".join(value.split())[:180] for value in metadata) + "]"
     return (hashlib.sha256(key + header.encode()).digest() if key is not None else row["id"],
             header + "\n" + row["text"])
 
