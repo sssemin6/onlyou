@@ -1468,7 +1468,7 @@ class Store:
                 selected.setdefault(key, row)
         return list(selected.values())
 
-    def semantic_contextual(self, values, model, filters, **options):
+    def semantic_contextual(self, values, model, filters, limit=40, *, min_similarity=.28):
         """Use one input format per archive; keep legacy searches during migration."""
         contextual = contextual_model_key(model)
         source = filters.get("source")
@@ -1482,13 +1482,15 @@ class Store:
         modern = [row["id"] for row in archives if row["model"]]
         legacy = [row["id"] for row in archives if not row["model"]]
         if not modern or not legacy:
-            return self.semantic(values, contextual if modern else model, filters, **options)
-        current = self.semantic(values, contextual, {**filters, "vector_sources": modern}, **options)
-        previous = self.semantic(values, model, {**filters, "vector_sources": legacy}, **options)
+            return self.semantic(values, contextual if modern else model, filters, limit, min_similarity=min_similarity)
+        current = self.semantic(values, contextual, {**filters, "vector_sources": modern},
+                                limit, min_similarity=min_similarity)
+        previous = self.semantic(values, model, {**filters, "vector_sources": legacy},
+                                 limit, min_similarity=min_similarity)
         # Scores from different input formats are not directly comparable.
-        return [row for pair in zip_longest(current, previous) for row in pair if row is not None][:options.get("limit", 40)]
+        return [row for pair in zip_longest(current, previous) for row in pair if row is not None][:limit]
 
-    def semantic(self, values, model, filters, limit=40):
+    def semantic(self, values, model, filters, limit=40, *, min_similarity=.28):
         vector = vector_array(pack_vector(values))
         where, params = self.scope(filters)
         with self.connection() as conn:
@@ -1521,10 +1523,10 @@ class Store:
                     passage_ids, values = zip(*eligible)
                     matrix = numpy.frombuffer(b"".join(values), dtype="<f4").reshape(-1, len(vector))
                     similarities = numpy.einsum("ij,j->i", matrix, numpy.asarray(vector, dtype="float32"))
-                    scores = [(float(score), passage) for passage, score in zip(passage_ids, similarities) if score >= .28]
+                    scores = [(float(score), passage) for passage, score in zip(passage_ids, similarities) if score >= min_similarity]
                 else:
                     scores = [(math.sumprod(vector, vector_array(value)), passage) for passage, value in eligible]
-                    scores = [(score, passage) for score, passage in scores if score >= .28]
+                    scores = [(score, passage) for score, passage in scores if score >= min_similarity]
             ordered = sorted(scores, reverse=True)
             results = []
             for start in range(0, len(ordered), limit):
