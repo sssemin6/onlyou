@@ -6,7 +6,7 @@ import re
 import socket
 import ssl
 
-from .answer import MODEL_NAME, QUERY_REWRITE_TOKEN_LIMIT
+from .answer import GAP_TOKEN_LIMIT, MODEL_NAME, QUERY_REWRITE_TOKEN_LIMIT
 from .embedding import EmbeddingAPI, GatewayRequestError, MODEL, gateway_origin
 from .external import ExternalAI, ExternalRequestError
 
@@ -60,10 +60,17 @@ class IntranetAI(EmbeddingAPI):
         return cls(key, selections, origin=origin, answer_models=answer_models, tls=tls)
 
     def rewrite_query(self, instructions, prompt, *, timeout):
+        return self.retrieval_completion(instructions, prompt, QUERY_REWRITE_TOKEN_LIMIT, timeout)
+
+    def diagnose_evidence_gap(self, instructions, prompt, *, timeout):
+        return self.retrieval_completion(instructions, prompt, GAP_TOKEN_LIMIT, timeout)
+
+    def retrieval_completion(self, instructions, prompt, token_limit, timeout):
         response = self.request(CHAT_PATH, {
             "model": self.rewrite_model,
             "messages": [{"role": "system", "content": instructions}, {"role": "user", "content": prompt}],
-            "max_tokens": QUERY_REWRITE_TOKEN_LIMIT,
+            "max_tokens": token_limit,
+            "temperature": 0,
             "stream": False,
         }, timeout)
         content = response["choices"][0]["message"]["content"]
