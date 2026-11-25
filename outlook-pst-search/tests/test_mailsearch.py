@@ -24,7 +24,7 @@ from types import SimpleNamespace
 
 from mailsearch.api_settings import ApiSettings, user_dpapi
 from mailsearch.answer import (AnswerSessions, LocalAI, answer_groups, answer_plan, combine_answer_evidence,
-                               delivery_date_answer, evidence_for, validate)
+                               delivery_date_answer, evidence_for, parse_rewrite, validate)
 from mailsearch.embedding import EmbeddingAPI, GatewayRequestError, tls_context, warn_unverified
 from mailsearch.external import ExternalAI, Excerpt, Reviews, pcf_batches
 from mailsearch.extract import convert_legacy, extract_attachment, extract_bytes
@@ -1414,6 +1414,24 @@ class Integration(unittest.TestCase):
             self.assertIn(f"Vector search backend={expected}", log)
         with patch.object(self.store, "vector_index", object()):
             self.assertEqual(self.store.vector_backend, "usearch(int8)")
+
+    def test_rewrite_scope_fallback_on_local_answer_and_external_preview(self):
+        source = self.import_mail()
+        query = "A-17 납품 승인 근거와 변경 이력"
+        plan = parse_rewrite({"sub_queries": ["A-17 납품 승인", "A-17 변경 이력"], "keywords": ["A-17"],
+                              "filters": {"date_from": "2020-01-01", "date_to": "2020-12-31"}}, query)
+        self.app.external = ExternalAI("https://example.invalid/v1/chat/completions", "fixture", "key")
+        payload = {"query": query, "filters": {"source": source}}
+        with patch.object(self.ai, "rewrite_query", return_value=plan) as rewrite:
+            status, local = self.call("/api/answer", payload)
+            self.assertEqual(status, 200)
+            self.assertTrue(local["results"])
+            self.assertTrue(all(row["source"] == source for row in local["results"]))
+            status, preview = self.call("/api/external/preview", payload)
+            self.assertEqual(status, 200)
+            self.assertTrue(preview["excerpts"])
+            self.assertTrue(all(item["source"]["source"] == source for item in preview["excerpts"]))
+            self.assertEqual(rewrite.call_count, 2)
 
     def test_question_filters_use_metadata_and_preserve_ui_selection(self):
         folder = Path(self.workspace.name) / "metadata"
