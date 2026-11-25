@@ -456,6 +456,7 @@ class Handler(BaseHTTPRequestHandler):
                 "sources": [{**row, "available": row["id"] in ids if scan else None,
                              "embedding_model_current": row["embedding_model_key"] in (None, embedding_key),
                              "updates": self.server.indexer.pending_updates(row) if scan else [],
+                             "finalization": self.server.indexer.finalization_progress(row),
                              "pst_read": self.server.indexer.pst_progress(row)} for row in sources],
                 "model": self.server.ai.model,
                 "embedding": embedding.model if use_gateway else self.server.ai.embedding_model,
