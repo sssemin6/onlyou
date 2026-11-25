@@ -2135,15 +2135,11 @@ class Integration(unittest.TestCase):
         approved = next(row["passage"] for row in original if row["sent"].startswith("2026-04-10"))
         active = self.store.source(source)["active"]
         (self.mail / "approved.eml").unlink()
-        removing, removed = threading.Event(), threading.Event()
         building, built = threading.Event(), threading.Event()
         update = self.indexer.update_finalization
 
         def observe(source, phase, done=None, total=None):
             update(source, phase, done, total)
-            if phase == "remove_old" and done == 1:
-                removing.set()
-                removed.wait(5)
             if phase == "build_memory" and done == total:
                 building.set()
                 built.wait(5)
@@ -2160,17 +2156,12 @@ class Integration(unittest.TestCase):
             self.assertEqual(self.call(f"/api/evidence/{approved}")[0], 200)
             self.assertEqual(self.call("/api/search", search)[1]["results"], original)
 
-        with (patch("mailsearch.indexer.FINALIZATION_BATCH_SIZE", 1),
-              patch.object(self.indexer, "update_finalization", side_effect=observe)):
+        with patch.object(self.indexer, "update_finalization", side_effect=observe):
             self.assertEqual(self.call("/api/source-action", {"source": source, "action": "refresh"})[0], 202)
             try:
-                self.assertTrue(removing.wait(5))
-                verify_status("remove_old", 1, 4)
-                removed.set()
                 self.assertTrue(building.wait(5))
                 verify_status("build_memory", 3, 3)
             finally:
-                removed.set()
                 built.set()
             self.assertEqual(await_source(self.store, source, {"ready", "error"})["state"], "ready")
 
@@ -2182,23 +2173,75 @@ class Integration(unittest.TestCase):
         self.assertEqual(len(updated), 2)
         self.assertFalse(any(row["sent"].startswith("2026-04-10") for row in updated))
 
+    def test_search_switches_before_cleanup_and_restart_reclaims_retired_batches(self):
+        source = self.import_mail()
+        active = self.store.source(source)["active"]
+        old_passage = self.call("/api/search", {"query": '"최종 승인"'})[1]["results"][0]["passage"]
+        (self.mail / "approved.eml").unlink()
+        cleaning, released = threading.Event(), threading.Event()
+        cleanup = self.indexer.cleanup_retired
+
+        def retired_count():
+            with self.store.connection() as conn:
+                return conn.execute("SELECT count(*) FROM mails WHERE source=? AND version=?",
+                                    (source, active)).fetchone()[0]
+
+        def interrupt_after_one_batch(source):
+            cleanup(source)
+            cleaning.set()
+            released.wait(5)
+            raise sqlite3.OperationalError("simulated cleanup interruption")
+
+        with (patch("mailsearch.indexer.RETIRED_MAIL_BATCH_SIZE", 1),
+              patch.object(self.indexer, "cleanup_retired", side_effect=interrupt_after_one_batch),
+              patch.object(self.ai, "embed", side_effect=AssertionError("existing embeddings must be reused")),
+              self.assertLogs("mailsearch.runtime", level="WARNING")):
+            self.indexer.command(source, "refresh")
+            worker = self.indexer.worker
+            try:
+                self.assertTrue(cleaning.wait(5))
+                row = self.call("/api/sources?scan=0")[1]["sources"][0]
+                self.assertEqual((row["state"], row["counts"]), ("ready", {"mail": 3}))
+                self.assertNotEqual(row["active"], active)
+                self.assertGreater(row["embedding_done"], 0)
+                self.assertEqual(row["embedding_done"], row["embedding_total"])
+                self.assertEqual(retired_count(), 3)
+                self.assertEqual(self.call(f"/api/evidence/{old_passage}")[0], 404)
+                for mode in ("quick", "keyword"):
+                    self.assertEqual(len(self.call("/api/search", {"query": "A-17", "mode": mode})[1]["results"]), 2)
+            finally:
+                released.set()
+            worker.join(5)
+            self.assertFalse(worker.is_alive())
+
+        restarted = Indexer(self.store, ai=self.ai)
+        self.addCleanup(restarted.stop)
+        restarted.wake()
+        deadline = time.monotonic() + 5
+        while restarted.has_work() and time.monotonic() < deadline:
+            time.sleep(.01)
+        self.assertEqual(retired_count(), 0)
+        with self.store.connection() as conn:
+            self.assertEqual(conn.execute("PRAGMA foreign_key_check").fetchall(), [])
+            self.assertEqual(conn.execute("SELECT count(*) FROM searchable_vectors").fetchone()[0],
+                             row["embedding_total"])
+
     def test_pause_during_finalization_keeps_previous_index(self):
         source = self.import_mail()
         active = self.store.source(source)["active"]
-        removing, released = threading.Event(), threading.Event()
+        building, released = threading.Event(), threading.Event()
         update = self.indexer.update_finalization
 
         def observe(source, phase, done=None, total=None):
             update(source, phase, done, total)
-            if phase == "remove_old" and done == 1:
-                removing.set()
+            if phase == "build_memory" and done == 0:
+                building.set()
                 released.wait(5)
 
-        with (patch("mailsearch.indexer.FINALIZATION_BATCH_SIZE", 1),
-              patch.object(self.indexer, "update_finalization", side_effect=observe)):
+        with patch.object(self.indexer, "update_finalization", side_effect=observe):
             self.indexer.command(source, "refresh")
             try:
-                self.assertTrue(removing.wait(5))
+                self.assertTrue(building.wait(5))
                 response = []
                 event = self.indexer.events[source]
                 pause = threading.Thread(target=lambda: response.append(
@@ -2216,6 +2259,21 @@ class Integration(unittest.TestCase):
                 self.assertEqual(conn.execute("SELECT count(*) FROM mails WHERE source=? AND version=?",
                                               (source, active)).fetchone()[0], 4)
             self.assertIsNone(self.call("/api/sources?scan=0")[1]["sources"][0]["finalization"])
+
+    def test_legacy_vector_migration_indexes_passage_deletes_without_rewriting_vectors(self):
+        self.import_mail()
+        with self.store.connection() as conn:
+            conn.execute("DROP INDEX vector_passage")
+            passage = conn.execute("SELECT min(id) FROM passages").fetchone()[0]
+            conn.execute("INSERT INTO vectors(passage,model,value) VALUES(?,?,?)", (passage, "legacy-model", b"vector"))
+            legacy_plan = conn.execute("EXPLAIN QUERY PLAN DELETE FROM passages WHERE id=?", (passage,))
+            self.assertIn("SCAN vectors", [row["detail"] for row in legacy_plan])
+        upgraded = Store(self.store.root)
+        with upgraded.connection() as conn:
+            plan = conn.execute("EXPLAIN QUERY PLAN DELETE FROM passages WHERE id=?", (passage,))
+            self.assertTrue(any("vector_passage (passage=?)" in row["detail"] for row in plan))
+            self.assertEqual(conn.execute("SELECT value FROM searchable_vectors WHERE passage=? AND model=?",
+                                          (passage, "legacy-model")).fetchone()[0], b"vector")
 
     def test_pause_and_resume_preserve_completed_work(self):
         entered, released = threading.Event(), threading.Event()
