@@ -165,6 +165,10 @@ def contextual_model_key(model):
     return "metadata-v2:" + model if model else ""
 
 
+def contextual_model_keys(model):
+    return (contextual_model_key(model), "metadata-v1:" + model) if model else ("", "")
+
+
 def now():
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
@@ -1545,8 +1549,7 @@ class Store:
 
     def semantic_contextual(self, values, model, filters, limit=40, *, min_similarity=.28):
         """Use one input format per archive; keep legacy searches during migration."""
-        contextual = contextual_model_key(model)
-        previous = "metadata-v1:" + model
+        contextual, previous = contextual_model_keys(model)
         source = filters.get("source")
         with self.connection() as conn:
             archives = conn.execute(
