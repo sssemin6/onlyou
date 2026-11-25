@@ -86,6 +86,7 @@ CREATE TABLE IF NOT EXISTS vectors (
     model TEXT NOT NULL, value BLOB NOT NULL,
     PRIMARY KEY(model, passage)
 ) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS vector_passage ON vectors(passage);
 CREATE TABLE IF NOT EXISTS vector_buckets (
     model TEXT NOT NULL, bucket INTEGER NOT NULL, passage INTEGER NOT NULL REFERENCES passages(id) ON DELETE CASCADE,
     PRIMARY KEY(model, bucket, passage)
@@ -979,7 +980,9 @@ class Store:
             counts = defaultdict(lambda: defaultdict(int))
             revision_counts = defaultdict(dict)
             for row in conn.execute(
-                "SELECT source,version,kind,COUNT(*) n FROM mails GROUP BY source,version,kind"
+                """SELECT m.source,m.version,m.kind,COUNT(*) n FROM sources s
+                   CROSS JOIN mails m ON m.source=s.id AND m.version IN (s.active,s.pending)
+                   GROUP BY m.source,m.version,m.kind"""
             ):
                 counts[row["source"]][row["kind"]] += row["n"]
                 revision_counts[row["source"], row["version"]][row["kind"]] = row["n"]
