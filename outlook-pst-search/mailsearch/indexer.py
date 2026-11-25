@@ -28,7 +28,7 @@ PST_DEFERRED = ("pst_in_use", "pst_changed")
 PST_PROGRESS_INTERVAL = 5
 EMBEDDING_BATCH_SIZE = 24
 EMBEDDING_BATCH_TIMEOUT = 60
-FINALIZATION_BATCH_SIZE = 256
+RETIRED_MAIL_BATCH_SIZE = 64
 runtime_logger = logging.getLogger("mailsearch.runtime")
 
 
@@ -236,6 +236,7 @@ class Indexer:
                 worker.join()
 
     def run(self):
+        cleanup_failed = False
         while True:
             with self.lock:
                 if self.stopping:
@@ -246,16 +247,33 @@ class Indexer:
                         task = conn.execute(
                             "SELECT * FROM sources WHERE state IN ('queued','removing') ORDER BY id LIMIT 1"
                         ).fetchone()
+                        retired = None
+                        if task is None and not cleanup_failed:
+                            retired = conn.execute(
+                                """SELECT s.id FROM sources s WHERE EXISTS (
+                                       SELECT 1 FROM mails m WHERE m.source=s.id AND m.version<s.active)
+                                   ORDER BY s.id LIMIT 1"""
+                            ).fetchone()
                 except sqlite3.Error as exc:
                     runtime_logger.error("Cannot read indexing queue (%s, sqlite=%s)",
                                          type(exc).__name__, getattr(exc, "sqlite_errorname", None))
                     self.worker = None
                     return
-                if task is None:
+                if task is None and retired is None:
                     self.worker = None
                     return
-                source = task["id"]
-                event = self.events[source] = threading.Event()
+                if task is not None:
+                    source = task["id"]
+                    event = self.events[source] = threading.Event()
+            if task is None:
+                try:
+                    self.cleanup_retired(retired["id"])
+                except sqlite3.Error as exc:
+                    cleanup_failed = True
+                    if not self.stopping:
+                        runtime_logger.warning("Retired index cleanup deferred (source=%d, sqlite=%s)",
+                                               retired["id"], getattr(exc, "sqlite_errorname", None))
+                continue
             try:
                 if task["state"] == "removing":
                     with self.lock:
@@ -326,6 +344,21 @@ class Indexer:
                 with self.lock:
                     self.events.pop(source, None)
                     self.pst_reads.pop(source, None)
+
+    def cleanup_retired(self, source):
+        # Recheck the active version in the delete so active and pending rows
+        # remain intact even when a source action arrives between batches.
+        with self.store.connection() as conn:
+            conn.set_progress_handler(lambda: self.stopping, 10000)
+            try:
+                conn.execute(
+                    """DELETE FROM mails WHERE id IN (
+                           SELECT id FROM mails WHERE source=? AND version<(SELECT active FROM sources WHERE id=?)
+                           ORDER BY version,id LIMIT ?)""",
+                    (source, source, RETIRED_MAIL_BATCH_SIZE),
+                )
+            finally:
+                conn.set_progress_handler(None, 0)
 
     @staticmethod
     def check(event):
@@ -774,7 +807,7 @@ class Indexer:
         self.state(source, "attachments")
         self.index_attachments(root, temp, source, version, event, extras=extras)
         issue = self.embed_revision(source, version, event)
-        self.start_finalization(source, version, event, "verify_source")
+        self.start_finalization(source, version, event, "verify_source", issue)
         if source_signature(path, kind) != signature:
             raise ImportIssue("changed")
         self.publish_revision(source, version, signature, event, issue, empty_eml=empty_eml, signatures=signatures)
@@ -797,7 +830,7 @@ class Indexer:
                             WHERE id=? AND pending=?""", (source, version))
         return None
 
-    def start_finalization(self, source, version, event, phase):
+    def start_finalization(self, source, version, event, phase, issue):
         self.check(event)
         started = time.monotonic()
         with self.finalization_lock:
@@ -806,7 +839,8 @@ class Indexer:
                 "started": started, "phase_started": started, "updated": started,
             }
         with self.store.connection() as conn:
-            conn.execute("UPDATE sources SET index_stage='finalizing' WHERE id=? AND pending=?", (source, version))
+            conn.execute("""UPDATE sources SET index_stage='finalizing',issue=? WHERE id=? AND pending=?
+                            AND state NOT IN ('paused','removing')""", (issue, source, version))
 
     def update_finalization(self, source, phase, done=None, total=None):
         timestamp = time.monotonic()
@@ -850,23 +884,6 @@ class Indexer:
             if retain and unchanged is None:
                 report("reuse_mail")
                 conn.execute("UPDATE mails SET version=? WHERE id IN (SELECT id FROM outlook_retained)", (version,))
-            report("count_old")
-            previous = conn.execute(
-                "SELECT version,COUNT(*) FROM mails WHERE source=? AND version<>? GROUP BY version",
-                (source, active),
-            ).fetchall()
-            total = sum(count for _, count in previous)
-            done = 0
-            for old_version, count in previous:
-                report("remove_old", done, total)
-                for _ in range(0, count, FINALIZATION_BATCH_SIZE):
-                    deleted = conn.execute(
-                        """DELETE FROM mails WHERE id IN (SELECT id FROM mails
-                           WHERE source=? AND version=? ORDER BY id LIMIT ?)""",
-                        (source, old_version, FINALIZATION_BATCH_SIZE),
-                    )
-                    done += deleted.rowcount
-                    report("remove_old", done, total)
             report("save_metadata")
             conn.execute("DELETE FROM problems WHERE source=? AND version<>?", (source, active))
             if signatures is not None:
@@ -944,7 +961,7 @@ class Indexer:
                              (omitted, partial, source, version))
 
         issue = self.embed_revision(source, version, event, retain=True)
-        self.start_finalization(source, version, event, "prepare_switch")
+        self.start_finalization(source, version, event, "prepare_switch", issue)
         unchanged = previous if len(retained) == len(old) == len(folders) and row["active_signature"] == signature else None
         self.publish_revision(source, version, signature, event, issue or (None if folders else "outlook_no_mail"),
                               empty_eml=not folders, retain=True, unchanged=unchanged)
