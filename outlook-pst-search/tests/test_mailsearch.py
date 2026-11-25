@@ -36,7 +36,7 @@ from mailsearch.ollama_setup import (InstallCommandError, install_ollama, packag
 from mailsearch.outlook import OutlookError, OutlookStore
 from mailsearch.server import (App, INSTANCE_FILE, SessionLock, existing_origin, gateway_defaults,
                                gateway_diagnostics, main, publish_instance)
-from mailsearch.store import VECTOR_LOOKUP_SQL, Store, fingerprint, local_midnight_utc, question_scope, read_signature, sections
+from mailsearch.store import VECTOR_LOOKUP_SQL, Store, contextual_model_key, fingerprint, local_midnight_utc, question_scope, read_signature, sections
 from tools.demo import generate
 
 
@@ -758,8 +758,8 @@ class Integration(unittest.TestCase):
     def test_gateway_indexes_existing_archive_and_searches_with_the_same_backend(self):
         source = self.import_mail()
         with self.store.connection() as conn:
-            conn.execute("UPDATE vectors SET model='bge-m3' WHERE model='embed'")
-            conn.execute("UPDATE vector_buckets SET model='bge-m3' WHERE model='embed'")
+            conn.execute("UPDATE vectors SET model='bge-m3' WHERE model='metadata-v1:embed'")
+            conn.execute("UPDATE vector_buckets SET model='bge-m3' WHERE model='metadata-v1:embed'")
         self.ai.configure_embedding("", EmbeddingAPI("test-key"))
 
         def respond(_method, _path, body, _headers):
@@ -781,7 +781,7 @@ class Integration(unittest.TestCase):
             self.assertIsNone(await_source(self.store, source, {"ready"})["issue"])
             with self.store.connection() as conn:
                 models = {row[0] for row in conn.execute("SELECT DISTINCT model FROM vectors")}
-                self.assertEqual(models, {"bge-m3", self.ai.embedding_index})
+                self.assertEqual(models, {"bge-m3", contextual_model_key(self.ai.embedding_index)})
             batch = json.loads(connection.request.call_args_list[0].args[2])["input"]
             self.assertTrue(any("A-17" in passage for passage in batch))
             status, data = self.call("/api/search", {"query": "의미 검색 테스트", "filters": {"source": source}})
@@ -852,7 +852,7 @@ class Integration(unittest.TestCase):
             local_call.assert_not_called()
             with self.store.connection() as conn:
                 indexes = {row[0] for row in conn.execute("SELECT DISTINCT model FROM vectors")}
-            self.assertTrue({"bge-m3", EMBEDDING_ENDPOINT + "#bge-m3"}.issubset(indexes))
+            self.assertTrue({contextual_model_key("bge-m3"), contextual_model_key(EMBEDDING_ENDPOINT + "#bge-m3")}.issubset(indexes))
 
             self.assertEqual(self.call(route, {"action": "apply", "selections": roles})[0], 200)
             https.reset_mock()
@@ -1792,7 +1792,7 @@ class Integration(unittest.TestCase):
             self.assertEqual(self.call("/api/search", payload)[0], 200)
             self.assertEqual(embed.call_count, 2)
 
-    def test_quoted_reply_and_duplicate_attachments_index_once_without_losing_links(self):
+    def test_duplicate_attachment_extraction_is_shared_with_contextual_embeddings(self):
         folder = Path(self.workspace.name) / "duplicate-attachments"
         folder.mkdir()
         body = "오늘 송부합니다.\n\n> 오래된 검토 98765\n\n새 회신입니다.\n-- \n서명비밀 19573"
@@ -1810,16 +1810,20 @@ class Integration(unittest.TestCase):
             source = self.indexer.register(folder)
             self.assertEqual(await_source(self.store, source, {"ready", "error"})["state"], "ready")
             extract.assert_called_once()
-            self.assertEqual(sum(value == data.decode() for call in embed.call_args_list for value in call.args[0]), 1)
+            inputs = [value for call in embed.call_args_list for value in call.args[0] if value.endswith(data.decode())]
+            self.assertEqual(len(inputs), 2)
+            for idx in range(2):
+                self.assertTrue(any(f"[Message {idx} | local@example.invalid | " in value
+                                    and f"file{idx}.txt" in value for value in inputs))
         with self.store.connection() as conn:
-            self.assertEqual(conn.execute("SELECT COUNT(*) FROM embedding_values").fetchone()[0], 1)
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM embedding_values").fetchone()[0], 2)
             self.assertEqual(conn.execute("SELECT COUNT(*) FROM embedding_refs").fetchone()[0], 2)
             self.assertTrue(all("98765" in row[0] for row in conn.execute("SELECT body FROM mails WHERE source=?", (source,))))
         filters = {"source": source}
         self.assertFalse(self.store.lexical("98765", filters))
         self.assertFalse(self.store.lexical("19573", filters))
         self.assertEqual(len({row["id"] for row in self.store.lexical("30719", filters)}), 2)
-        rows = self.store.semantic([1, .05, .12], "embed", filters)
+        rows = self.store.semantic_contextual([1, .05, .12], "embed", filters)
         self.assertEqual(len({row["attachment"] for row in rows if "30719" in row["text"]}), 2)
 
     def test_http11_reuses_sqlite_on_one_socket(self):
