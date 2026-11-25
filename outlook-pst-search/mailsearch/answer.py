@@ -587,6 +587,7 @@ def public_row(row):
         "as_of": row["updated"], "passage": row["passage"], "attachment": row["attachment"],
         "location": row["location"], "preview": row["text"][:260],
         "kind": row["kind"] if "kind" in row.keys() else "mail",
+        **({"window": True, "start": row["start"]} if "window" in row.keys() and row["window"] else {}),
     }
 
 
@@ -961,7 +962,14 @@ def evidence_for(store, ai, question, filters, context, semantic=True, limit=9, 
             if len(expanded) == ceiling:
                 break
             expanded.setdefault(row["passage"], row)
-        evidence = list(expanded.values())
+        with store.measure("context"):
+            windows = {}
+            for index, row in enumerate(expanded.values()):
+                if index < 8 and "start" in row:
+                    row = store.expand_passage_window(row)
+                key = (row["id"], row["attachment"], row["location"], row.get("start"), row["text"])
+                windows.setdefault(key, row)
+            evidence = list(windows.values())
     return evidence, mode
 
 
