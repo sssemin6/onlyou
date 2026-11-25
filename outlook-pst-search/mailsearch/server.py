@@ -490,7 +490,7 @@ class Handler(BaseHTTPRequestHandler):
                 "persistent_keys": self.server.persistent_keys,
             })
         elif re.fullmatch(r"/api/evidence/\d{1,16}", route.path):
-            row = self.server.store.open_passage(int(route.path.rsplit("/", 1)[-1]))
+            row = self.server.store.open_passage(int(route.path.rsplit("/", 1)[-1]), window=route.query == "window=1")
             if row is None:
                 self.send_json(404, {"error": "evidence_missing"})
             else:
@@ -919,8 +919,12 @@ class Handler(BaseHTTPRequestHandler):
                     proposed = ai.answer(query, evidence, context, **options) if direct is None else None
                 report("validating")
                 # Recheck visibility after inference, including source removal during generation.
-                visible = {r["passage"] for r in store.passages([r["passage"] for r in evidence], filters)}
-                evidence = [r for r in evidence if r["passage"] in visible]
+                window_ids = {r["passage"] for r in evidence if r.get("window")}
+                visible = {r["passage"]: r for r in store.passages([r["passage"] for r in evidence], filters,
+                                                                 windows=window_ids)}
+                evidence = [r for r in evidence if r["passage"] in visible
+                            and (not r.get("window") or (r["start"], r["text"]) ==
+                                 (visible[r["passage"]]["start"], visible[r["passage"]]["text"]))]
                 rows = [public_row(row) for row in evidence]
                 result = delivery_date_answer(query, evidence, context) if direct is not None else None
                 if result is None:
@@ -1128,7 +1132,8 @@ class Handler(BaseHTTPRequestHandler):
                 raise ValueError("external_excerpts")
             ids = [item.passage for item in excerpts]
             scope = {"tab": "pcf"} if pcf else {}
-            rows = {row["passage"]: row for row in server.store.passages(ids, scope)}
+            window_ids = {item.passage for item in excerpts if item.window_start is not None}
+            rows = {row["passage"]: row for row in server.store.passages(ids, scope, windows=window_ids)}
             if any(item.passage not in rows or not item.original_in(rows[item.passage]) for item in excerpts):
                 self.send_json(409, {"error": "external_source_changed"})
                 return
@@ -1145,8 +1150,9 @@ class Handler(BaseHTTPRequestHandler):
                     "reason": type(exc).__name__,
                 })
                 return
-            visible = {row["passage"]: row for row in server.store.passages(ids, scope)}
-            verified = [{**visible[item.passage], "text": item.text, "start": visible[item.passage]["start"] + item.start,
+            visible = {row["passage"]: row for row in server.store.passages(ids, scope, windows=window_ids)}
+            verified = [{**visible[item.passage], "text": item.text,
+                         "start": visible[item.passage]["start"] + item.start,
                          "reviewed_sender": (item.context or {}).get("sender", "")}
                         for item in excerpts if item.passage in visible and item.original_in(visible[item.passage])]
             with server.store.measure("validation"):
