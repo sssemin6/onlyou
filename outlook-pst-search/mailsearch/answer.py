@@ -1091,7 +1091,7 @@ def evidence_for(store, ai, question, filters, context, semantic=True, limit=9, 
 
 
 def supplemental_evidence(store, ai, question, filters, context, evidence, mode, query_count, *,
-                          ceiling=ANSWER_EVIDENCE_LIMIT, expand=True, check=None):
+                          ceiling=ANSWER_EVIDENCE_LIMIT, expand=True, check=None, review_slots=None):
     """Run at most one supplemental retrieval under the current scope and budget."""
     unchanged = evidence, mode, (), False
     complex_question = bool(query_count > 1 or SYNTHESIS_QUESTION.search(question) or COMPARISON_QUESTION.search(question))
@@ -1149,6 +1149,9 @@ def supplemental_evidence(store, ai, question, filters, context, evidence, mode,
     new = [row for row in dedupe_by_content(supplemental)
            if row["passage"] not in ids and evidence_content_key(row) not in seen]
     leading = min(4, len(primary), max(0, ceiling - min(4, len(new))))
+    if review_slots is not None:
+        # The ordinary external profile reviews at most five excerpts.
+        leading = min(leading, max(0, review_slots - min(2, len(new))))
     merged = [*primary[:leading], *new[:4], *primary[leading:], *new[4:]][:ceiling]
     return merged, "hybrid" if extra_mode == "hybrid" and new else mode, aspects, True
 
