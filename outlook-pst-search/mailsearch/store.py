@@ -262,6 +262,36 @@ def question_scope(question, filters, *, today=None):
     return " ".join(question.split()) if removed else question, scope
 
 
+def rewritten_scope(filters, hints):
+    """Use inferred hints only where the existing search scope is unspecified."""
+    scope = dict(filters)
+    if scope.get("tab") in ("document", "pcf"):
+        return scope
+    if not (scope.get("after") or scope.get("before")):
+        bounds = {}
+        for field, key in (("date_from", "after"), ("date_to", "before")):
+            value = hints.get(field)
+            if isinstance(value, str) and re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", value):
+                try:
+                    day = date.fromisoformat(value)
+                    if key == "before":
+                        day += timedelta(days=1)
+                    bounds[key] = local_midnight_utc(day)
+                except (ValueError, OverflowError, OSError):
+                    bounds.clear()
+                    break
+        if bounds.get("after", "") < bounds.get("before", "~"):
+            scope.update(bounds)
+    sender = hints.get("sender")
+    if not scope.get("sender") and isinstance(sender, str) and 1 < len(sender.strip()) <= 80:
+        scope["sender"] = sender.strip()
+        if re.fullmatch(EMAIL_ADDRESS, scope["sender"]):
+            scope["sender_address"] = True
+    if "attachment" not in scope and hints.get("prefer_attachment") is True:
+        scope["prefer_attachment"] = True
+    return scope
+
+
 DECISION_SIGNAL = re.compile(
     r"철회|번복|취소|반려|승인|확정|합의|채택|보류|제안|검토|"
     r"\b(?:approv\w*|reject\w*|withdraw\w*|cancel\w*|confirm\w*|propos\w*)\b", re.I,
@@ -1351,7 +1381,7 @@ class Store:
             (*base_params, *params, statement, window),
         )
 
-    def lexical(self, question, filters, fuzzy=False, limit=100):
+    def lexical(self, question, filters, fuzzy=False, limit=100, *, required=()):
         where, params = self.scope(filters)
         words = query_words(question, fuzzy)
         if not question.strip():
@@ -1375,6 +1405,14 @@ class Store:
         strategies = [(term_statement, 1.5), (gram_statement, 1.0)]
         if term_statement == gram_statement:
             strategies = [(term_statement, 2.5)]
+        must_match = []
+        for keyword in required:
+            tokens = query_words(keyword, fuzzy=True)
+            for token in tokens:
+                variants = dict.fromkeys(fts_query([token], strategy) for strategy in ("terms", "grams"))
+                must_match.append("(" + " OR ".join(variants) + ")")
+        if must_match:
+            strategies = [(" AND ".join([f"({statement})", *must_match]), weight) for statement, weight in strategies]
         filtered = bool(params or filters.get("regular_only"))
         window = max(limit * 3, 256)
         if filtered:
