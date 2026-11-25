@@ -41,7 +41,7 @@ from .intranet import CHAT_PATH, LOCAL_EMBEDDING, RERANK_PATH, IntranetAI, avail
 from .ollama_setup import OllamaSetup
 from .pcf import PCF_CELL, PCF_FIELDS
 from .search_profile import SearchProfile, SearchTickets
-from .store import (Store, contextual_model_key, local_midnight_utc, normalized, pack_vector, prioritize_attachments, query_words,
+from .store import (Store, contextual_model_keys, local_midnight_utc, normalized, pack_vector, prioritize_attachments, query_words,
                     question_scope, quoted_plan)
 
 STATIC = Path(__file__).with_name("static")
@@ -452,10 +452,10 @@ class Handler(BaseHTTPRequestHandler):
             external = self.server.external
             embedding = self.server.ai.embedding_api
             use_gateway = embedding and embedding.index_key
-            embedding_key = contextual_model_key(self.server.ai.embedding_index)
+            embedding_keys = contextual_model_keys(self.server.ai.embedding_index)
             self.send_json(200, {
                 "sources": [{**row, "available": row["id"] in ids if scan else None,
-                             "embedding_model_current": row["embedding_model_key"] in (None, embedding_key),
+                             "embedding_model_current": row["embedding_model_key"] in (None, *embedding_keys),
                              "updates": self.server.indexer.pending_updates(row) if scan else [],
                              "finalization": self.server.indexer.finalization_progress(row),
                              "pst_read": self.server.indexer.pst_progress(row)} for row in sources],
