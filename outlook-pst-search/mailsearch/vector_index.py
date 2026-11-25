@@ -1,12 +1,34 @@
-"""Optional in-memory USearch HNSW side index. SQLite remains authoritative."""
+"""Optional disk-backed USearch HNSW side index. SQLite remains authoritative."""
+import hashlib
 import json
 import logging
-from collections import OrderedDict
+import os
+import re
+import sqlite3
 from concurrent.futures import ThreadPoolExecutor
+from tempfile import NamedTemporaryFile
 from threading import Event, Lock
 from time import monotonic
 
 logger = logging.getLogger("mailsearch.runtime")
+SHARD_FILE = re.compile(r"v1-([0-9]+)-([0-9]+)-[0-9]+-[0-9a-f]{64}\.usearch")
+ACTIVE_SHARDS = "SELECT id,active FROM sources WHERE active IS NOT NULL AND state<>'removing'"
+
+
+def prune_vector_files(store, active=None):
+    root = store.root / "vectors"
+    if not root.is_dir():
+        return
+    try:
+        if active is None:
+            with store.connection() as conn:
+                active = dict(conn.execute(ACTIVE_SHARDS))
+        for path in root.glob("*.usearch"):
+            match = SHARD_FILE.fullmatch(path.name)
+            if match and active.get(int(match[1])) != int(match[2]):
+                path.unlink(missing_ok=True)
+    except (OSError, sqlite3.Error) as exc:
+        logger.warning("Vector shard cleanup deferred (%s)", type(exc).__name__)
 
 
 class USearchIndex:
@@ -15,32 +37,64 @@ class USearchIndex:
         from usearch.index import Index
 
         self.store = store
+        self.root = store.root / "vectors"
         self.numpy = numpy
         self.Index = Index
         self.lock = Lock()
-        self.indices = OrderedDict()
-        self.building = None
+        self.indices = {}
+        self.building = set()
         self.failed = {}
         self.stop = Event()
         self.pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="vector-build")
+        self.prune()
+        if self.root.is_dir():
+            for path in self.root.glob(".shard-*.tmp"):
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError:
+                    logger.warning("Temporary vector shard cleanup deferred")
 
     def close(self):
         self.stop.set()
         self.pool.shutdown(wait=True, cancel_futures=True)
         with self.lock:
             self.indices.clear()
+        prune_vector_files(self.store)
+
+    def prune(self):
+        with self.lock:
+            with self.store.connection() as conn:
+                active = dict(conn.execute(ACTIVE_SHARDS))
+            self.indices = {key: index for key, index in self.indices.items() if active.get(key[1]) == key[2]}
+            prune_vector_files(self.store, active)
+
+    def path(self, key):
+        model, source, version, dimensions = key
+        digest = hashlib.sha256(model.encode()).hexdigest()
+        return self.root / f"v1-{source}-{version}-{dimensions}-{digest}.usearch"
+
+    def new_index(self, dimensions):
+        return self.Index(ndim=dimensions, metric="cos", dtype="i8",
+                          connectivity=16, expansion_add=96, expansion_search=96)
 
     def build(self, key):
         model, source, version, dimensions = key
+        temporary = None
         try:
-            index = self.Index(ndim=dimensions, metric="cos", dtype="i8",
-                               connectivity=16, expansion_add=96, expansion_search=96)
+            if self.stop.is_set():
+                return
+            index = self.new_index(dimensions)
             with self.store.connection() as conn:
                 rows = conn.execute(
-                    """SELECT v.passage,v.value FROM mails m JOIN passages p ON p.mail=m.id
-                       JOIN searchable_vectors v ON v.passage=p.id
-                       WHERE m.source=? AND m.version=? AND v.model=? AND length(v.value)=?""",
-                    (source, version, model, dimensions * 4),
+                    """SELECT v.passage,v.value FROM mails m CROSS JOIN passages p ON p.mail=m.id
+                       CROSS JOIN vectors v ON v.model=? AND v.passage=p.id
+                       WHERE m.source=? AND m.version=? AND length(v.value)=?
+                       UNION ALL
+                       SELECT r.passage,v.value FROM mails m CROSS JOIN passages p ON p.mail=m.id
+                       CROSS JOIN embedding_refs r ON r.model=? AND r.passage=p.id
+                       CROSS JOIN embedding_values v ON v.model=r.model AND v.digest=r.digest
+                       WHERE m.source=? AND m.version=? AND length(v.value)=?""",
+                    (model, source, version, dimensions * 4) * 2,
                 )
                 while not self.stop.is_set():
                     batch = rows.fetchmany(1024)
@@ -51,47 +105,71 @@ class USearchIndex:
                     index.add(keys, self.numpy.ascontiguousarray(values.reshape(-1, dimensions), dtype="float32"),
                               threads=1)
                 rows.close()
-            with self.lock:
-                if not self.stop.is_set():
-                    self.indices[key] = index if len(index) else None
-                    self.indices.move_to_end(key)
-                    while len(self.indices) > 8:
-                        self.indices.popitem(last=False)
+            if self.stop.is_set():
+                return
+            self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
+            with NamedTemporaryFile(dir=self.root, prefix=".shard-", suffix=".tmp", delete=False) as stream:
+                temporary = stream.name
+            index.save(temporary)
+            with self.lock, self.store.connection() as conn:
+                if self.stop.is_set() or not conn.execute(
+                    ACTIVE_SHARDS + " AND id=? AND active=?", (source, version),
+                ).fetchone():
+                    return
+                path = self.path(key)
+                os.replace(temporary, path)
+                temporary = None
+                view = self.new_index(dimensions)
+                view.view(str(path))
+                self.indices[key] = view
             logger.info("Vector shard ready (source=%d, version=%d, vectors=%d)", source, version, len(index))
-        except (OSError, RuntimeError, ValueError, TypeError, MemoryError) as exc:
+        except (OSError, RuntimeError, ValueError, TypeError, MemoryError, sqlite3.Error) as exc:
             with self.lock:
                 self.failed[key] = monotonic() + 60
             logger.warning("USearch build unavailable (source=%d, error=%s)", source, type(exc).__name__)
         finally:
+            if temporary is not None:
+                try:
+                    os.unlink(temporary)
+                except OSError:
+                    logger.warning("Temporary vector shard cleanup deferred")
             with self.lock:
-                self.building = None
+                self.building.discard(key)
 
     def candidates(self, conn, vector, model, filters, limit):
         wanted = []
-        for row in conn.execute("SELECT id,active,pending FROM sources WHERE active IS NOT NULL OR pending IS NOT NULL"):
+        for row in conn.execute("""SELECT id,active FROM sources WHERE state<>'removing'
+                                  AND (active IS NOT NULL OR pending IS NOT NULL)"""):
             if filters.get("source") and filters["source"] != row["id"]:
                 continue
             if row["active"] is None:
                 # A first import is mutable until its version is published.
                 return None
             wanted.append((model, row["id"], row["active"], len(vector)))
-        if len(wanted) > 8:
-            return None
         with self.lock:
-            self.failed = {key: until for key, until in self.failed.items() if until > monotonic()}
-            missing = next((key for key in wanted if key not in self.indices), None)
-            if missing:
-                if self.building is None and missing not in self.failed and not self.stop.is_set():
-                    self.building = missing
-                    self.pool.submit(self.build, missing)
+            if self.stop.is_set():
                 return None
-            indices = [self.indices[key] for key in wanted if self.indices[key] is not None]
+            self.failed = {key: until for key, until in self.failed.items() if until > monotonic()}
             for key in wanted:
-                self.indices.move_to_end(key)
-            # A replaced active version can never be selected again.
-            for key in tuple(self.indices):
-                if any(key[:2] == active[:2] and key[2] != active[2] for active in wanted):
-                    self.indices.pop(key)
+                if key in self.indices or key in self.building or key in self.failed:
+                    continue
+                path = self.path(key)
+                try:
+                    if path.is_file():
+                        view = self.new_index(key[3])
+                        view.view(str(path))
+                        if view.ndim != key[3]:
+                            raise ValueError("vector dimensions")
+                        self.indices[key] = view
+                        logger.info("Vector shard mapped (source=%d, version=%d)", key[1], key[2])
+                        continue
+                except (OSError, RuntimeError, ValueError, TypeError, MemoryError) as exc:
+                    logger.warning("Vector shard could not be mapped (source=%d, error=%s)", key[1], type(exc).__name__)
+                self.building.add(key)
+                self.pool.submit(self.build, key)
+            if any(key not in self.indices for key in wanted):
+                return None
+            indices = [self.indices[key] for key in wanted if len(self.indices[key])]
         query = self.numpy.asarray(vector, dtype="float32")
         where, params = self.store.scope(filters)
         count = max(limit * 4, 128)
@@ -104,8 +182,8 @@ class USearchIndex:
                 scored.sort()
                 keys = [key for _, key in scored]
                 allowed = {r[0] for r in conn.execute(
-                    f"""SELECT p.id FROM passages p JOIN mails m ON m.id=p.mail JOIN sources s ON s.id=m.source
-                        WHERE p.id IN (SELECT value FROM json_each(?)) AND {where}""",
+                    f"""SELECT p.id FROM json_each(?) ids CROSS JOIN passages p ON p.id=ids.value
+                        CROSS JOIN mails m ON m.id=p.mail CROSS JOIN sources s ON s.id=m.source WHERE {where}""",
                     (json.dumps(keys), *params),
                 )}
                 chosen = [key for key in keys if key in allowed]
