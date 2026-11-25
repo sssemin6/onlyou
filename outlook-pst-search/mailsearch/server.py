@@ -26,7 +26,7 @@ from urllib.parse import quote, urlsplit
 
 from .answer import (ANSWER_CLAIM_LIMIT, ANSWER_EVIDENCE_LIMIT, ANSWER_TEXT_LIMIT, CONVERSATION_ID,
                      DEFAULT_ANSWER_NUM_CTX, PCF_INSTRUCTIONS, SYNTHESIS_QUESTION, AnswerSessions, LocalAI,
-                     answer_groups, answer_plan, combine_answer_evidence, delivery_date_answer, evidence_for,
+                     answer_groups, answer_plan, combine_answer_evidence, dedupe_by_content, delivery_date_answer, evidence_for,
                      follow_up_evidence, follow_up_replies, follow_up_reply_sender,
                      map_citations, merge_rows, pcf_candidates, pcf_retrieval, pcf_word, public_row,
                      report_unconfirmed_aspects, rewritten_evidence, supplemental_evidence, validate)
@@ -637,7 +637,7 @@ class Handler(BaseHTTPRequestHandler):
                 else:
                     rows = store.lexical(query, filters, limit=180)
             if future:
-                rows = merge_rows(rows, future.result(), limit=60)
+                rows = merge_rows(rows, future.result(), limit=220 if rerank else 60)
             rows = prioritize_attachments(rows, filters)
             if defer and rows:
                 sources, documents = {}, {}
@@ -648,7 +648,8 @@ class Handler(BaseHTTPRequestHandler):
                         unknown = True
                     elif decision:
                         allowed.append(row)
-                result = self.search_results(allowed, query, filters, quick, bool(plan), memory)
+                result = self.search_results(dedupe_by_content(allowed) if rerank else allowed,
+                                             query, filters, quick, bool(plan), memory)
                 if unknown or rerank:
                     result["access_ticket"] = self.server.search_tickets.issue(
                         (rows, query, filters, quick, bool(plan), rerank, profile, memory)
@@ -657,7 +658,7 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 if rerank:
                     with profile.measure("rerank"):
-                        rows = ai.rerank_candidates(query, rows)
+                        rows = ai.rerank_candidates(query, dedupe_by_content(rows))
                 self.send_json(200, self.search_results(rows, query, filters, quick, bool(plan), memory))
         profile.log(runtime_logger, "query")
 
@@ -682,13 +683,13 @@ class Handler(BaseHTTPRequestHandler):
                     continue
                 verified.append({**live, **({"similarity": row["similarity"]} if "similarity" in row else {})})
                 distinct.add(self.search_result_key(live, filters))
-                if len(distinct) == 20:
+                if not rerank and len(distinct) == 20:
                     break
             still_visible = {row["passage"] for row in store.passages([row["passage"] for row in verified], verify_filters)}
             verified = [row for row in verified if row["passage"] in still_visible]
             if rerank:
                 with profile.measure("rerank"):
-                    verified = self.server.ai.rerank_candidates(query, verified)
+                    verified = self.server.ai.rerank_candidates(query, dedupe_by_content(verified))
             result = self.search_results(verified, query, filters, quick, exact, memory)
             if access_pending:
                 result["access_pending"] = True
