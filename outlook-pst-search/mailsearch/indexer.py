@@ -14,6 +14,7 @@ import threading
 import time
 from pathlib import Path
 
+from .vector_index import prune_vector_files
 from .embedding import GatewayRequestError, logger
 from .extract import CREATE_FLAGS, DOCUMENT_SUFFIXES, MAX_ATTACHMENT, extract_attachment, extract_document, parse_mail
 from .filesystem import local_path, source_path, stable_input
@@ -292,6 +293,7 @@ class Indexer:
                         conn.execute("DELETE FROM sources WHERE id=?", (source,))
                         conn.commit()
                         conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                    self.prune_vectors()
                 else:
                     self.process(task, event)
             except Paused:
@@ -344,6 +346,12 @@ class Indexer:
                 with self.lock:
                     self.events.pop(source, None)
                     self.pst_reads.pop(source, None)
+
+    def prune_vectors(self):
+        if self.store.vector_index:
+            self.store.vector_index.prune()
+        else:
+            prune_vector_files(self.store)
 
     def cleanup_retired(self, source):
         # Recheck the active version in the delete so active and pending rows
@@ -892,6 +900,7 @@ class Indexer:
                 self.store.commit_memory_revision(conn, source, active, report)
             else:
                 report("commit")
+        self.prune_vectors()
 
     def process_outlook(self, row, temporary, event):
         source, version, previous = row["id"], row["pending"], row["active"]
