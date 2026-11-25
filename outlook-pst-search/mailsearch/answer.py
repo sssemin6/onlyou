@@ -278,7 +278,7 @@ class LocalAI:
                     if len(self.query_cache) > 128:
                         self.query_cache.popitem(last=False)
         with store.measure("vector"):
-            return store.semantic(cached, index, filters)
+            return store.semantic_contextual(cached, index, filters)
 
     def rerank_candidates(self, query, rows, *, limit=10, text_limit=512):
         provider = self.embedding_api
