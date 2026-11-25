@@ -3,6 +3,7 @@ import hashlib
 import http.client
 import io
 import json
+import logging
 import os
 import shutil
 import sqlite3
@@ -25,8 +26,9 @@ from types import SimpleNamespace
 from mailsearch.api_settings import ApiSettings, user_dpapi
 from mailsearch.answer import (QUERY_EMBEDDING_TIMEOUT, QUERY_REWRITE_TIMEOUT, AnswerSessions, LocalAI,
                                answer_groups, answer_plan, combine_answer_evidence, delivery_date_answer,
-                               evidence_for, latest_thread_decisions, needs_recency_boost, parse_rewrite,
-                               reciprocal_rank, rewritten_evidence, validate)
+                               evidence_for, latest_thread_decisions, needs_recency_boost, parse_evidence_gap, parse_rewrite,
+                               reciprocal_rank, report_unconfirmed_aspects, rewritten_evidence,
+                               supplemental_evidence, validate)
 from mailsearch.embedding import EmbeddingAPI, GatewayRequestError, tls_context, warn_unverified
 from mailsearch.external import ExternalAI, Excerpt, Reviews, pack_excerpts, pcf_batches
 from mailsearch.extract import convert_legacy, extract_attachment, extract_bytes
@@ -36,6 +38,7 @@ from mailsearch.indexer import ImportIssue, Indexer
 from mailsearch.ollama_setup import (InstallCommandError, install_ollama, package_progress,
                                     pull_model, run_install_command, winget_binary)
 from mailsearch.outlook import OutlookError, OutlookStore
+from mailsearch.search_profile import SearchProfile
 from mailsearch.server import (App, INSTANCE_FILE, SessionLock, existing_origin, gateway_defaults,
                                gateway_diagnostics, main, publish_instance)
 from mailsearch.store import VECTOR_LOOKUP_SQL, Store, contextual_model_key, fingerprint, local_midnight_utc, pack_vector, question_scope, read_signature, sections
@@ -1426,6 +1429,53 @@ class Integration(unittest.TestCase):
             self.assertIn(f"Vector search backend={expected}", log)
         with patch.object(self.store, "vector_index", object()):
             self.assertEqual(self.store.vector_backend, "usearch(int8)")
+
+    def test_external_gap_labels_are_applied_after_reviewed_generation(self):
+        source = self.import_mail()
+        original = self.store.lexical("A-17", {"source": source})[:1]
+        question = "A-17 시제품 승인과 양산 BOM 비교"
+        plan = parse_evidence_gap({"sufficient": False, "missing_aspects": ["양산 BOM 반영 여부"],
+                                   "follow_up_queries": ["양산 BOM"]}, question)
+        self.ai.rewrite_model = "fixture"
+        self.app.external = ExternalAI("https://example.invalid/v1/chat/completions", "fixture", "key")
+        with (patch("mailsearch.server.rewritten_evidence", return_value=(original, "keyword", {"source": source}, 2)),
+              patch.object(self.ai, "diagnose_evidence_gap", return_value=plan) as diagnose,
+              patch.object(self.app.external, "complete", return_value={"status": "insufficient", "claims": []}) as complete):
+            status, preview = self.call("/api/external/preview", {"query": question, "filters": {"source": source}})
+            self.assertEqual(status, 200)
+            self.assertTrue(preview["excerpts"])
+            diagnose.assert_called_once()
+            complete.assert_not_called()
+            status, response = self.call("/api/external/send", {
+                "review": preview["review"], "excerpts": [preview["excerpts"][0]["id"]],
+            })
+            self.assertEqual(status, 200)
+            self.assertEqual(response["unknowns"], ["양산 BOM 반영 여부"])
+            self.assertEqual(set(json.loads(complete.call_args.args[1])), {"question", "evidence"})
+
+    def test_answer_stream_reports_the_completed_supplemental_pass(self):
+        source = self.import_mail()
+        original = self.store.lexical("A-17", {"source": source})[:1]
+        question = "A-17 시제품 승인과 양산 BOM 비교"
+        plan = parse_evidence_gap({"sufficient": False, "missing_aspects": ["양산 BOM"],
+                                   "follow_up_queries": ["양산 BOM"]}, question)
+        self.ai.rewrite_model = "fixture"
+        with (patch("mailsearch.server.rewritten_evidence", return_value=(original, "keyword", {"source": source}, 2)),
+              patch.object(self.ai, "diagnose_evidence_gap", return_value=plan),
+              patch.dict(os.environ, {"MAILSEARCH_AGENTIC_RETRY": "1"})):
+            connection = http.client.HTTPConnection("127.0.0.1", self.app.server_port, timeout=8)
+            try:
+                connection.request("POST", "/api/answer/stream",
+                                   json.dumps({"query": question, "filters": {"source": source}}),
+                                   {"X-Mail-Session": self.app.token, "Content-Type": "application/json"})
+                response = connection.getresponse()
+                self.assertEqual(response.status, 200)
+                events = [json.loads(line[6:]) for line in response.read().decode().splitlines() if line.startswith("data: ")]
+            finally:
+                connection.close()
+        retrieval, = [event for event in events if event["stage"] == "retrieving"]
+        self.assertEqual(retrieval["pass"], 2)
+        self.assertEqual(events[-1]["unknowns"], ["양산 BOM"])
 
     def test_rewrite_scope_fallback_on_local_answer_and_external_preview(self):
         source = self.import_mail()
@@ -3024,6 +3074,9 @@ class RAGStability(unittest.TestCase):
                 doc = {"name": path.name, "folder": "", "sent": "", "status": "완료", "sections": [("내용", original)]}
                 mail = store.add_document(conn, source, 1, path.name, doc)
                 anchor = conn.execute("SELECT id FROM passages WHERE mail=? ORDER BY start LIMIT 1 OFFSET 1", (mail,)).fetchone()[0]
+            hits = store.lexical("검수기록", {"source": source}, fuzzy=True)
+            self.assertTrue(hits)
+            self.assertTrue(all(len(hit["text"]) <= 480 for hit in hits))
             raw, = store.passages([anchor], {"source": source})
             window = store.expand_passage_window(raw)
             self.assertTrue(window["window"])
@@ -3055,6 +3108,95 @@ class RAGStability(unittest.TestCase):
             self.assertEqual(reopened.lexical("Atlas", {"source": source})[0]["passage"], passage)
             self.assertEqual(reopened.semantic_contextual([1., 0.], "embed", {})[0]["passage"], passage)
             self.assertEqual(reopened.open_passage(passage)["text"], mail["body"])
+
+    def test_supplemental_search_recovers_bom_in_same_scope_and_checks_access(self):
+        question = "A17 시제품 승인과 양산 BOM 반영 여부 비교"
+        prototype = "A17 시제품 4 mm를 승인합니다."
+        production = "A17 양산 BOM 두께는 3 mm입니다."
+        gap = parse_evidence_gap({"sufficient": False, "missing_aspects": ["양산 BOM 반영 여부"],
+                                  "follow_up_queries": ["양산 BOM Rev.C 두께"]}, question)
+        self.assertEqual(gap.queries, ("A17 양산 BOM Rev.C 두께",))
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = Store(root / "index")
+            approved = root / "approved"
+            excluded = root / "excluded"
+            approved.mkdir()
+            excluded.mkdir()
+            (approved / "bom.txt").write_text(production, encoding="utf-8")
+            subject = "A17 시제품 승인"
+            mail = {"subject": subject, "sender": "", "recipient": "", "sent": "2026-05-03", "folder": "/",
+                    "attachments": [], "message_id": "", "reply_ids": "", "body": prototype}
+            with store.connection() as conn:
+                source = conn.execute("INSERT INTO sources(path,kind,active) VALUES(?,'eml_dir',1)",
+                                      (str(approved),)).lastrowid
+                outside = conn.execute("INSERT INTO sources(path,kind,active) VALUES(?,'eml_dir',1)",
+                                       (str(excluded),)).lastrowid
+                initial = store.add_mail(conn, source, 1, "initial.eml", mail)
+                for item, summary, target, sent in (
+                    ("bom.txt", production, source, "2026-05-11"),
+                    ("unreadable.txt", "A17 양산 BOM 비인가 초안", source, "2026-05-11"),
+                    ("old.eml", "A17 양산 BOM 2024 외부 기간", source, "2024-05-11"),
+                    ("unauthorized.eml", "A17 양산 BOM 타 보관함", outside, "2026-05-11"),
+                ):
+                    if item.endswith(".txt"):
+                        doc = {"name": item, "folder": "", "sent": sent, "status": "완료", "sections": [("내용", summary)]}
+                        store.add_document(conn, target, 1, item, doc)
+                    else:
+                        store.add_mail(conn, target, 1, item, {**mail, "subject": "A17 양산 BOM", "sent": sent, "body": summary})
+                passage = conn.execute("SELECT id FROM passages WHERE mail=?", (initial,)).fetchone()[0]
+
+            scope = {"source": source, "after": "2026-05-01", "before": "2026-06-01"}
+            raw = store.passages([passage], scope)
+            ai = LocalAI("")
+            ai.rewrite_model = "fixture"
+            profile = SearchProfile("answer")
+            with (store.search_session(profile), patch.dict(os.environ, {"MAILSEARCH_AGENTIC_RETRY": "1"}),
+                  patch.object(ai, "diagnose_evidence_gap", return_value=gap) as diagnose):
+                rows, mode, missing, ran = supplemental_evidence(store, ai, question, scope, "", raw, "keyword", 2)
+                self.assertTrue(ran)
+                diagnose.assert_called_once()
+                self.assertEqual(diagnose.call_args.args[1], raw)
+                self.assertEqual({row["text"] for row in rows}, {prototype, production})
+                self.assertEqual([row["source"] for row in rows], [source, source])
+                self.assertTrue(all(scope["after"] <= row["sent"] < scope["before"] for row in rows))
+                self.assertEqual((mode, missing), ("keyword", ("양산 BOM 반영 여부",)))
+                self.assertGreater(profile.ms["followup"], 0)
+                self.assertGreater(profile.ms["fts"], 0)
+                profile.log(logging.getLogger("mailsearch.runtime"), "supplemental_fixture")
+                with patch.dict(os.environ, {"MAILSEARCH_AGENTIC_RETRY": "0"}):
+                    self.assertEqual(supplemental_evidence(store, ai, question, scope, "", raw, "keyword", 2),
+                                     (raw, "keyword", (), False))
+                profile.started -= 39
+                self.assertEqual(supplemental_evidence(store, ai, question, scope, "", raw, "keyword", 2),
+                                 (raw, "keyword", (), False))
+                diagnose.assert_called_once()
+            missing_only = report_unconfirmed_aspects({"status": "answered", "claims": [
+                {"text": prototype, "citations": [{"quote": prototype}]}]}, missing)
+            self.assertEqual((missing_only["status"], missing_only["unknowns"]), ("partial", list(missing)))
+            verified = {"status": "answered", "claims": [{"text": production, "citations": [{"quote": production}]}]}
+            self.assertEqual(report_unconfirmed_aspects(verified, missing), verified)
+            self.assertEqual(report_unconfirmed_aspects(verified, ("양산 BOM Rev.C",))["status"], "partial")
+
+    def test_gateway_gap_diagnosis_transmits_coverage_without_mail_content(self):
+        gateway = self.gateway(answer="answer-model-a")
+        ai = LocalAI("", embedding_api=gateway)
+        question = "A17 시제품 승인과 양산 BOM 비교"
+        evidence = [{"text": "Private body 시제품 승인합니다.", "sender": "Private sender", "subject": "Private subject"}]
+        raw = {"sufficient": False, "missing_aspects": ["양산 BOM"], "follow_up_queries": ["양산 BOM"]}
+        reply = {"choices": [{"message": {"content": json.dumps(raw)}}]}
+        with patch.object(gateway, "request", return_value=reply) as request:
+            result = ai.diagnose_evidence_gap(question, evidence)
+        self.assertEqual(result.queries, ("A17 양산 BOM",))
+        path, payload, timeout = request.call_args.args
+        self.assertEqual((path, payload["max_tokens"], payload["temperature"]), (CHAT_PATH, 320, 0))
+        self.assertGreater(timeout, 0)
+        self.assertLessEqual(timeout, 2.5)
+        data = json.loads(payload["messages"][1]["content"])
+        self.assertEqual(set(data), {"question", "coverage"})
+        self.assertEqual((data["coverage"]["prototype"], data["coverage"]["production"]), (1, 0))
+        self.assertNotIn("Private", json.dumps(payload))
+        self.assertIsNone(parse_evidence_gap({**raw, "sufficient": True}, question))
 
     def test_rerank_timeout_and_redacted_fallback_for_80_candidates(self):
         client = self.gateway(rerank="bge-reranker-v2-m3")
