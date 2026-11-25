@@ -14,14 +14,14 @@ import threading
 import time
 from pathlib import Path
 
-from .vector_index import prune_vector_files
 from .embedding import GatewayRequestError, logger
 from .extract import CREATE_FLAGS, DOCUMENT_SUFFIXES, MAX_ATTACHMENT, extract_attachment, extract_document, parse_mail
 from .filesystem import local_path, source_path, stable_input
 from .outlook import DEFAULT_OUTLOOK, OutlookError, outlook_modules, outlook_store
 from .pcf import WORD_SUFFIXES
-from .store import (MAIL_INDEX_FORMAT, buckets, document_kind, document_identity, matches_fingerprint, now,
+from .store import (MAIL_INDEX_FORMAT, buckets, contextual_model_key, document_kind, document_identity, matches_fingerprint, now,
                     pack_vector, read_signature, sections, vector_array)
+from .vector_index import prune_vector_files
 
 
 NO_MAIL = {"pst_no_mail", "eml_no_mail"}
@@ -31,6 +31,15 @@ EMBEDDING_BATCH_SIZE = 24
 EMBEDDING_BATCH_TIMEOUT = 60
 RETIRED_MAIL_BATCH_SIZE = 64
 runtime_logger = logging.getLogger("mailsearch.runtime")
+
+
+def embedding_input(row):
+    location = " / ".join(filter(None, (row["name"], row["location"])))
+    metadata = (row["subject"], row["sender"], row["sent"][:10], location)
+    header = "[" + " | ".join(" ".join(value.split())[:180] for value in metadata) + "]"
+    key = row["embedding_key"]
+    return (hashlib.sha256(key + header.encode()).digest() if key is not None else row["id"],
+            header + "\n" + row["text"])
 
 
 def pst_access_error(exc):
@@ -878,9 +887,18 @@ class Indexer:
             self.check(event)
             self.update_finalization(source, phase, done, total)
 
-        active = version if unchanged is None else unchanged
         report("prepare_switch")
         with self.store.connection() as conn:
+            old, model, done, total = conn.execute(
+                "SELECT active,embedding_model_key,embedding_done,embedding_total FROM sources WHERE id=?", (source,),
+            ).fetchone()
+            formats = [row[0] for row in conn.execute(
+                "SELECT model FROM embedding_revisions WHERE source=? AND version=?", (source, old),
+            )]
+            if model and done and model not in formats and unchanged is not None:
+                # New vectors require a new immutable shard even when all mail IDs survive.
+                unchanged = None
+            active = version if unchanged is None else unchanged
             changed = conn.execute(
                 """UPDATE sources SET active=?,active_signature=?,pending=NULL,state=?,updated=?,issue=?,
                    index_stage=? WHERE id=? AND pending=? AND state NOT IN ('paused','removing')""",
@@ -893,6 +911,11 @@ class Indexer:
                 report("reuse_mail")
                 conn.execute("UPDATE mails SET version=? WHERE id IN (SELECT id FROM outlook_retained)", (version,))
             report("save_metadata")
+            if model and done and (done == total or old is None or model in formats):
+                formats.append(model)
+            conn.executemany("INSERT OR IGNORE INTO embedding_revisions VALUES(?,?,?)",
+                             ((source, active, key) for key in formats))
+            conn.execute("DELETE FROM embedding_revisions WHERE source=? AND version<>?", (source, active))
             conn.execute("DELETE FROM problems WHERE source=? AND version<>?", (source, active))
             if signatures is not None:
                 self.store.save_pst_files(conn, source, signatures)
@@ -1218,7 +1241,8 @@ class Indexer:
                 save_extracted()
 
     def index_embeddings(self, source, version, event, *, retain=False):
-        model = self.ai.embedding_index
+        backend_key = self.ai.embedding_index
+        model = contextual_model_key(backend_key)
         batch_size = self.embedding_batch_size
         timeout = self.embedding_batch_timeout
         scope = "(m.version=? OR m.id IN (SELECT id FROM outlook_retained))" if retain else "m.version=?"
@@ -1240,7 +1264,8 @@ class Indexer:
             self.check(event)
             with self.store.connection() as conn:
                 rows = conn.execute(
-                    f"""SELECT p.id,p.text,m.subject,a.name,p.embedding_key FROM passages p CROSS JOIN mails m ON m.id=p.mail
+                    f"""SELECT p.id,p.text,m.subject,m.sender,m.sent,p.location,a.name,p.embedding_key
+                       FROM passages p CROSS JOIN mails m ON m.id=p.mail
                        LEFT JOIN attachments a ON a.id=p.attachment WHERE m.source=? AND {scope} AND p.id>?
                        AND NOT EXISTS(SELECT 1 FROM vectors v WHERE v.passage=p.id AND v.model=?)
                        AND NOT EXISTS(SELECT 1 FROM embedding_refs r WHERE r.passage=p.id AND r.model=?)
@@ -1248,27 +1273,28 @@ class Indexer:
                 ).fetchall()
                 shared = {}
                 inputs = {}
+                keys = {}
                 for row in rows:
-                    key = row["embedding_key"]
-                    if key is None:
-                        inputs[row["id"]] = f"{row['subject']}\n{row['name'] or ''}\n{row['text']}"
-                    elif key not in inputs and key not in shared:
-                        existing = conn.execute(
-                            "SELECT value FROM embedding_values WHERE model=? AND digest=?", (model, key),
-                        ).fetchone()
-                        if existing:
-                            shared[key] = existing["value"]
-                        else:
-                            inputs[key] = row["text"]
+                    key, document = embedding_input(row)
+                    keys[row["id"]] = key
+                    if key in inputs or key in shared:
+                        continue
+                    existing = conn.execute(
+                        "SELECT value FROM embedding_values WHERE model=? AND digest=?", (model, key),
+                    ).fetchone() if isinstance(key, bytes) else None
+                    if existing:
+                        shared[key] = existing["value"]
+                    else:
+                        inputs[key] = document
             if not rows:
                 return None
             try:
-                if self.ai.embedding_index != model:
+                if self.ai.embedding_index != backend_key:
                     return "embedding_unavailable"
                 encoded = [pack_vector(v) for v in self.ai.embed(list(inputs.values()), timeout=timeout)] if inputs else []
                 if len(encoded) != len(inputs):
                     raise ValueError("embeddings")
-                if self.ai.embedding_index != model:
+                if self.ai.embedding_index != backend_key:
                     return "embedding_unavailable"
                 shared.update(zip(inputs, encoded))
             except (OSError, ValueError, RuntimeError, KeyError, TypeError, http.client.HTTPException) as exc:
@@ -1290,9 +1316,9 @@ class Indexer:
             with self.store.connection() as conn:
                 for row in rows:
                     passage = row["id"]
-                    key = row["embedding_key"]
-                    value = shared[key if key is not None else passage]
-                    if key is None:
+                    key = keys[passage]
+                    value = shared[key]
+                    if key == passage:
                         conn.execute("INSERT INTO vectors VALUES(?,?,?)", (passage, model, value))
                     else:
                         conn.execute("INSERT OR IGNORE INTO embedding_values VALUES(?,?,?)", (model, key, value))
