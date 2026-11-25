@@ -762,13 +762,67 @@ def merge_rows(lexical, semantic, limit=9):
     return reciprocal_rank(((lexical, 1.2), (semantic, 1.0)), limit)
 
 
-def reciprocal_rank(pools, limit):
+RECENCY_INTENT = re.compile(r"현재|최신|최근|유효|latest|current|final", re.I)
+HISTORICAL_INTENT = re.compile(
+    r"초기|당초|최초|당시|이전|과거|작년|재작년|지난\s*(?:해|달|주)|[12][0-9]{3}\s*(?:년|[-./])|"
+    r"(?<![\w-])[12][0-9]{3}(?![\w-])|\bas of\b|\binitial\b", re.I,
+)
+WITHDRAWN_DECISION = re.compile(r"철회|번복|취소|반려|withdraw|revok|cancel|reject", re.I)
+
+
+def needs_recency_boost(question, filters):
+    return bool(filters.get("tab") != "pcf" and not filters.get("before")
+                and (DECISION_QUESTION.search(question) or RECENCY_INTENT.search(question))
+                and not (TIMELINE_QUESTION.search(question) or HISTORICAL_INTENT.search(question)
+                         or COMPARISON_QUESTION.search(question)))
+
+
+def message_date(row):
+    if row.get("kind", "mail") != "mail":
+        return None
+    try:
+        return datetime.date.fromisoformat(row.get("sent", "")[:10])
+    except ValueError:
+        return None
+
+
+def latest_thread_decisions(question, ranked, candidates, limit):
+    def group(row):
+        topic = topic_key(row.get("subject", ""))
+        return row.get("source"), topic
+
+    codes = {normalized(code) for code in REWRITE_IDENTIFIER.findall(question) if re.search("[A-Za-z]", code)}
+    groups = {group(row) for row in ranked[:limit] if row.get("subject")}
+    newest = {}
+    for row in candidates:
+        key = group(row)
+        sent = message_date(row)
+        if key not in groups or not sent or (codes and not codes.intersection(REWRITE_IDENTIFIER.findall(key[1]))):
+            continue
+        if row.get("location") != "본문":
+            continue
+        decisions = (match[0] for match in CLAUSE.finditer(row["text"]))
+        if any(not PROPOSAL.search(line) and not NEGATED.search(line) and not re.search(r"여부|예정|요청", line)
+               and (APPROVAL_SENTENCE.search(line) or WITHDRAWN_DECISION.search(line)) for line in decisions):
+            if key not in newest or sent > newest[key][0]:
+                newest[key] = (sent, row)
+    return [newest[key][1] for key in dict.fromkeys(group(row) for row in ranked[:limit]) if key in newest]
+
+
+def reciprocal_rank(pools, limit, *, recent=False):
     scores = {}
     for rows, weight in pools:
         for rank, row in enumerate(rows):
             previous, _ = scores.get(row["passage"], (0, row))
             scores[row["passage"]] = (previous + weight / (25 + rank), row)
-    return [row for _, row in sorted(scores.values(), key=lambda value: value[0], reverse=True)[:limit]]
+    today = datetime.date.today()
+
+    def rank(item):
+        score, row = item
+        sent = message_date(row) if recent else None
+        return score * (1 + .12 * 2 ** (-max(0, (today - sent).days) / 270)) if sent else score
+
+    return [row for _, row in sorted(scores.values(), key=rank, reverse=True)[:limit]]
 
 
 def pcf_candidates(store, ai, question, filters, context):
@@ -820,7 +874,7 @@ def rewritten_evidence(store, ai, question, filters, context, **options):
 
 
 def evidence_for(store, ai, question, filters, context, semantic=True, limit=9, expand=False, *, thread_hops=1,
-                 max_evidence=None, local_context="", sub_queries=(), keywords=(), check=None):
+                 max_evidence=None, local_context="", sub_queries=(), keywords=(), check=None, intent=None):
     search_text = f"{question} {context}".strip()
     rerank = semantic and search_text and ai.rerank_enabled
     candidate_limit = max(RAG_CANDIDATE_LIMIT if rerank else 40, limit)
@@ -863,7 +917,9 @@ def evidence_for(store, ai, question, filters, context, semantic=True, limit=9, 
             except MODEL_ERRORS:
                 if mode != "hybrid":
                     mode = "keyword_only"
-    seeds = reciprocal_rank(pools, candidate_limit)
+    intent = question if intent is None else intent
+    recent = needs_recency_boost(intent, filters)
+    seeds = reciprocal_rank(pools, candidate_limit, recent=recent)
     if rerank and len(seeds) > 1:
         with store.measure("rerank"):
             seeds = ai.rerank_candidates(search_text, seeds, limit=candidate_limit, text_limit=1100)
@@ -878,9 +934,11 @@ def evidence_for(store, ai, question, filters, context, semantic=True, limit=9, 
             chosen.append(row)
     with store.measure("context"):
         linked = store.related(list(dict.fromkeys(row["id"] for row in chosen[:7])), filters, hops=thread_hops, question=search_text)
+    reserved = latest_thread_decisions(intent, chosen, [*seeds, *linked], min(4, limit)) if recent else []
     seen = set()
     evidence = []
-    for row in [*chosen[:4], *linked[:4], *chosen[4:]]:
+    leading = max(0, min(4, limit - len(reserved)))
+    for row in [*chosen[:leading], *reserved, *chosen[leading:4], *linked[:4], *chosen[4:]]:
         key = (row["fingerprint"], row["attachment"], row["location"], row["text"])
         if key not in seen:
             seen.add(key)
