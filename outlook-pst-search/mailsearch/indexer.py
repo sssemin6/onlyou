@@ -19,7 +19,7 @@ from .extract import CREATE_FLAGS, DOCUMENT_SUFFIXES, MAX_ATTACHMENT, extract_at
 from .filesystem import local_path, source_path, stable_input
 from .outlook import DEFAULT_OUTLOOK, OutlookError, outlook_modules, outlook_store
 from .pcf import WORD_SUFFIXES
-from .store import (MAIL_INDEX_PREFIXES, buckets, contextual_model_key, document_kind, document_identity, matches_fingerprint, now,
+from .store import (MAIL_INDEX_PREFIXES, buckets, contextual_model_keys, document_kind, document_identity, matches_fingerprint, now,
                     pack_vector, read_signature, sections, vector_array)
 from .vector_index import prune_vector_files
 
@@ -1002,18 +1002,41 @@ class Indexer:
         self.publish_revision(source, version, signature, event, issue or (None if folders else "outlook_no_mail"),
                               empty_eml=not folders, retain=True, unchanged=unchanged)
 
+    def add_attachment_passages(self, conn, mail_id, mail, attachment, name, locations, content_key):
+        for location, text in locations:
+            for start, segment in sections(text):
+                key = hashlib.sha256(content_key + segment.encode()).digest() if content_key is not None else None
+                self.store.add_passage(conn, mail_id, mail, attachment, name, location, start, segment, embedding_key=key)
+
+    @staticmethod
+    def saved_attachment_extract(conn, key):
+        row = conn.execute("SELECT locations FROM attachment_extracts WHERE digest=?", (key,)).fetchone()
+        return json.loads(row["locations"]) if row is not None else None
+
     def index_outlook_attachments(self, conn, mail_id, mail, temporary, event):
+        def load_extract(key, extract):
+            cached = self.saved_attachment_extract(conn, key)
+            if cached is not None:
+                return "완료", cached, key
+            status, locations = extract()
+            if status == "완료" and locations:
+                conn.execute("INSERT OR IGNORE INTO attachment_extracts VALUES(?,?)",
+                             (key, json.dumps(locations, ensure_ascii=False)))
+                return status, locations, key
+            return status, locations, None
+
         entries = conn.execute("SELECT id FROM attachments WHERE mail=? ORDER BY id", (mail_id,)).fetchall()
         for entry, (name, part) in zip(entries, mail["attachments"], strict=True):
             self.check(event)
+            content_key = None
             try:
-                status, locations = extract_attachment(name, part, temporary, self.pdf, check=lambda: self.check(event))
+                result = extract_attachment(name, part, temporary, self.pdf, check=lambda: self.check(event), cache=load_extract)
+                status, locations = result[:2]
+                content_key = result[2] if len(result) == 3 else None
             except OutlookError as exc:
                 status, locations = ("용량 초과" if str(exc) == "outlook_attachment_size" else "Outlook 첨부 읽기 실패"), []
-            for location, text in locations:
-                for start, segment in sections(text):
-                    self.store.add_passage(conn, mail_id, mail, entry["id"], name, location, start, segment)
-            conn.execute("UPDATE attachments SET status=? WHERE id=?", (status, entry["id"]))
+            self.add_attachment_passages(conn, mail_id, mail, entry["id"], name, locations, content_key)
+            conn.execute("UPDATE attachments SET status=?,content_key=? WHERE id=?", (status, content_key, entry["id"]))
 
     def pending_updates(self, row):
         """PST files that changed or use an older index format."""
@@ -1158,9 +1181,9 @@ class Indexer:
             def load_extract(key, extract):
                 if key in new_extracts:
                     return "완료", new_extracts[key], key
-                row = conn.execute("SELECT locations FROM attachment_extracts WHERE digest=?", (key,)).fetchone()
-                if row is not None:
-                    return "완료", json.loads(row["locations"]), key
+                cached = self.saved_attachment_extract(conn, key)
+                if cached is not None:
+                    return "완료", cached, key
                 status, locations = extract()
                 if status == "완료" and locations:
                     new_extracts[key] = locations
@@ -1180,13 +1203,8 @@ class Indexer:
                                 "INSERT OR IGNORE INTO problems VALUES(?,?,?,'mail_original_changed')",
                                 (source, version, attachment["item"]),
                             )
-                        for location, text in locations:
-                            for start, segment in sections(text):
-                                embedding_key = (hashlib.sha256(content_key + segment.encode()).digest()
-                                                 if content_key is not None else None)
-                                self.store.add_passage(conn, attachment["mail"], mail, attachment["id"],
-                                                       attachment["name"], location, start, segment,
-                                                       embedding_key=embedding_key)
+                        self.add_attachment_passages(conn, attachment["mail"], mail, attachment["id"],
+                                                     attachment["name"], locations, content_key)
                         conn.execute("UPDATE attachments SET status=?,content_key=? WHERE id=?",
                                      (status, content_key, attachment["id"]))
                     omitted = sum(not locations for _, _, _, locations, _ in extracted)
@@ -1246,12 +1264,19 @@ class Indexer:
 
     def index_embeddings(self, source, version, event, *, retain=False):
         backend_key = self.ai.embedding_index
-        model = contextual_model_key(backend_key)
+        model, legacy_model = contextual_model_keys(backend_key)
         batch_size = self.embedding_batch_size
         timeout = self.embedding_batch_timeout
         scope = "(m.version=? OR m.id IN (SELECT id FROM outlook_retained))" if retain else "m.version=?"
         self.check(event)
         with self.store.connection() as conn:
+            active = conn.execute(
+                """SELECT r.model FROM sources s JOIN embedding_revisions r ON r.source=s.id AND r.version=s.active
+                   WHERE s.id=? AND r.model IN (?,?) ORDER BY r.model=? DESC LIMIT 1""",
+                (source, model, legacy_model, model),
+            ).fetchone()
+            if active:
+                model = active["model"]
             total, done = conn.execute(
                 f"""SELECT COUNT(*),COALESCE(SUM(v.passage IS NOT NULL OR r.passage IS NOT NULL),0)
                    FROM mails m JOIN passages p ON p.mail=m.id
