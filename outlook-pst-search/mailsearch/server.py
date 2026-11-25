@@ -28,7 +28,7 @@ from .answer import (ANSWER_CLAIM_LIMIT, ANSWER_EVIDENCE_LIMIT, ANSWER_TEXT_LIMI
                      DEFAULT_ANSWER_NUM_CTX, PCF_INSTRUCTIONS, SYNTHESIS_QUESTION, AnswerSessions, LocalAI,
                      answer_groups, answer_plan, combine_answer_evidence, delivery_date_answer, evidence_for,
                      follow_up_evidence, follow_up_replies, follow_up_reply_sender,
-                     map_citations, merge_rows, pcf_candidates, pcf_retrieval, pcf_word, public_row, validate)
+                     map_citations, merge_rows, pcf_candidates, pcf_retrieval, pcf_word, public_row, rewritten_evidence, validate)
 from .api_settings import ApiSettings, write_api_settings
 from .embedding import (CA_FILE_ENV, GatewayTLSOptions, MODEL as BGE_MODEL, PATH as EMBEDDING_PATH,
                         gateway_origin, logger as gateway_logger)
@@ -768,10 +768,15 @@ class Handler(BaseHTTPRequestHandler):
             evidence = [row for row in evidence if not pcf_word(row)]
         else:
             search_text, filters = question_scope(query, filters)
-            evidence, mode = evidence_for(store, ai, search_text, filters, context,
-                                          semantic=route == "/api/external/preview",
-                                          limit=MAX_INTERNAL_EXCERPTS if budget else 9, expand=bool(budget),
-                                          max_evidence=32 if budget else None)
+            options = {"limit": MAX_INTERNAL_EXCERPTS if budget else 9, "expand": bool(budget),
+                       "max_evidence": 32 if budget else None}
+            rewrite = (rewritten_evidence(store, ai, query, filters, context, **options)
+                       if route == "/api/external/preview" else None)
+            if rewrite:
+                evidence, mode, _, _ = rewrite
+            else:
+                evidence, mode = evidence_for(store, ai, search_text, filters, context,
+                                              semantic=route == "/api/external/preview", **options)
         if route in {"/api/external/preview", "/api/pcf/preview"}:
             with store.measure("context"):
                 token, review = self.server.reviews.create(
@@ -869,21 +874,31 @@ class Handler(BaseHTTPRequestHandler):
             follow_up, anchors = follow_up_evidence(store, query, filters, turns)
             if reply_sender:
                 anchors = follow_up_replies(store, anchors, filters, reply_sender)
-        pools = []
-        modes = []
-        for question in subqueries:
-            if check:
-                check()
-            found, mode = evidence_for(store, ai, question, filters, context, limit=12,
-                                       expand=True, thread_hops=3, max_evidence=ANSWER_EVIDENCE_LIMIT,
-                                       local_context=follow_up)
-            pools.append(found)
-            modes.append(mode)
-        evidence = combine_answer_evidence(pools, anchors)
+        options = {"limit": 12, "expand": True, "thread_hops": 3, "max_evidence": ANSWER_EVIDENCE_LIMIT,
+                   "local_context": follow_up, "check": check}
+        rewritten = None
+        if not reply_sender and filters.get("tab") != "pcf":
+            rewritten = rewritten_evidence(store, ai, query, filters, context, **options)
+        if rewritten:
+            found, mode, filters, query_count = rewritten
+            if anchors:
+                with store.measure("context"):
+                    visible = {row["passage"] for row in store.passages([row["passage"] for row in anchors], filters)}
+                anchors = [row for row in anchors if row["passage"] in visible]
+            evidence = combine_answer_evidence([found], anchors)
+        else:
+            pools = []
+            modes = []
+            for question in subqueries:
+                found, mode = evidence_for(store, ai, question, filters, context, **options)
+                pools.append(found)
+                modes.append(mode)
+            evidence = combine_answer_evidence(pools, anchors)
+            mode = next((label for label in ("hybrid", "keyword_only") if label in modes), "keyword")
+            query_count = len(pools)
         if follow_up:
             context = f"{follow_up} {context}".strip()[:450]
-        mode = next((label for label in ("hybrid", "keyword_only") if label in modes), "keyword")
-        report("retrieving", count=len(evidence), queries=len(pools))
+        report("retrieving", count=len(evidence), queries=query_count)
         rows = [public_row(row) for row in evidence]
         result = {"status": "insufficient", "claims": []}
         if not ai.model:
@@ -893,7 +908,7 @@ class Handler(BaseHTTPRequestHandler):
         elif evidence:
             try:
                 full_question = f"{query} {context}"
-                synthesis = len(subqueries) > 1 or SYNTHESIS_QUESTION.search(query)
+                synthesis = query_count > 1 or SYNTHESIS_QUESTION.search(query)
                 direct = None if synthesis else delivery_date_answer(query, evidence, context)
                 report("synthesizing")
                 with store.measure("generation"):
