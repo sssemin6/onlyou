@@ -41,7 +41,7 @@ from mailsearch.outlook import OutlookError, OutlookStore
 from mailsearch.search_profile import SearchProfile
 from mailsearch.server import (App, INSTANCE_FILE, SessionLock, existing_origin, gateway_defaults,
                                gateway_diagnostics, main, publish_instance)
-from mailsearch.store import VECTOR_LOOKUP_SQL, Store, contextual_model_key, fingerprint, local_midnight_utc, pack_vector, question_scope, read_signature, sections
+from mailsearch.store import VECTOR_LOOKUP_SQL, Store, contextual_model_key, fingerprint, local_midnight_utc, mail_sections, pack_vector, question_scope, read_signature, sections
 from tools.demo import generate
 
 
@@ -3066,6 +3066,19 @@ class RAGStability(unittest.TestCase):
                 self.assertEqual(evidence, [copies[0], other])
         unrelated = row(102, None, "다른 프로젝트", other["text"])
         self.assertEqual(dedupe_by_content([other, unrelated]), [other, unrelated])
+
+    def test_korean_reply_boundaries_remove_only_the_quoted_tail(self):
+        current = "현재 회신입니다.\r\n"
+        for divider in ("----- 원본 메일 -----", "----- 전달된 메일 -----", "----- Forwarded Message -----",
+                        "발신: old@example.invalid\r\n받는 사람: team\r\n제목: 이전 안\r\n"
+                        "회사: 테스트\r\n부서: 테스트\r\n일시: 2025-12-01",
+                        "발신자: 테스트\r\n발송일시: 2025-12-01",
+                        "발신: 테스트\r\n보낸 시각: 2025-12-01"):
+            with self.subTest(divider=divider):
+                body = current + divider + "\r\n이전 초안만 담긴 인용문"
+                self.assertEqual(list(mail_sections(body)), [(0, current)])
+        body = current + "발신: 담당자의 안내입니다.\r\n일시는 추후 정합니다.\r\n계속 확인합니다."
+        self.assertEqual(list(mail_sections(body)), [(0, body)])
 
     def test_latest_decision_is_retained_without_boosting_historical_questions(self):
         today = date.today().isoformat()
