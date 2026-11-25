@@ -28,7 +28,8 @@ from .answer import (ANSWER_CLAIM_LIMIT, ANSWER_EVIDENCE_LIMIT, ANSWER_TEXT_LIMI
                      DEFAULT_ANSWER_NUM_CTX, PCF_INSTRUCTIONS, SYNTHESIS_QUESTION, AnswerSessions, LocalAI,
                      answer_groups, answer_plan, combine_answer_evidence, delivery_date_answer, evidence_for,
                      follow_up_evidence, follow_up_replies, follow_up_reply_sender,
-                     map_citations, merge_rows, pcf_candidates, pcf_retrieval, pcf_word, public_row, rewritten_evidence, validate)
+                     map_citations, merge_rows, pcf_candidates, pcf_retrieval, pcf_word, public_row,
+                     report_unconfirmed_aspects, rewritten_evidence, supplemental_evidence, validate)
 from .api_settings import ApiSettings, write_api_settings
 from .embedding import (CA_FILE_ENV, GatewayTLSOptions, MODEL as BGE_MODEL, PATH as EMBEDDING_PATH,
                         gateway_origin, logger as gateway_logger)
@@ -755,6 +756,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(403, {"error": "external_disabled"})
             return
         pcf = route == "/api/pcf/preview"
+        gap_aspects = ()
         internal_budget = external.internal_budget if route == "/api/external/preview" else 0
         budget = external.review_budget if route == "/api/external/preview" else 0
         chars = external.review_chars if budget else 0
@@ -769,19 +771,25 @@ class Handler(BaseHTTPRequestHandler):
         else:
             search_text, filters = question_scope(query, filters)
             options = {"limit": MAX_INTERNAL_EXCERPTS if budget else 9, "expand": bool(budget),
-                       "max_evidence": 32 if budget else None}
+                       "max_evidence": 32 if budget else None, "intent": query}
             rewrite = (rewritten_evidence(store, ai, query, filters, context, **options)
                        if route == "/api/external/preview" else None)
+            query_count = 1
             if rewrite:
-                evidence, mode, _, _ = rewrite
+                evidence, mode, filters, query_count = rewrite
             else:
                 evidence, mode = evidence_for(store, ai, search_text, filters, context,
                                               semantic=route == "/api/external/preview", **options)
+            if route == "/api/external/preview":
+                evidence, mode, gap_aspects, _ = supplemental_evidence(
+                    store, ai, query, filters, context, evidence, mode, query_count,
+                    ceiling=32 if budget else 9, expand=bool(budget),
+                )
         if route in {"/api/external/preview", "/api/pcf/preview"}:
             with store.measure("context"):
                 token, review = self.server.reviews.create(
                     query, evidence, external.review_generation, pcf=pcf, internal_budget=internal_budget,
-                    review_budget=budget, review_chars=chars,
+                    review_budget=budget, review_chars=chars, filters=filters, gap_aspects=gap_aspects,
                 )
             by_passage = {row["passage"]: public_row(row) for row in evidence}
             self.send_json(200, {
@@ -898,7 +906,13 @@ class Handler(BaseHTTPRequestHandler):
             query_count = len(pools)
         if follow_up:
             context = f"{follow_up} {context}".strip()[:450]
-        report("retrieving", count=len(evidence), queries=query_count)
+        gap_aspects = ()
+        second = False
+        if ai.model and not reply_sender:
+            evidence, mode, gap_aspects, second = supplemental_evidence(
+                store, ai, query, filters, context, evidence, mode, query_count, check=check,
+            )
+        report("retrieving", count=len(evidence), queries=query_count, **{"pass": 2 if second else 1})
         rows = [public_row(row) for row in evidence]
         result = {"status": "insufficient", "claims": []}
         if not ai.model:
@@ -909,13 +923,15 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 full_question = f"{query} {context}"
                 synthesis = query_count > 1 or SYNTHESIS_QUESTION.search(query)
-                direct = None if synthesis else delivery_date_answer(query, evidence, context)
+                direct = None if synthesis or gap_aspects else delivery_date_answer(query, evidence, context)
                 report("synthesizing")
                 with store.measure("generation"):
                     groups = answer_groups(store, evidence) if synthesis else ()
                     options = {"groups": groups} if groups else {}
                     if check:
                         options["check"] = check
+                    if gap_aspects:
+                        options["gap_aspects"] = gap_aspects
                     proposed = ai.answer(query, evidence, context, **options) if direct is None else None
                 report("validating")
                 # Recheck visibility after inference, including source removal during generation.
@@ -935,7 +951,7 @@ class Handler(BaseHTTPRequestHandler):
                 result["status"] = "model_unavailable"
             finally:
                 self.server.generation.release()
-        return {**result, "results": rows, "retrieval": mode}
+        return {**report_unconfirmed_aspects(result, gap_aspects), "results": rows, "retrieval": mode}
 
     def preview_pcf_word(self, passage, question, context, filters, external):
         store = self.server.store
@@ -1131,7 +1147,7 @@ class Handler(BaseHTTPRequestHandler):
             if len(excerpts) > (MAX_INTERNAL_EXCERPTS if review.review_budget else MAX_EXCERPTS):
                 raise ValueError("external_excerpts")
             ids = [item.passage for item in excerpts]
-            scope = {"tab": "pcf"} if pcf else {}
+            scope = {"tab": "pcf"} if pcf else review.filters or {}
             window_ids = {item.passage for item in excerpts if item.window_start is not None}
             rows = {row["passage"]: row for row in server.store.passages(ids, scope, windows=window_ids)}
             if any(item.passage not in rows or not item.original_in(rows[item.passage]) for item in excerpts):
@@ -1157,6 +1173,7 @@ class Handler(BaseHTTPRequestHandler):
                         for item in excerpts if item.passage in visible and item.original_in(visible[item.passage])]
             with server.store.measure("validation"):
                 checked = validate(result, verified, review.question, text_for=lambda row: row["text"], pcf=pcf)
+            checked = report_unconfirmed_aspects(checked, review.gap_aspects)
             reply = {**checked, "results": [public_row(row) for row in verified], "provider": "external"}
         finally:
             server.outbound.release()
