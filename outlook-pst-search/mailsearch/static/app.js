@@ -271,6 +271,30 @@ function sourceProgress(done, total, unit) {
     indexingNumber.format(value) + " / " + indexingNumber.format(total) + unit };
 }
 
+const finalizationLabel = {
+  verify_source: "원본 변경 여부 확인",
+  prepare_switch: "새 검색 버전 반영 준비",
+  reuse_mail: "기존 Outlook 메일 연결",
+  count_old: "이전 색인 정리 대상 집계",
+  remove_old: "이전 색인 정리",
+  save_metadata: "보관함 정보 반영",
+  count_memory: "메모리 색인 대상 집계",
+  load_memory: "검색용 메일·문서 불러오기",
+  build_memory: "메모리 검색 색인 준비",
+  commit: "DB 저장 및 검색 버전 전환",
+};
+
+function finalizationStatus(saving) {
+  const status = finalizationLabel[saving?.phase] || "저장 단계 확인";
+  if (!saving) return { mark: "△", status: status + " 중", showBar: true };
+  const progress = sourceProgress(saving.done, saving.total, "건");
+  const detail = ["전체 경과 " + elapsedTime(saving.elapsed), "현재 단계 " + elapsedTime(saving.phase_elapsed)];
+  if (saving.idle >= 30) {
+    detail.push(progress ? elapsedTime(saving.idle) + " 동안 처리 건수 변화 없음" : "이 단계는 완료 건수를 집계할 수 없습니다");
+  }
+  return { mark: "△", status: status + " 중", progress, showBar: true, detail: detail.join(" · ") };
+}
+
 function sourceIndexStatuses(source, embeddingEnabled) {
   const { state, issue, pst_read: pst } = source;
   const running = workingIndexStates.has(state);
@@ -292,12 +316,14 @@ function sourceIndexStatuses(source, embeddingEnabled) {
     general = { mark: "X", status: stageName + " 실패", progress: ordinaryProgress, detail: issueNames[issue] || issue };
   } else if (generalComplete) {
     general = gaps ? { mark: "X", status: "처리 종료 · 일부 자료 미완료" } : { mark: "O", status: "완료 · 100%" };
+  } else if (running && stage === "finalizing") {
+    general = finalizationStatus(source.finalization);
   } else if (running) {
     const progress = stage === "extracting" && pst ? sourceProgress(pst.position - 1, pst.total, "개 확인")
       : ordinaryProgress;
-    const waitingForTotal = !progress && source.index_total == null && !pst && stage !== "finalizing";
+    const waitingForTotal = !progress && source.index_total == null && !pst;
     general = { mark: "△", status: stageName + " 진행 중", progress, showBar: true,
-      detail: waitingForTotal ? "전체 대상 집계 중" : stage === "finalizing" ? "처리 결과 반영 중" : "" };
+      detail: waitingForTotal ? "전체 대상 집계 중" : "" };
   } else {
     general = { mark: "—", status: [stopped, stage && stageName].filter(Boolean).join(" · "), progress: ordinaryProgress };
   }
