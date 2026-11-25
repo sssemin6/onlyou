@@ -946,7 +946,8 @@ class Indexer:
             self.state(source, "headers")
             self.check(event)
             retained = {entry: old[entry]["id"] for entry, folder in folders.items()
-                        if entry in old and old[entry]["folder"] == folder}
+                        if entry in old and old[entry]["folder"] == folder
+                        and old[entry]["fingerprint"].startswith(MAIL_INDEX_FORMAT + ":")}
             pending_ids = {entry for entry, item in pending.items()
                            if entry not in retained and folders.get(entry) == item["folder"]}
             with self.store.connection() as conn:
@@ -1097,7 +1098,7 @@ class Indexer:
                         doc = {"name": path.name, "folder": folder, "sent": document_date(path),
                                "status": status, "sections": locations, "pcf": structured}
                         adopted = previous is not None and self.store.try_adopt(
-                            conn, source, previous, version, item, document_identity(doc), index_format=None)
+                            conn, source, previous, version, item, document_identity(doc))
                         if adopted:
                             conn.execute("""UPDATE attachments SET status=? WHERE mail IN (
                                 SELECT id FROM mails WHERE source=? AND version=? AND item=?)""",
