@@ -2128,6 +2128,95 @@ class Integration(unittest.TestCase):
         self.assertEqual(data["status"], "insufficient")
         self.assertFalse(data["claims"])
 
+    def test_finalization_reports_progress_before_atomic_switch(self):
+        source = self.import_mail()
+        search = {"query": "A-17", "mode": "quick", "filters": {"source": source}}
+        original = self.call("/api/search", search)[1]["results"]
+        approved = next(row["passage"] for row in original if row["sent"].startswith("2026-04-10"))
+        active = self.store.source(source)["active"]
+        (self.mail / "approved.eml").unlink()
+        removing, removed = threading.Event(), threading.Event()
+        building, built = threading.Event(), threading.Event()
+        update = self.indexer.update_finalization
+
+        def observe(source, phase, done=None, total=None):
+            update(source, phase, done, total)
+            if phase == "remove_old" and done == 1:
+                removing.set()
+                removed.wait(5)
+            if phase == "build_memory" and done == total:
+                building.set()
+                built.wait(5)
+
+        def verify_status(phase, done, total):
+            code, data = self.call("/api/sources?scan=0")
+            self.assertEqual(code, 200)
+            current = data["sources"][0]
+            self.assertEqual((current["index_stage"], current["active"]), ("finalizing", active))
+            progress = current["finalization"]
+            self.assertEqual((progress["phase"], progress["done"], progress["total"]), (phase, done, total))
+            self.assertGreaterEqual(progress["elapsed"], progress["phase_elapsed"])
+            self.assertGreaterEqual(progress["phase_elapsed"], progress["idle"])
+            self.assertEqual(self.call(f"/api/evidence/{approved}")[0], 200)
+            self.assertEqual(self.call("/api/search", search)[1]["results"], original)
+
+        with (patch("mailsearch.indexer.FINALIZATION_BATCH_SIZE", 1),
+              patch.object(self.indexer, "update_finalization", side_effect=observe)):
+            self.assertEqual(self.call("/api/source-action", {"source": source, "action": "refresh"})[0], 202)
+            try:
+                self.assertTrue(removing.wait(5))
+                verify_status("remove_old", 1, 4)
+                removed.set()
+                self.assertTrue(building.wait(5))
+                verify_status("build_memory", 3, 3)
+            finally:
+                removed.set()
+                built.set()
+            self.assertEqual(await_source(self.store, source, {"ready", "error"})["state"], "ready")
+
+        current = self.call("/api/sources?scan=0")[1]["sources"][0]
+        self.assertNotEqual(current["active"], active)
+        self.assertIsNone(current["finalization"])
+        self.assertEqual(self.call(f"/api/evidence/{approved}")[0], 404)
+        updated = self.call("/api/search", search)[1]["results"]
+        self.assertEqual(len(updated), 2)
+        self.assertFalse(any(row["sent"].startswith("2026-04-10") for row in updated))
+
+    def test_pause_during_finalization_keeps_previous_index(self):
+        source = self.import_mail()
+        active = self.store.source(source)["active"]
+        removing, released = threading.Event(), threading.Event()
+        update = self.indexer.update_finalization
+
+        def observe(source, phase, done=None, total=None):
+            update(source, phase, done, total)
+            if phase == "remove_old" and done == 1:
+                removing.set()
+                released.wait(5)
+
+        with (patch("mailsearch.indexer.FINALIZATION_BATCH_SIZE", 1),
+              patch.object(self.indexer, "update_finalization", side_effect=observe)):
+            self.indexer.command(source, "refresh")
+            try:
+                self.assertTrue(removing.wait(5))
+                response = []
+                event = self.indexer.events[source]
+                pause = threading.Thread(target=lambda: response.append(
+                    self.call("/api/source-action", {"source": source, "action": "pause"})[0]))
+                pause.start()
+                self.assertTrue(event.wait(3))
+            finally:
+                released.set()
+            pause.join(5)
+            self.assertEqual(response, [202])
+            current = await_source(self.store, source, {"paused", "error"})
+            self.assertEqual((current["state"], current["active"]), ("paused", active))
+            self.assertIsNotNone(current["pending"])
+            with self.store.connection() as conn:
+                self.assertEqual(conn.execute("SELECT count(*) FROM mails WHERE source=? AND version=?",
+                                              (source, active)).fetchone()[0], 4)
+            self.assertIsNone(self.call("/api/sources?scan=0")[1]["sources"][0]["finalization"])
+
     def test_pause_and_resume_preserve_completed_work(self):
         entered, released = threading.Event(), threading.Event()
         index_headers = self.indexer.index_headers
