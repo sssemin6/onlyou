@@ -1,6 +1,7 @@
 import http.client
 import io
 import json
+import ssl
 import threading
 import unittest
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -84,6 +85,29 @@ class GatewayPoolTests(unittest.TestCase):
             self.assertIsNone(pool.take(key))
         for connection in connections[1:-1]:
             connection.close.assert_called_once()
+
+    def test_reset_aborted_and_tls_eof_retry_only_when_opted_in(self):
+        for error in (ConnectionResetError, ConnectionAbortedError, ssl.SSLEOFError):
+            for retry_stale in (True, False):
+                with (self.subTest(error=error.__name__, retry_stale=retry_stale),
+                      self.assertNoLogs(embedding.logger) if retry_stale else self.assertLogs(embedding.logger),
+                      patch.object(embedding, "gateway_connections", GatewayConnections())):
+                    stale, fresh = MagicMock(), MagicMock()
+                    stale.getresponse.side_effect = [self.response(), error()]
+                    fresh.getresponse.return_value = self.response()
+                    self.https.reset_mock()
+                    self.https.side_effect = [stale, fresh]
+                    self.request()
+                    if retry_stale:
+                        self.assertEqual(self.request(retry_stale=True), {"ok": True})
+                        self.assertEqual(self.https.call_count, 2)
+                        fresh.request.assert_called_once()
+                    else:
+                        with self.assertRaises(error):
+                            self.request(path="/v1/chat/completions", retry_stale=False)
+                        self.https.assert_called_once()
+                        fresh.request.assert_not_called()
+                    stale.close.assert_called_once()
 
 
 class CacheTests(unittest.TestCase):
@@ -198,3 +222,26 @@ class SpeculativeTests(unittest.TestCase):
         self.assertEqual(store.lexical.call_count, 3)
         ai.rerank_candidates.assert_called_once()
         self.assertEqual(store.search_session.call_count, 2)
+
+    def test_empty_narrowed_scope_falls_back_to_original_filters_and_reuses_warm_hits(self):
+        store = MagicMock(spec=Store)
+        ai = MagicMock(spec=LocalAI, embedding_index="", rerank_enabled=False)
+        ai.retrieval_model_available = True
+        question = "Atlas 도면 확인"
+        filters = {"source": 7, "sender": "Lee"}
+        plan = answer.RewritePlan(("Atlas 승인",), (), {"date_from": "2026-11-23"})
+        ai.rewrite_query.return_value = plan
+        narrowed = answer.rewritten_scope(filters, plan.filters)
+        self.assertIn("after", narrowed)
+        hit = dict(passage=1, id=1, text="Atlas 도면", fingerprint="1", location="본문", kind="mail", attachment=None)
+        store.lexical.side_effect = lambda query, scope, **_: [hit] if query == question and scope == filters else []
+        store.related.return_value = []
+
+        with (ThreadPoolExecutor(max_workers=4) as workers,
+              patch.object(answer, "evidence_for", wraps=answer.evidence_for) as retrieve):
+            evidence, mode, applied, count = answer.rewritten_evidence(store, ai, question, filters, "", workers=workers)
+
+        self.assertEqual((evidence, mode, applied, count), ([hit], "keyword", filters, 1))
+        self.assertEqual([call.args[3] for call in retrieve.call_args_list], [narrowed, filters])
+        original_calls = [call for call in store.lexical.call_args_list if call.args == (question, filters)]
+        self.assertEqual(len(original_calls), 1)
