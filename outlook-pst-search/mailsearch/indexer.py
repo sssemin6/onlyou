@@ -5,6 +5,7 @@ import http.client
 import json
 import logging
 import os
+import re
 import shutil
 import sqlite3
 import stat
@@ -16,6 +17,7 @@ from fnmatch import fnmatchcase
 from glob import escape
 from pathlib import Path
 
+from .answer import LocalModelHTTPError, LocalModelStartupError
 from .api_settings import write_api_settings as atomic_write
 from .embedding import EmbeddingAPI, GatewayRequestError, logger
 from .extract import (CREATE_FLAGS, DOCUMENT_SUFFIXES, LEGACY_CONVERTER_MISSING, MAX_ATTACHMENT,
@@ -37,6 +39,12 @@ GATEWAY_EMBEDDING_BATCH_SIZE = 64
 MIN_EMBEDDING_BATCH_SIZE = 16
 MAX_EMBEDDING_BATCH_SIZE = 128
 EMBEDDING_BATCH_TIMEOUT = 60
+EMBEDDING_INPUT_LIMIT = 2400
+EMBEDDING_RETRY_LIMIT = 500
+EMBEDDING_RETRY_DELAY = 2
+EMBEDDING_OUTAGE_LIMIT = 5
+EMBEDDING_RECOVERY_BATCHES = 10
+INVALID_EMBEDDING_CHARS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f\ud800-\udfff]")
 RETIRED_MAIL_BATCH_SIZE = 64
 IGNORED_DIRECTORIES = frozenset(name.casefold() for name in (
     ".git", "node_modules", "__pycache__", "$RECYCLE.BIN", "System Volume Information", "AppData",
@@ -50,15 +58,18 @@ runtime_logger = logging.getLogger("mailsearch.runtime")
 
 
 def embedding_input(row):
+    def clean(value):
+        return " ".join(INVALID_EMBEDDING_CHARS.sub("", value).split())
+
     key = row["embedding_key"]
     if key is None:
         location = " / ".join(filter(None, (row["name"], row["location"])))
         metadata = (row["subject"], row["sender"], row["sent"][:10], location)
     else:
         metadata = (row["name"] or "", row["location"])
-    header = "[" + " | ".join(" ".join(value.split())[:180] for value in metadata) + "]"
+    header = "[" + " | ".join(clean(value)[:180] for value in metadata) + "]"
     return (hashlib.sha256(key + header.encode()).digest() if key is not None else row["id"],
-            header + "\n" + row["text"])
+            (header + "\n" + clean(row["text"]))[:EMBEDDING_INPUT_LIMIT])
 
 
 def pst_access_error(exc):
@@ -1475,7 +1486,9 @@ class Indexer:
         provider = self.ai.embedding_api
         gateway = isinstance(provider, EmbeddingAPI) and bool(provider.index_key)
         backend = "gateway" if gateway else "Ollama"
-        batch_size = self.embedding_batch_size or (GATEWAY_EMBEDDING_BATCH_SIZE if gateway else EMBEDDING_BATCH_SIZE)
+        target_batch = self.embedding_batch_size or (GATEWAY_EMBEDDING_BATCH_SIZE if gateway else EMBEDDING_BATCH_SIZE)
+        batch_size = target_batch
+        outages = successes = 0
         timeout = self.embedding_batch_timeout
         scope = "(m.version=? OR m.id IN (SELECT id FROM outlook_retained))" if retain else "m.version=?"
         self.check(event)
@@ -1487,12 +1500,14 @@ class Indexer:
             ).fetchone()
             if active:
                 model = active["model"]
-            total, done = conn.execute(
-                f"""SELECT COUNT(*),COALESCE(SUM(v.passage IS NOT NULL OR r.passage IS NOT NULL),0)
+            total, done, skipped = conn.execute(
+                f"""SELECT COUNT(*),COALESCE(SUM(v.passage IS NOT NULL OR r.passage IS NOT NULL OR s.passage IS NOT NULL),0),
+                          COALESCE(SUM(s.passage IS NOT NULL),0)
                    FROM mails m JOIN passages p ON p.mail=m.id
                    LEFT JOIN vectors v ON v.passage=p.id AND v.model=?
                    LEFT JOIN embedding_refs r ON r.passage=p.id AND r.model=?
-                   WHERE m.source=? AND {scope} AND {EMBEDDING_PASSAGE}""", (model, model, source, version),
+                   LEFT JOIN embedding_skips s ON s.passage=p.id AND s.model=?
+                   WHERE m.source=? AND {scope} AND {EMBEDDING_PASSAGE}""", (model, model, model, source, version),
             ).fetchone()
             conn.execute("""UPDATE sources SET state='embeddings',index_stage='embeddings',embedding_done=?,
                             embedding_total=?,embedding_model_key=?
@@ -1509,7 +1524,8 @@ class Indexer:
                        AND {EMBEDDING_PASSAGE}
                        AND NOT EXISTS(SELECT 1 FROM vectors v WHERE v.passage=p.id AND v.model=?)
                        AND NOT EXISTS(SELECT 1 FROM embedding_refs r WHERE r.passage=p.id AND r.model=?)
-                       ORDER BY p.id LIMIT ?""", (source, version, last, model, model, batch_size)
+                       AND NOT EXISTS(SELECT 1 FROM embedding_skips s WHERE s.passage=p.id AND s.model=?)
+                       ORDER BY p.id LIMIT ?""", (source, version, last, model, model, model, batch_size)
                 ).fetchall()
                 shared = {}
                 inputs = {}
@@ -1527,36 +1543,86 @@ class Indexer:
                     else:
                         inputs[key] = document
             if not rows:
-                return None
-            try:
-                if self.ai.embedding_index != backend_key:
-                    return "embedding_unavailable"
-                encoded = [pack_vector(v) for v in self.ai.embed(list(inputs.values()), timeout=timeout)] if inputs else []
-                if len(encoded) != len(inputs):
-                    raise ValueError("embeddings")
-                if self.ai.embedding_index != backend_key:
-                    return "embedding_unavailable"
-                shared.update(zip(inputs, encoded))
-            except (OSError, ValueError, RuntimeError, KeyError, TypeError, http.client.HTTPException) as exc:
-                winerror = getattr(exc, "winerror", None)
-                reason = f"HTTP {exc.status}" if isinstance(exc, GatewayRequestError) else type(exc).__name__
-                retryable = isinstance(exc, TimeoutError) or (
-                    isinstance(exc, GatewayRequestError) and exc.status in {408, 413, 504})
-                if retryable and len(inputs) > 1:
-                    batch_size = max(1, len(inputs) // 2)
-                    logger.warning("Embedding batch retry (backend=%s, completed=%d/%d, timeout=%ds, next_batch=%d): %s",
-                                   backend, done, total, timeout, batch_size, reason)
-                    continue
-                logger.error("Embedding batch failed (backend=%s, completed=%d/%d): %s (errno=%s, winerror=%s)",
-                             backend, done, total, reason, getattr(exc, "errno", None), winerror)
-                if isinstance(exc, ConnectionAbortedError) or winerror == 10053:
-                    return "embedding_connection_aborted"
-                return "embedding_unavailable"
+                return "embedding_partial" if skipped else None
+            documents = list(inputs.values())
+            encoded = None
+            skipped_key = None
+            shortened = False
+            while True:
+                self.check(event)
+                try:
+                    if self.ai.embedding_index != backend_key:
+                        return "embedding_unavailable"
+                    if documents:
+                        vectors = [pack_vector(v) for v in self.ai.embed(documents, timeout=timeout)]
+                        if len(vectors) != len(inputs):
+                            raise ValueError("embeddings")
+                        outages = 0
+                        successes += 1
+                    else:
+                        vectors = []
+                    if self.ai.embedding_index != backend_key:
+                        return "embedding_unavailable"
+                    encoded = vectors
+                    break
+                except (OSError, ValueError, RuntimeError, KeyError, TypeError, http.client.HTTPException) as exc:
+                    successes = 0
+                    winerror = getattr(exc, "winerror", None)
+                    status = None
+                    reason = type(exc).__name__
+                    startup_failed = isinstance(exc, LocalModelStartupError)
+                    if isinstance(exc, GatewayRequestError):
+                        status, reason = exc.status, f"HTTP {exc.status}"
+                        retryable_http = status in {400, 408, 413, 500, 502, 503, 504}
+                    elif isinstance(exc, LocalModelHTTPError):
+                        status, reason = exc.status, f"Ollama HTTP {exc.status}"
+                        retryable_http = status in {400, 500, 502, 503}
+                    else:
+                        retryable_http = False
+                        if startup_failed and isinstance(exc.__cause__, LocalModelHTTPError):
+                            reason = f"Ollama HTTP {exc.__cause__.status} (model discovery)"
+                    disconnected = isinstance(exc, (ConnectionError, http.client.HTTPException)) or winerror in {10053, 10054, 10061}
+                    outage = disconnected or isinstance(exc, TimeoutError) or status in {408, 502, 503, 504}
+                    outages = outages + 1 if outage else 0
+                    if startup_failed or outages >= EMBEDDING_OUTAGE_LIMIT or not (retryable_http or outage):
+                        logger.error("Embedding batch failed (backend=%s, completed=%d/%d): %s (errno=%s, winerror=%s)",
+                                     backend, done, total, reason, getattr(exc, "errno", None), winerror)
+                        if isinstance(exc, ConnectionAbortedError) or winerror == 10053:
+                            return "embedding_connection_aborted"
+                        return "embedding_unavailable"
+                    split = len(inputs) > 1
+                    if split:
+                        batch_size = max(1, len(inputs) // 2)
+                        logger.warning("Embedding batch retry (backend=%s, completed=%d/%d, timeout=%ds, next_batch=%d): %s",
+                                       backend, done, total, timeout, batch_size, reason)
+                    elif not shortened:
+                        shortened = True
+                        documents = [documents[0][:EMBEDDING_RETRY_LIMIT]]
+                        logger.warning("Embedding single passage retry (backend=%s, limit=%d): %s",
+                                       backend, EMBEDDING_RETRY_LIMIT, reason)
+                    elif not outage:
+                        skipped_key = next(iter(inputs))
+                        break
+                    else:
+                        logger.warning("Embedding backend retry (backend=%s, attempts=%d/%d): %s",
+                                       backend, outages, EMBEDDING_OUTAGE_LIMIT, reason)
+                    if (disconnected or (status is not None and 500 <= status < 600)) and event.wait(EMBEDDING_RETRY_DELAY):
+                        self.check(event)
+                    if split:
+                        break
+            if encoded is None and skipped_key is None:
+                continue
+            shared.update(zip(inputs, encoded or []))
+            skipped_ids = []
             self.check(event)
             with self.store.connection() as conn:
                 for row in rows:
                     passage = row["id"]
                     key = keys[passage]
+                    if key == skipped_key:
+                        conn.execute("INSERT INTO embedding_skips VALUES(?,?)", (model, passage))
+                        skipped_ids.append(passage)
+                        continue
                     value = shared[key]
                     if key == passage:
                         conn.execute("INSERT INTO vectors VALUES(?,?,?)", (passage, model, value))
@@ -1570,6 +1636,15 @@ class Indexer:
                 done += len(rows)
                 conn.execute("UPDATE sources SET embedding_done=? WHERE id=? AND pending=?",
                              (done, source, version))
+            skipped += len(skipped_ids)
+            for passage in skipped_ids:
+                runtime_logger.warning("Embedding passage skipped (passage=%d, reason=%s)", passage, reason)
             runtime_logger.info("[임베딩] %.1f%% (%s/%s구간) · 배치 %d · 백엔드=%s (source=%d)",
                                 100 * done / total, format(done, ","), format(total, ","), batch_size, backend, source)
+            if skipped_ids:
+                runtime_logger.info("Embedding passages skipped so far (source=%d, skipped=%d)", source, skipped)
+            if batch_size < target_batch and successes >= EMBEDDING_RECOVERY_BATCHES:
+                batch_size = min(target_batch, batch_size * 2)
+                successes = 0
+                runtime_logger.info("Embedding batch capacity recovered (source=%d, next_batch=%d)", source, batch_size)
             last = rows[-1]["id"]
