@@ -630,6 +630,7 @@ class Handler(BaseHTTPRequestHandler):
         mode = payload.get("mode")
         plan = quoted_plan(query)
         quick = mode == "quick" and plan is None and not filters.get("body")
+        quick_body = quick and payload.get("quick_body") is True
         hybrid = plan is None and mode not in ("keyword", "quick")
         memory = (plan is None and mode in ("quick", "keyword") and payload.get("full_text") is not True
                   and filters.get("tab") not in ("document", "pcf") and not filters.get("prefer_attachment")
@@ -645,7 +646,7 @@ class Handler(BaseHTTPRequestHandler):
                 if plan is not None:
                     rows = store.exact_search(plan, filters)
                 elif memory:
-                    rows = store.memory_search(query, filters, quick=quick, limit=100 if defer else 20)
+                    rows = store.memory_search(query, filters, quick=quick and not quick_body, limit=100 if defer else 20)
                     if not rows and mode == "keyword" and "," not in normalized(query) and not filters.get("body"):
                         # Old keyword clients also search deep mail text and attachment contents.
                         rows = store.lexical(query, filters, limit=180)
