@@ -13,6 +13,9 @@ import subprocess
 import tempfile
 import threading
 import time
+from collections import deque
+from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import contextmanager
 from fnmatch import fnmatchcase
 from glob import escape
 from pathlib import Path
@@ -181,6 +184,10 @@ class Indexer:
             raise ValueError("embedding_batch_settings")
         self.embedding_batch_size = embedding_batch_size
         self.embedding_batch_timeout = embedding_batch_timeout
+        try:
+            self.extract_workers = min(4, max(1, int(os.environ.get("MAILSEARCH_EXTRACT_WORKERS", "2"))))
+        except ValueError:
+            self.extract_workers = 2
         self.lock = threading.RLock()
         self.events = {}
         self.pst_reads = {}
@@ -402,6 +409,17 @@ class Indexer:
         for worker in workers:
             if worker is not None:
                 worker.join()
+
+    @contextmanager
+    def extraction_pool(self):
+        if self.extract_workers == 1:
+            yield None
+            return
+        pool = ThreadPoolExecutor(max_workers=self.extract_workers, thread_name_prefix="index-extract")
+        try:
+            yield pool
+        finally:
+            pool.shutdown(wait=True, cancel_futures=True)
 
     def run(self):
         cleanup_failed = False
@@ -1085,7 +1103,7 @@ class Indexer:
 
     def process_outlook(self, row, temporary, event):
         source, version, previous = row["id"], row["pending"], row["active"]
-        with outlook_store(row["path"]) as outlook:
+        with outlook_store(row["path"]) as outlook, self.extraction_pool() as pool:
             signature = outlook.store_id
             with self.store.connection() as conn:
                 old = self.store.mail_identities(conn, source, previous) if row["active_signature"] == signature else {}
@@ -1128,7 +1146,7 @@ class Indexer:
                     self.check(event)
                     mail = outlook.read(entry_id, folders[entry_id], temporary, aliases.get(entry_id, ()))
                     mail_id = self.store.add_mail(conn, source, version, entry_id, mail)
-                    self.index_outlook_attachments(conn, mail_id, mail, temporary, event)
+                    self.index_outlook_attachments(conn, mail_id, mail, temporary, event, pool)
                     del mail
                     done += 1
                     batch.append(mail_id)
@@ -1177,32 +1195,73 @@ class Indexer:
         row = conn.execute("SELECT locations FROM attachment_extracts WHERE digest=?", (key,)).fetchone()
         return json.loads(row["locations"]) if row is not None else None
 
-    def index_outlook_attachments(self, conn, mail_id, mail, temporary, event):
+    def attachment_extract(self, conn, name, part, temporary, event, pool, inflight, new_extracts):
         def load_extract(key, extract):
-            cached = self.saved_attachment_extract(conn, key)
-            if cached is not None:
-                return "완료", cached, key
-            status, locations = extract()
-            if status == "완료" and locations:
+            locations = new_extracts.get(key)
+            if locations is None:
+                locations = self.saved_attachment_extract(conn, key)
+            if locations is not None:
+                return "완료", locations, key
+
+            if pool is None:
+                status, locations = extract()
+                if status == "완료" and locations:
+                    new_extracts[key] = locations
+                    return status, locations, key
+                return status, locations, None
+
+            if key not in inflight:
+                def read():
+                    self.check(event)
+                    status, locations = extract()
+                    return status, locations, key
+
+                inflight[key] = pool.submit(read)
+            return inflight[key]
+
+        # MIME decoding and Outlook COM reads stay on the indexer thread. The
+        # worker receives only a closure over the decoded document bytes.
+        return extract_attachment(name, part, temporary, self.pdf, check=lambda: self.check(event), cache=load_extract)
+
+    def attachment_result(self, result, event, inflight, new_extracts):
+        if isinstance(result, Future):
+            pending = result
+            status, locations, key = pending.result()
+            self.check(event)
+            if inflight.get(key) is pending:
+                del inflight[key]
+                if status == "완료" and locations:
+                    new_extracts[key] = locations
+            return status, locations, key if status == "완료" and locations else None
+        self.check(event)
+        return (*result, None) if len(result) == 2 else result
+
+    def index_outlook_attachments(self, conn, mail_id, mail, temporary, event, pool=None):
+        inflight, new_extracts, pending = {}, {}, deque()
+
+        def save_one():
+            entry, name, result = pending.popleft()
+            status, locations, key = self.attachment_result(result, event, inflight, new_extracts)
+            if key in new_extracts:
                 conn.execute("INSERT OR IGNORE INTO attachment_extracts VALUES(?,?)",
-                             (key, json.dumps(locations, ensure_ascii=False)))
-                return status, locations, key
-            return status, locations, None
+                             (key, json.dumps(new_extracts.pop(key), ensure_ascii=False)))
+            self.add_attachment_passages(conn, mail_id, mail, entry["id"], name, locations, key)
+            conn.execute("UPDATE attachments SET status=?,content_key=? WHERE id=?", (status, key, entry["id"]))
 
         entries = conn.execute("SELECT id,status FROM attachments WHERE mail=? ORDER BY id", (mail_id,)).fetchall()
         for entry, (name, part) in zip(entries, mail["attachments"], strict=True):
             if entry["status"] == UNSUPPORTED_FORMAT:
                 continue
             self.check(event)
-            content_key = None
             try:
-                result = extract_attachment(name, part, temporary, self.pdf, check=lambda: self.check(event), cache=load_extract)
-                status, locations = result[:2]
-                content_key = result[2] if len(result) == 3 else None
+                result = self.attachment_extract(conn, name, part, temporary, event, pool, inflight, new_extracts)
             except OutlookError as exc:
-                status, locations = ("용량 초과" if str(exc) == "outlook_attachment_size" else "Outlook 첨부 읽기 실패"), []
-            self.add_attachment_passages(conn, mail_id, mail, entry["id"], name, locations, content_key)
-            conn.execute("UPDATE attachments SET status=?,content_key=? WHERE id=?", (status, content_key, entry["id"]))
+                result = ("용량 초과" if str(exc) == "outlook_attachment_size" else "Outlook 첨부 읽기 실패"), []
+            pending.append((entry, name, result))
+            if len(pending) >= self.extract_workers:
+                save_one()
+        while pending:
+            save_one()
 
     def pending_updates(self, row):
         """PST files that changed or use an older index format."""
@@ -1247,7 +1306,7 @@ class Indexer:
 
     def index_headers(self, root, source, version, event, *, numbered=False, extras=(), previous=None,
                       carried=(), temp=None, ignore_patterns=()):
-        with self.store.connection() as conn:
+        with self.extraction_pool() as pool, self.store.connection() as conn:
             for prefix in carried:
                 self.check(event)
                 adopted = self.store.carry_prefix(conn, source, previous, version, prefix)
@@ -1269,6 +1328,24 @@ class Indexer:
             next_log = time.monotonic() + PST_PROGRESS_INTERVAL
             done = 0
             batch = []
+            pending_docs = {}
+            documents = ((path, item) for path, item, _ in entries if path.suffix.lower() in DOCUMENT_SUFFIXES)
+
+            def already_indexed(item):
+                return conn.execute("""SELECT 1 FROM mails WHERE source=? AND version=? AND item=?
+                                       UNION ALL SELECT 1 FROM problems WHERE source=? AND version=? AND item=? LIMIT 1""",
+                                    (source, version, item, source, version, item)).fetchone() is not None
+
+            def extract(path):
+                self.check(event)
+                structured = {} if (path.suffix.lower() in WORD_SUFFIXES and document_kind(path.name) == "pcf") else None
+                try:
+                    status, locations = extract_document(
+                        path, workspace, self.pdf, check=lambda: self.check(event), structure=structured)
+                except OSError:
+                    status, locations = "추출 실패 또는 암호화", []
+                return status, locations, structured
+
             for done, (path, item, folder) in enumerate(entries, 1):
                 self.check(event)
                 if done > 1 and (done - 1) % 32 == 0:
@@ -1280,17 +1357,19 @@ class Indexer:
                     if previous is None:
                         self.store.append_pending_memory(source, batch)
                         batch.clear()
-                if conn.execute("SELECT 1 FROM mails WHERE source=? AND version=? AND item=?", (source, version, item)).fetchone():
-                    continue
-                if conn.execute("SELECT 1 FROM problems WHERE source=? AND version=? AND item=?", (source, version, item)).fetchone():
+                if already_indexed(item):
                     continue
                 if path.suffix.lower() in DOCUMENT_SUFFIXES:
-                    structured = {} if (path.suffix.lower() in WORD_SUFFIXES and document_kind(path.name) == "pcf") else None
-                    try:
-                        status, locations = extract_document(
-                            path, workspace, self.pdf, check=lambda: self.check(event), structure=structured)
-                    except OSError:
-                        status, locations = "추출 실패 또는 암호화", []
+                    if pool is not None and item not in pending_docs:
+                        # Look ahead across interleaved EML files and keep writes in scan order.
+                        for next_path, next_item in documents:
+                            self.check(event)
+                            if not already_indexed(next_item):
+                                pending_docs[next_item] = pool.submit(extract, next_path)
+                                if len(pending_docs) == self.extract_workers:
+                                    break
+                    status, locations, structured = extract(path) if pool is None else pending_docs.pop(item).result()
+                    self.check(event)
                     if not locations and not (structured and structured.get("comments")):
                         conn.execute("INSERT INTO problems VALUES(?,?,?,?)", (source, version, item, status))
                         conn.execute("UPDATE sources SET omitted=omitted+1 WHERE id=?", (source,))
@@ -1342,10 +1421,10 @@ class Indexer:
             self.store.append_pending_memory(source, batch)
 
     def index_attachments(self, root, temp, source, version, event, extras=()):
-        with self.store.connection() as conn:
+        with self.extraction_pool() as pool, self.store.connection() as conn:
             last = 0
-            extracted = []
-            new_extracts = {}
+            extracted, pending = [], deque()
+            new_extracts, inflight = {}, {}
             conn.executemany("UPDATE attachments SET status='대기' WHERE id=?",
                              ((row["id"],) for row in self.retryable_extracts(conn, source, version)))
             total, done = conn.execute(
@@ -1358,17 +1437,10 @@ class Indexer:
             log_index_progress(source, "첨부", done, total)
             next_log = time.monotonic() + PST_PROGRESS_INTERVAL
 
-            def load_extract(key, extract):
-                if key in new_extracts:
-                    return "완료", new_extracts[key], key
-                cached = self.saved_attachment_extract(conn, key)
-                if cached is not None:
-                    return "완료", cached, key
-                status, locations = extract()
-                if status == "완료" and locations:
-                    new_extracts[key] = locations
-                    return status, locations, key
-                return status, locations, None
+            def collect_one():
+                attachment, mail, result = pending.popleft()
+                status, locations, key = self.attachment_result(result, event, inflight, new_extracts)
+                extracted.append((attachment, mail, status, locations, key))
 
             def save_extracted():
                 nonlocal done, next_log
@@ -1422,21 +1494,23 @@ class Indexer:
                         if attachment["status"] != "대기":
                             continue
                         self.check(event)
-                        cached = None
                         if changed:
-                            status, locations = "원본 변경", []
+                            result = "원본 변경", []
                         elif mail is None:
-                            status, locations = "추출 실패", []
+                            result = "추출 실패", []
                         else:
                             name, part = mail["attachments"][position]
-                            result = extract_attachment(name, part, temp, self.pdf,
-                                                        check=lambda: self.check(event), cache=load_extract)
-                            status, locations = result[:2]
-                            cached = result[2] if len(result) == 3 else None
-                        extracted.append((attachment, mail, status, locations, cached))
-                        if len(extracted) == 24:
+                            result = self.attachment_extract(conn, name, part, temp, event, pool, inflight, new_extracts)
+                        pending.append((attachment, mail, result))
+                        if len(pending) >= self.extract_workers:
+                            collect_one()
+                        if len(extracted) + len(pending) == 24:
+                            while pending:
+                                collect_one()
                             save_extracted()
                 last = batch[-1]["id"]
+            while pending:
+                collect_one()
             if extracted:
                 save_extracted()
             self.update_extraction_counts(conn, source, version)
