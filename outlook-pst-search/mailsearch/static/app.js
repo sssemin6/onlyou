@@ -3,6 +3,8 @@
 const element = (id) => document.getElementById(id);
 const token = document.querySelector('meta[name="mail-session"]').content;
 const form = element("search-form");
+const queryInput = element("query");
+const suggestionList = element("search-suggestions");
 const sourcesList = element("sources");
 const addForm = element("add-form");
 const addOpen = element("add-open");
@@ -125,6 +127,10 @@ let externalAnswerAvailable = false;
 let intranetAnswerAvailable = false;
 let semanticSources = [];
 let request;
+let instantSearchTimer;
+let suggestionTimer;
+let suggestionRequest;
+let selectedSuggestion = -1;
 let pendingReview;
 let sourceSnapshot = "";
 let sourceRequest = 0;
@@ -1113,6 +1119,8 @@ function clearReview() {
 }
 
 function clearSearch() {
+  window.clearTimeout(instantSearchTimer);
+  closeSuggestions();
   request?.abort();
   element("cancel-answer").hidden = true;
   clearReview();
@@ -1280,12 +1288,90 @@ async function previewAnswer(route, payload, active, pcf) {
   });
 }
 
-element("query").addEventListener("input", clearSearch);
+function searchFilters() {
+  return { ...Object.fromEntries(["source", ...TAB_FILTERS[activeTab]].map((id) => [id, element(id).value])),
+    tab: activeTab };
+}
+
+function closeSuggestions() {
+  window.clearTimeout(suggestionTimer);
+  suggestionRequest?.abort();
+  suggestionList.hidden = true;
+  suggestionList.replaceChildren();
+  selectedSuggestion = -1;
+  queryInput.setAttribute("aria-expanded", "false");
+  queryInput.removeAttribute("aria-activedescendant");
+}
+
+function chooseSuggestion(value) {
+  queryInput.value = value;
+  queryInput.focus();
+  form.requestSubmit(element("submit-search"));
+}
+
+function scheduleSuggestions(prefix, filters) {
+  suggestionTimer = window.setTimeout(async () => {
+    const active = suggestionRequest = new AbortController();
+    try {
+      const { suggestions } = await call("/api/suggest", { prefix, filters }, active.signal);
+      if (active.signal.aborted || document.activeElement !== queryInput || !suggestions.length) return;
+      const kinds = { sender: "보낸 사람·받는 사람", subject: "메일 제목", document: "문서" };
+      suggestions.forEach((item, index) => {
+        const option = node("li");
+        option.id = "search-suggestion-" + index;
+        option.setAttribute("role", "option");
+        option.setAttribute("aria-selected", "false");
+        option.append(node("span", item.label, "suggestion-label"), node("span", kinds[item.kind], "suggestion-kind"));
+        option.addEventListener("pointerdown", (event) => event.preventDefault());
+        option.addEventListener("click", () => chooseSuggestion(item.query));
+        option.dataset.query = item.query;
+        suggestionList.append(option);
+      });
+      suggestionList.hidden = false;
+      queryInput.setAttribute("aria-expanded", "true");
+    } catch {
+      // The user can still search while suggestions are unavailable.
+    }
+  }, 180);
+}
+
+function scheduleInstantSearch(query, filters) {
+  if (query.length < 2 || searchMode(filters) !== "quick") return;
+  instantSearchTimer = window.setTimeout(async () => {
+    const active = request = new AbortController();
+    try {
+      await showSearch({ query, filters }, "quick", active);
+    } catch (error) {
+      if (!active.signal.aborted) notice(error.message);
+    }
+  }, 260);
+}
+
+function queryChanged(event) {
+  clearSearch();
+  if (event.isComposing) return;
+  const query = queryInput.value.trim();
+  if (query.length < 2) return;
+  const filters = searchFilters();
+  scheduleSuggestions(query, filters);
+  scheduleInstantSearch(query, filters);
+}
+
+queryInput.addEventListener("input", queryChanged);
+queryInput.addEventListener("compositionstart", clearSearch);
+queryInput.addEventListener("compositionend", queryChanged);
+queryInput.addEventListener("blur", closeSuggestions);
+document.addEventListener("pointerdown", (event) => {
+  if (event.target !== queryInput && !suggestionList.contains(event.target)) closeSuggestions();
+});
+
 const quickSearch = element("search-quick");
 const keywordSearch = element("search-keyword");
 for (const [option, other] of [[quickSearch, keywordSearch], [keywordSearch, quickSearch]]) {
   option.addEventListener("change", () => {
     if (option.checked) other.checked = false;
+    clearSearch();
+    scheduleInstantSearch(queryInput.value.trim(), searchFilters());
   });
 }
 
@@ -1295,6 +1381,28 @@ function searchMode(filters) {
     (!filters.source || String(source.id) === filters.source) &&
     (activeTab === "all" || source.counts?.[activeTab] > 0));
   return semanticReady && !keywordSearch.checked && !quickSearch.checked ? "hybrid" : "keyword";
+}
+
+async function showSearch(payload, mode, active) {
+  const { query } = payload;
+  const data = await call("/api/search", { ...payload, mode, defer_access: true, full_text: mode === "keyword",
+    quick_body: mode === "quick",
+    rerank: mode === "hybrid" && element("search-rerank").checked }, active.signal);
+  if (active.signal.aborted) return;
+  const quick = data.mode === "quick" && query;
+  const title = quick ? "빠른 검색 결과" : query ? "검색 결과" : recentTitle();
+  const emptyMessage = quick ? "일치하는 자료가 없습니다. 빠른 검색을 끄면 전체 본문과 첨부파일을 찾습니다." : undefined;
+  showResults(data.results, title, data.access_ticket ? "원본 접근을 확인하는 중입니다." : emptyMessage);
+  if (data.access_ticket) {
+    notice("원본 접근을 확인하는 중입니다.");
+    const verified = await call("/api/search-access", { ticket: data.access_ticket }, active.signal);
+    if (active.signal.aborted) return;
+    const pendingMessage = verified.access_pending ? "응답이 늦는 원본을 확인 중입니다. 잠시 후 다시 검색해 주세요." : "";
+    showResults(verified.results, title, pendingMessage || emptyMessage);
+    notice(pendingMessage);
+  } else {
+    notice("");
+  }
 }
 
 form.addEventListener("submit", async (event) => {
@@ -1309,8 +1417,7 @@ form.addEventListener("submit", async (event) => {
     notice("질문을 입력하세요.");
     return;
   }
-  const filters = Object.fromEntries(["source", ...TAB_FILTERS[activeTab]].map((id) => [id, element(id).value]));
-  filters.tab = activeTab;
+  const filters = searchFilters();
   const mode = searchMode(filters);
   const payload = { query, filters, context: ask ? previousQuestion : "" };
   notice(ask ? "답변에 쓸 근거를 찾고 있습니다." : mode === "hybrid" ? "의미 검색 중입니다." : "검색 중입니다.");
@@ -1322,24 +1429,7 @@ form.addEventListener("submit", async (event) => {
     } else if (ask) {
       await previewAnswer(pcf ? "/api/pcf/preview" : "/api/external/preview", payload, active, pcf);
     } else {
-      const data = await call("/api/search", { ...payload, mode, defer_access: true, full_text: mode === "keyword",
-        quick_body: mode === "quick",
-        rerank: mode === "hybrid" && element("search-rerank").checked }, active.signal);
-      if (active.signal.aborted) return;
-      const quick = data.mode === "quick" && query;
-      const title = quick ? "빠른 검색 결과" : query ? "검색 결과" : recentTitle();
-      const emptyMessage = quick ? "일치하는 자료가 없습니다. 빠른 검색을 끄면 전체 본문과 첨부파일을 찾습니다." : undefined;
-      showResults(data.results, title, data.access_ticket ? "원본 접근을 확인하는 중입니다." : emptyMessage);
-      if (data.access_ticket) {
-        notice("원본 접근을 확인하는 중입니다.");
-        const verified = await call("/api/search-access", { ticket: data.access_ticket }, active.signal);
-        if (active.signal.aborted) return;
-        const pendingMessage = verified.access_pending ? "응답이 늦는 원본을 확인 중입니다. 잠시 후 다시 검색해 주세요." : "";
-        showResults(verified.results, title, pendingMessage || emptyMessage);
-        notice(pendingMessage);
-      } else {
-        notice("");
-      }
+      await showSearch(payload, mode, active);
     }
   } catch (error) {
     if (!active.signal.aborted) notice(error.message);
@@ -1778,10 +1868,34 @@ document.addEventListener("keydown", (event) => {
   element("query").focus();
 });
 
-element("query").addEventListener("keydown", (event) => {
-  if (event.key !== "Enter" || !(event.ctrlKey || event.metaKey) || event.isComposing) return;
-  event.preventDefault();
-  form.requestSubmit(element("submit-ask"));
+queryInput.addEventListener("keydown", (event) => {
+  if (event.isComposing) return;
+  if (event.key === "Enter" && (event.ctrlKey || event.metaKey)) {
+    event.preventDefault();
+    form.requestSubmit(element("submit-ask"));
+    return;
+  }
+  if (event.key === "Escape") {
+    if (!suggestionList.hidden) event.preventDefault();
+    closeSuggestions();
+    return;
+  }
+  if (suggestionList.hidden) return;
+  const options = suggestionList.children;
+  if (event.key === "Enter" && selectedSuggestion >= 0) {
+    event.preventDefault();
+    chooseSuggestion(options[selectedSuggestion].dataset.query);
+  } else if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+    event.preventDefault();
+    const offset = event.key === "ArrowDown" ? 1 : -1;
+    if (selectedSuggestion >= 0) options[selectedSuggestion].setAttribute("aria-selected", "false");
+    selectedSuggestion = selectedSuggestion < 0 && offset < 0 ? options.length - 1
+      : (selectedSuggestion + offset + options.length) % options.length;
+    const option = options[selectedSuggestion];
+    option.setAttribute("aria-selected", "true");
+    queryInput.setAttribute("aria-activedescendant", option.id);
+    option.scrollIntoView({ block: "nearest" });
+  }
 });
 
 function showAddForm(open) {
