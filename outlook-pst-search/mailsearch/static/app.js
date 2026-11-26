@@ -1164,6 +1164,7 @@ form.addEventListener("submit", async (event) => {
       await previewAnswer(pcf ? "/api/pcf/preview" : "/api/external/preview", payload, active, pcf);
     } else {
       const data = await call("/api/search", { ...payload, mode, defer_access: true, full_text: mode === "keyword",
+        quick_body: mode === "quick",
         rerank: mode === "hybrid" && element("search-rerank").checked }, active.signal);
       if (active.signal.aborted) return;
       const quick = data.mode === "quick" && query;
