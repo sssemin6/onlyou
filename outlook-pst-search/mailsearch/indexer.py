@@ -13,8 +13,10 @@ import tempfile
 import threading
 import time
 from fnmatch import fnmatchcase
+from glob import escape
 from pathlib import Path
 
+from .api_settings import write_api_settings as atomic_write
 from .embedding import EmbeddingAPI, GatewayRequestError, logger
 from .extract import (CREATE_FLAGS, DOCUMENT_SUFFIXES, LEGACY_CONVERTER_MISSING, MAX_ATTACHMENT,
                       PDF_EXTRACTOR_MISSING, UNSUPPORTED_FORMAT, extract_attachment, extract_document,
@@ -39,7 +41,10 @@ RETIRED_MAIL_BATCH_SIZE = 64
 IGNORED_DIRECTORIES = frozenset(name.casefold() for name in (
     ".git", "node_modules", "__pycache__", "$RECYCLE.BIN", "System Volume Information", "AppData",
     "Program Files", "Program Files (x86)", "Windows", "venv", ".venv",
+    "My Music", "My Pictures", "My Videos", "OneDriveTemp", "Intel", "NVIDIA", "AMD",
 ))
+MAIL_SUFFIXES = frozenset({".pst", ".eml"})
+SOFTWARE_SUFFIXES = frozenset({".exe", ".dll", ".sys", ".msi", ".so", ".pyd"})
 EMBEDDING_PASSAGE = "p.location<>'파일명' AND length(p.text)>=15 AND embedding_text_eligible(p.text)"
 runtime_logger = logging.getLogger("mailsearch.runtime")
 
@@ -64,21 +69,22 @@ def pst_access_issue(exc):
     return "pst_access_denied" if getattr(exc, "winerror", None) in {5, 65, 86, 1326} else "pst_in_use"
 
 
-def folder_files(root, suffixes, *, numbered=False, log_skipped=False):
+def folder_files(root, suffixes, *, numbered=False, log_skipped=False, extra_patterns=()):
     ignore = root / ".mailsearchignore"
-    patterns = []
+    lines = list(extra_patterns)
     try:
         with ignore.open(encoding="utf-8-sig") as config:
-            for line in config:
-                value = line.strip().replace("\\", "/").casefold()
-                if value and not value.startswith("#"):
-                    pattern = value.strip("/")
-                    if pattern:
-                        patterns.append((pattern, value.endswith("/"), "/" in pattern or value.startswith("/")))
+            lines.extend(config)
     except FileNotFoundError:
         pass
     except (OSError, UnicodeError):
         runtime_logger.warning("Unable to read .mailsearchignore")
+    patterns = []
+    for line in lines:
+        value = line.strip().replace("\\", "/").casefold()
+        pattern = value.strip("/")
+        if pattern and not value.startswith("#"):
+            patterns.append((pattern, value.endswith("/"), "/" in pattern or value.startswith("/")))
 
     def ignored(relative, directory):
         name = relative.name.casefold()
@@ -91,6 +97,14 @@ def folder_files(root, suffixes, *, numbered=False, log_skipped=False):
     skipped = 0
     for current, dirs, files in os.walk(root):
         parent = Path(current)
+        if parent != root and not numbered:
+            endings = [os.path.splitext(name)[1].casefold() for name in files]
+            if not MAIL_SUFFIXES.intersection(endings) and sum(ext in SOFTWARE_SUFFIXES for ext in endings) >= 2:
+                dirs.clear()
+                if log_skipped:
+                    # Escape newlines and terminal control characters in folder names.
+                    runtime_logger.info("Skipped software directory: %r", parent.relative_to(root).as_posix())
+                continue
         dirs[:] = sorted(name for name in dirs
                          if not ignored((parent / name).relative_to(root), True)
                          and not (parent / name).is_symlink() and not (parent / name).is_junction())
@@ -111,6 +125,11 @@ def folder_files(root, suffixes, *, numbered=False, log_skipped=False):
             yield path
     if log_skipped and skipped:
         runtime_logger.info("Folder scan skipped %d unsupported files", skipped)
+
+
+def log_index_progress(source, stage, done, total):
+    runtime_logger.info("[색인] %s %s/%s건 (source=%d)", stage, format(done, ","),
+                        format(total, ","), source)
 
 
 def folder_identity(signature):
@@ -178,6 +197,7 @@ class Indexer:
             """)
         self.spool = store.root / "work"
         self.spool.mkdir(mode=0o700, exist_ok=True)
+        self.ignore_file = store.root / "source-ignores.json"
 
     def register(self, path, *, outlook=False):
         if outlook:
@@ -241,6 +261,65 @@ class Indexer:
                 self.store.reload_memory(source)
             self.wake()
         return source
+
+    def source_ignores(self):
+        try:
+            settings = json.loads(self.ignore_file.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return {}
+        except (OSError, ValueError) as exc:
+            raise ImportIssue("source_ignore_settings") from exc
+        if not isinstance(settings, dict) or any(
+            not isinstance(values, list) or any(not isinstance(item, str) for item in values)
+            for values in settings.values()
+        ):
+            raise ImportIssue("source_ignore_settings")
+        return settings
+
+    def ignore_folder(self, source, pattern):
+        if not isinstance(pattern, str) or not pattern.endswith("/") or len(pattern) > 256:
+            raise ValueError("ignore_pattern")
+        name = pattern[:-1]
+        if (not name or name in {".", ".."} or name.endswith((" ", ".")) or
+                any(ord(char) < 32 or char in '/\\:*?"<>|' for char in name)):
+            raise ValueError("ignore_pattern")
+        rule = "/" + escape(name) + "/"
+        with self.lock:
+            row = self.store.source(source)
+            if row is None or row["state"] == "removing":
+                raise ImportIssue("source_missing")
+            if row["kind"] != "eml_dir":
+                raise ImportIssue("source_ignore_kind")
+            if source in self.events or row["state"] in {"queued", "extracting", "headers", "attachments", "embeddings"}:
+                raise ImportIssue("source_busy")
+            if row["state"] == "remove_failed":
+                raise ImportIssue("source_action")
+            root = Path(row["path"])
+            folder = root / name
+            if not folder.is_dir() or folder.is_symlink() or folder.is_junction():
+                raise ImportIssue("source_ignore_folder")
+            try:
+                target = root / ".mailsearchignore"
+                if (root.resolve(strict=True) != root or target.is_symlink() or not root.stat().st_mode & 0o222
+                        or target.exists() and not target.stat().st_mode & 0o222):
+                    raise PermissionError
+                try:
+                    original = target.read_bytes()
+                except FileNotFoundError:
+                    original = b""
+                if rule.casefold() not in {line.strip().casefold() for line in original.decode("utf-8-sig").splitlines()}:
+                    separator = b"" if not original or original.endswith(b"\n") else b"\n"
+                    atomic_write(target, original + separator + (rule + "\n").encode())
+            except (OSError, UnicodeError):
+                settings = self.source_ignores()
+                current = settings.setdefault(str(source), [])
+                if rule.casefold() not in {item.casefold() for item in current}:
+                    current.append(rule)
+                    try:
+                        atomic_write(self.ignore_file, json.dumps(settings, ensure_ascii=False).encode())
+                    except OSError as exc:
+                        raise ImportIssue("source_ignore_settings") from exc
+            self.command(source, "refresh")
 
     def command(self, source, action):
         with self.lock:
@@ -480,7 +559,7 @@ class Indexer:
             return {**{key: read[key] for key in ("item", "position", "total", "files")},
                     "elapsed": int(age - read["started"]), "idle": int(age - read["last_output"])}
 
-    def import_folder_psts(self, folder, stage, event, known, source, already_deferred, outdated):
+    def import_folder_psts(self, folder, stage, event, known, source, already_deferred, outdated, *, ignore_patterns=()):
         """Also import PST files kept inside a registered mail folder.
 
         PSTs whose signature matches the last committed import are carried over
@@ -491,8 +570,9 @@ class Indexer:
         extras, carried = [], []
         skipped = {}
         signatures = {}
-        deferred = dict(already_deferred)
-        files = sorted(folder_files(folder, {".pst"}))
+        files = sorted(folder_files(folder, {".pst"}, extra_patterns=ignore_patterns))
+        current_items = {path.relative_to(folder).as_posix() for path in files} if already_deferred else ()
+        deferred = {item: code for item, code in already_deferred.items() if item in current_items}
         for position, pst in enumerate(files, 1):
             self.check(event)
             item = pst.relative_to(folder).as_posix()
@@ -501,6 +581,8 @@ class Indexer:
             slot = stage / ("pst-" + hashlib.sha1(label.encode("utf-8")).hexdigest()[:16])
             checkpoint = slot / "pst-signature"
             if item in deferred:
+                runtime_logger.warning("PST deferred (source=%d, archive=%d/%d, reason=%s)",
+                                       source, position, len(files), deferred[item])
                 if label in known:
                     carried.append(label)
                     signatures[label] = known[label]
@@ -533,6 +615,8 @@ class Indexer:
                 if not pst_access_error(exc):
                     raise
                 deferred[item] = pst_access_issue(exc)
+                runtime_logger.warning("PST deferred (source=%d, archive=%d/%d, reason=%s)",
+                                       source, position, len(files), deferred[item])
                 if label in known:
                     carried.append(label)
                     signatures[label] = known[label]
@@ -555,6 +639,8 @@ class Indexer:
                 if not pst_access_error(exc):
                     raise
                 deferred[item] = pst_access_issue(exc)
+                runtime_logger.warning("PST deferred (source=%d, archive=%d/%d, reason=%s)",
+                                       source, position, len(files), deferred[item])
                 if label in known:
                     carried.append(label)
                     signatures[label] = known[label]
@@ -589,9 +675,13 @@ class Indexer:
         completed = stage / "cached-export"
         if cached.is_dir() and (not progress or completed.is_file()):
             return cached
+        if progress and source is not None:
+            runtime_logger.info("PST extraction started (source=%d)", source)
         output = self.export(path, stage, event, source if progress else None)
         if read_signature(path) != signature:
             raise ImportIssue("changed")
+        if progress and source is not None:
+            runtime_logger.info("PST extraction completed (source=%d)", source)
         if output != stage / "eml" or not (stage / "export-complete").is_file():
             return output
         with self.lock:
@@ -746,6 +836,8 @@ class Indexer:
                             read = self.pst_reads[source]
                             if count > read["files"]:
                                 read.update(files=count, last_output=sampled)
+                        runtime_logger.info("PST extraction progress (source=%d, exported=%s)",
+                                            source, format(count, ","))
                         next_sample = sampled + max(PST_PROGRESS_INTERVAL, (sampled - started) * 10)
             finally:
                 if process.poll() is None:
@@ -766,11 +858,12 @@ class Indexer:
         return output
 
     @staticmethod
-    def entries(root, *, numbered=False):
+    def entries(root, *, numbered=False, ignore_patterns=()):
         if root.is_file():
             yield root, root.name, "/"
             return
-        for path in folder_files(root, DOCUMENT_SUFFIXES | {".eml"}, numbered=numbered, log_skipped=not numbered):
+        for path in folder_files(root, DOCUMENT_SUFFIXES | {".eml"}, numbered=numbered,
+                                 log_skipped=not numbered, extra_patterns=ignore_patterns):
             relative = path.relative_to(root)
             yield path, relative.as_posix(), "/" + ("" if relative.parent == Path(".") else relative.parent.as_posix())
 
@@ -810,6 +903,7 @@ class Indexer:
         self.check(event)
         is_pst = row["kind"] == "pst"
         extras, carried, signatures, deferred = (), (), None, ()
+        ignore_patterns = ()
         if is_pst:
             self.start_pst_read(source, path.name, 1, 1)
             try:
@@ -834,6 +928,7 @@ class Indexer:
         else:
             root = path
             if path.is_dir():
+                ignore_patterns = self.source_ignores().get(str(source), ())
                 already_deferred = {}
                 if row["done"]:
                     with self.store.connection() as conn:
@@ -844,7 +939,7 @@ class Indexer:
                 known = self.store.pst_files(source)
                 outdated = self.store.outdated_pst_labels(source, previous, known)
                 extras, carried, skipped_psts, signatures, deferred = self.import_folder_psts(
-                    path, stage, event, known, source, already_deferred, outdated)
+                    path, stage, event, known, source, already_deferred, outdated, ignore_patterns=ignore_patterns)
                 with self.store.connection() as conn:
                     conn.execute("""DELETE FROM problems WHERE source=? AND version=?
                                     AND code IN ('pst_in_use','pst_access_denied','pst_changed','pst_no_mail','pst_export','pst_invalid')""",
@@ -855,7 +950,7 @@ class Indexer:
         self.check(event)
         self.state(source, "headers")
         self.index_headers(root, source, version, event, numbered=is_pst, extras=extras,
-                           previous=previous, carried=carried, temp=temp)
+                           previous=previous, carried=carried, temp=temp, ignore_patterns=ignore_patterns)
         self.check(event)
         progress = self.store.source(source)
         if not progress["done"] and deferred and not progress["failed"]:
@@ -1014,6 +1109,8 @@ class Indexer:
                                 failed=0,omitted=0,partial=0 WHERE id=? AND pending=?""",
                              (signature, done, done, len(folders), source, version))
             remaining = (entry for entry in folders if entry not in retained and entry not in pending_ids)
+            log_index_progress(source, "Outlook 메일·첨부", done, len(folders))
+            next_log = time.monotonic() + PST_PROGRESS_INTERVAL
             batch = []
             with self.store.connection() as conn:
                 for entry_id in remaining:
@@ -1028,11 +1125,16 @@ class Indexer:
                         conn.execute("UPDATE sources SET done=?,index_done=? WHERE id=? AND pending=?",
                                      (done, done, source, version))
                         conn.commit()
+                        if time.monotonic() >= next_log:
+                            log_index_progress(source, "Outlook 메일·첨부", done, len(folders))
+                            next_log = time.monotonic() + PST_PROGRESS_INTERVAL
                         if previous is None:
                             self.store.append_pending_memory(source, batch)
                         batch.clear()
                 conn.execute("UPDATE sources SET done=?,index_done=? WHERE id=? AND pending=?",
                              (done, done, source, version))
+            if done:
+                log_index_progress(source, "Outlook 메일·첨부", done, len(folders))
             if previous is None:
                 self.store.append_pending_memory(source, batch)
 
@@ -1100,7 +1202,9 @@ class Indexer:
         outdated = self.store.outdated_pst_labels(row["id"], row["active"], known)
         changed = []
         try:
-            files = sorted(folder_files(path, {".pst"}))
+            files = sorted(folder_files(path, {".pst"}, extra_patterns=self.source_ignores().get(str(row["id"]), ())))
+        except ImportIssue:
+            return []
         except OSError:
             return []
         for pst in files:
@@ -1115,8 +1219,8 @@ class Indexer:
                     changed.append(item)
         return changed
 
-    def scan_entries(self, root, *, numbered, extras=()):
-        yield from self.entries(root, numbered=numbered)
+    def scan_entries(self, root, *, numbered, extras=(), ignore_patterns=()):
+        yield from self.entries(root, numbered=numbered, ignore_patterns=ignore_patterns)
         for output, prefix in extras:
             for path, item, folder in self.entries(output, numbered=True):
                 yield path, prefix + item, "/" + prefix.rstrip("/") + folder
@@ -1130,7 +1234,8 @@ class Indexer:
                 return output / item[len(prefix):]
         return root / item
 
-    def index_headers(self, root, source, version, event, *, numbered=False, extras=(), previous=None, carried=(), temp=None):
+    def index_headers(self, root, source, version, event, *, numbered=False, extras=(), previous=None,
+                      carried=(), temp=None, ignore_patterns=()):
         with self.store.connection() as conn:
             for prefix in carried:
                 self.check(event)
@@ -1144,11 +1249,13 @@ class Indexer:
                 return
             old_mails = self.store.mail_identities(conn, source, previous)
             entries = []
-            for entry in self.scan_entries(root, numbered=numbered, extras=extras):
+            for entry in self.scan_entries(root, numbered=numbered, extras=extras, ignore_patterns=ignore_patterns):
                 self.check(event)
                 entries.append(entry)
             conn.execute("UPDATE sources SET index_done=0,index_total=? WHERE id=? AND pending=?", (len(entries), source, version))
             conn.commit()
+            log_index_progress(source, "메일·문서", 0, len(entries))
+            next_log = time.monotonic() + PST_PROGRESS_INTERVAL
             done = 0
             batch = []
             for done, (path, item, folder) in enumerate(entries, 1):
@@ -1156,6 +1263,9 @@ class Indexer:
                 if done > 1 and (done - 1) % 32 == 0:
                     conn.execute("UPDATE sources SET index_done=? WHERE id=? AND pending=?", (done - 1, source, version))
                     conn.commit()
+                    if time.monotonic() >= next_log:
+                        log_index_progress(source, "메일·문서", done - 1, len(entries))
+                        next_log = time.monotonic() + PST_PROGRESS_INTERVAL
                     if previous is None:
                         self.store.append_pending_memory(source, batch)
                         batch.clear()
@@ -1215,6 +1325,8 @@ class Indexer:
                         batch.append(mail_id)
                     conn.execute("UPDATE sources SET done=done+1 WHERE id=?", (source,))
             conn.execute("UPDATE sources SET index_done=?,index_total=? WHERE id=? AND pending=?", (done, done, source, version))
+        if done:
+            log_index_progress(source, "메일·문서", done, len(entries))
         if previous is None:
             self.store.append_pending_memory(source, batch)
 
@@ -1232,6 +1344,8 @@ class Indexer:
             ).fetchone()
             conn.execute("UPDATE sources SET index_done=?,index_total=? WHERE id=? AND pending=?", (done, total, source, version))
             conn.commit()
+            log_index_progress(source, "첨부", done, total)
+            next_log = time.monotonic() + PST_PROGRESS_INTERVAL
 
             def load_extract(key, extract):
                 if key in new_extracts:
@@ -1246,7 +1360,7 @@ class Indexer:
                 return status, locations, None
 
             def save_extracted():
-                nonlocal done
+                nonlocal done, next_log
                 with conn:
                     conn.executemany(
                         "INSERT OR IGNORE INTO attachment_extracts VALUES(?,?)",
@@ -1266,6 +1380,9 @@ class Indexer:
                     conn.execute("UPDATE sources SET index_done=? WHERE id=? AND pending=?", (done, source, version))
                 extracted.clear()
                 new_extracts.clear()
+                if done == total or time.monotonic() >= next_log:
+                    log_index_progress(source, "첨부", done, total)
+                    next_log = time.monotonic() + PST_PROGRESS_INTERVAL
 
             while True:
                 self.check(event)
@@ -1357,6 +1474,7 @@ class Indexer:
         model, legacy_model = contextual_model_keys(backend_key)
         provider = self.ai.embedding_api
         gateway = isinstance(provider, EmbeddingAPI) and bool(provider.index_key)
+        backend = "gateway" if gateway else "Ollama"
         batch_size = self.embedding_batch_size or (GATEWAY_EMBEDDING_BATCH_SIZE if gateway else EMBEDDING_BATCH_SIZE)
         timeout = self.embedding_batch_timeout
         scope = "(m.version=? OR m.id IN (SELECT id FROM outlook_retained))" if retain else "m.version=?"
@@ -1421,16 +1539,16 @@ class Indexer:
                 shared.update(zip(inputs, encoded))
             except (OSError, ValueError, RuntimeError, KeyError, TypeError, http.client.HTTPException) as exc:
                 winerror = getattr(exc, "winerror", None)
-                backend = "gateway" if gateway else "Ollama"
+                reason = f"HTTP {exc.status}" if isinstance(exc, GatewayRequestError) else type(exc).__name__
                 retryable = isinstance(exc, TimeoutError) or (
                     isinstance(exc, GatewayRequestError) and exc.status in {408, 413, 504})
                 if retryable and len(inputs) > 1:
                     batch_size = max(1, len(inputs) // 2)
                     logger.warning("Embedding batch retry (backend=%s, completed=%d/%d, timeout=%ds, next_batch=%d): %s",
-                                   backend, done, total, timeout, batch_size, type(exc).__name__)
+                                   backend, done, total, timeout, batch_size, reason)
                     continue
                 logger.error("Embedding batch failed (backend=%s, completed=%d/%d): %s (errno=%s, winerror=%s)",
-                             backend, done, total, type(exc).__name__, getattr(exc, "errno", None), winerror)
+                             backend, done, total, reason, getattr(exc, "errno", None), winerror)
                 if isinstance(exc, ConnectionAbortedError) or winerror == 10053:
                     return "embedding_connection_aborted"
                 return "embedding_unavailable"
@@ -1452,4 +1570,6 @@ class Indexer:
                 done += len(rows)
                 conn.execute("UPDATE sources SET embedding_done=? WHERE id=? AND pending=?",
                              (done, source, version))
+            runtime_logger.info("[임베딩] %.1f%% (%s/%s구간) · 배치 %d · 백엔드=%s (source=%d)",
+                                100 * done / total, format(done, ","), format(total, ","), batch_size, backend, source)
             last = rows[-1]["id"]
