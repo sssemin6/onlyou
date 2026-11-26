@@ -11,8 +11,9 @@ import sqlite3
 import subprocess
 import threading
 import time
-from collections import Counter, OrderedDict
-from concurrent.futures import Future
+import unicodedata
+from collections import Counter, OrderedDict, deque
+from concurrent.futures import Future, wait
 from contextlib import contextmanager
 from pathlib import Path
 from dataclasses import dataclass
@@ -238,7 +239,19 @@ def parse_evidence_gap(raw, question):
     return EvidenceGap(aspects, plan.sub_queries)
 
 
-def bounded_task(slot, timeout, task, name):
+def wait_for_search(future, check=None, *, deadline=None):
+    while check:
+        check()
+        remaining = .05 if deadline is None else min(.05, deadline - time.monotonic())
+        if remaining <= 0:
+            return future.result(timeout=0)
+        if wait((future,), timeout=remaining).done:
+            check()
+            break
+    return future.result(timeout=None if deadline is None else max(0, deadline - time.monotonic()))
+
+
+def bounded_task(slot, timeout, task, name, *, check=None):
     if timeout <= 0 or not slot.acquire(blocking=False):
         return None
     result = Future()
@@ -246,13 +259,19 @@ def bounded_task(slot, timeout, task, name):
 
     def run():
         value = None
+        error = None
         try:
             value = task(deadline)
         except (*MODEL_ERRORS, sqlite3.Error):
             pass
+        except Exception as exc:
+            error = exc
         finally:
             slot.release()
-            result.set_result(value)
+            if error is None:
+                result.set_result(value)
+            else:
+                result.set_exception(error)
 
     worker = threading.Thread(target=run, name=name, daemon=True)
     try:
@@ -261,9 +280,58 @@ def bounded_task(slot, timeout, task, name):
         slot.release()
         return None
     try:
-        return result.result(timeout=max(0, deadline - time.monotonic()))
+        return wait_for_search(result, check, deadline=deadline)
     except TimeoutError:
         return None
+
+
+class QueryCache:
+    """Bounded TTL LRU with one in-flight computation per key, including batched misses."""
+    def __init__(self, maxsize=256, ttl=900):
+        self.maxsize = maxsize
+        self.ttl = ttl
+        self.entries = OrderedDict()
+        self.pending = {}
+        self.lock = threading.Lock()
+
+    def load(self, keys, fetch, timeout):
+        deadline = time.monotonic() + timeout
+        owned, waiting, values = {}, {}, {}
+        with self.lock:
+            now = time.monotonic()
+            for key in dict.fromkeys(keys):
+                cached = self.entries.get(key)
+                if cached and cached[0] > now:
+                    self.entries.move_to_end(key)
+                    values[key] = cached[1]
+                    continue
+                self.entries.pop(key, None)
+                future = self.pending.get(key)
+                if future is None:
+                    future = self.pending[key] = owned[key] = Future()
+                waiting[key] = future
+        if owned:
+            try:
+                fetched = dict(zip(owned, fetch(owned), strict=True))
+            except BaseException as exc:
+                with self.lock:
+                    for key, future in owned.items():
+                        del self.pending[key]
+                        future.set_exception(exc)
+                raise
+            with self.lock:
+                expires = time.monotonic() + self.ttl
+                for key, future in owned.items():
+                    value = fetched[key]
+                    if value is not None:
+                        self.entries[key] = expires, value
+                    del self.pending[key]
+                    future.set_result(value)
+                while len(self.entries) > self.maxsize:
+                    self.entries.popitem(last=False)
+        for key, future in waiting.items():
+            values[key] = future.result(timeout=max(0, deadline - time.monotonic()))
+        return values
 
 
 class LocalAI:
@@ -279,8 +347,8 @@ class LocalAI:
             raise ValueError("Answer context must be between 2048 and 32768.")
         self.answer_num_ctx = answer_num_ctx
         self.model_context_limit = None
-        self.query_cache = OrderedDict()
         self.query_cache_lock = threading.Lock()
+        self.config_version = 0
         rewrite_model = os.environ.get("MAILSEARCH_QUERY_REWRITE_MODEL", "").strip()
         self.rewrite_model = rewrite_model if (MODEL_NAME.fullmatch(rewrite_model)
                                                 and "cloud" not in rewrite_model.casefold()
@@ -296,7 +364,9 @@ class LocalAI:
     def configure_embedding(self, local_model, provider):
         with self.query_cache_lock:
             self.embedding_config = local_model, provider
-            self.query_cache.clear()
+            self.config_version += 1
+            self.query_cache = QueryCache()
+            self.rewrite_cache = QueryCache()
 
     @property
     def embedding_model(self):
@@ -447,35 +517,26 @@ class LocalAI:
     def prefetch_query_embeddings(self, store, queries, *, timeout=QUERY_EMBEDDING_TIMEOUT):
         """Warm the query cache in one request and return this search's vectors."""
         with self.query_cache_lock:
-            configuration = self.embedding_config
             index, embed = self.embedding_backend()
-            if not index:
-                return "", {}
-            vectors = {}
-            missing = []
-            for query in dict.fromkeys(queries):
-                if query in self.query_cache:
-                    vectors[query] = self.query_cache[query]
-                    self.query_cache.move_to_end(query)
-                else:
-                    missing.append(query)
-        if missing:
+            cache = self.query_cache
+        if not index:
+            return "", {}
+        keys = {query: (index, normalized(compact_space(query))) for query in queries}
+        original = {}
+        for query, key in keys.items():
+            original.setdefault(key, query)
+
+        def fetch(missing):
             with store.measure("embed"):
-                batch = embed(missing, timeout)
+                batch = embed([original[key] for key in missing], timeout)
                 if len(batch) != len(missing):
                     raise ValueError("embedding_response")
                 for vector in batch:
                     pack_vector(vector)
-            entries = dict(zip(missing, batch, strict=True))
-            vectors.update(entries)
-            with self.query_cache_lock:
-                if self.embedding_config is configuration:
-                    for query, vector in entries.items():
-                        self.query_cache[query] = vector
-                        self.query_cache.move_to_end(query)
-                    while len(self.query_cache) > 128:
-                        self.query_cache.popitem(last=False)
-        return index, vectors
+            return batch
+
+        vectors = cache.load(original, fetch, timeout)
+        return index, {query: vectors[key] for query, key in keys.items()}
 
     def semantic_search(self, store, query, filters, *, limit=40, min_similarity=.28, prefetched=None):
         index, vectors = self.prefetch_query_embeddings(store, (query,)) if prefetched is None else prefetched
@@ -542,10 +603,28 @@ class LocalAI:
     def rewrite_query(self, question):
         if not self.retrieval_model_available:
             return None
-        prompt = json.dumps({"question": question, "today": datetime.date.today().isoformat()}, ensure_ascii=False)
-        raw = self.retrieval_completion(REWRITE_INSTRUCTIONS, prompt, "rewrite_query",
-                                        token_limit=QUERY_REWRITE_TOKEN_LIMIT, timeout=QUERY_REWRITE_TIMEOUT)
-        return parse_rewrite(raw, question)
+        today = datetime.date.today().isoformat()
+        with self.query_cache_lock:
+            local_model, gateway = self.rewrite_model, self.embedding_api
+            origin = f"ollama://127.0.0.1:{self.port}" if local_model else getattr(gateway, "origin", "")
+            model = local_model or getattr(gateway, "rewrite_model", "")
+            # Case and spaces within exact phrases are significant to the rewrite prompt.
+            key = (origin, model, self.config_version, today, unicodedata.normalize("NFC", question.strip()))
+            cache = self.rewrite_cache
+        if not model:
+            return None
+
+        def fetch(_keys):
+            prompt = json.dumps({"question": question, "today": today}, ensure_ascii=False)
+            raw = self.retrieval_completion(REWRITE_INSTRUCTIONS, prompt, "rewrite_query",
+                                            token_limit=QUERY_REWRITE_TOKEN_LIMIT, timeout=QUERY_REWRITE_TIMEOUT,
+                                            backend=(local_model, gateway))
+            return [parse_rewrite(raw, question)]
+
+        try:
+            return cache.load((key,), fetch, QUERY_REWRITE_TIMEOUT)[key]
+        except TimeoutError:
+            return None
 
     def diagnose_evidence_gap(self, question, evidence, *, timeout=2.5, allow_intranet_evidence=True):
         if not self.retrieval_model_available:
@@ -795,6 +874,31 @@ class AnswerSessions:
     def __init__(self):
         self.items = OrderedDict()
         self.lock = threading.Lock()
+        self.turns_ready = threading.Condition()
+        self.waiting = {}
+
+    @contextmanager
+    def serialize(self, key, check):
+        if not key:
+            yield
+            return
+        ticket = object()
+        with self.turns_ready:
+            queue = self.waiting.setdefault(key, deque())
+            queue.append(ticket)
+        try:
+            with self.turns_ready:
+                while queue[0] is not ticket:
+                    check()
+                    self.turns_ready.wait(.05)
+            check()
+            yield
+        finally:
+            with self.turns_ready:
+                queue.remove(ticket)
+                if not queue:
+                    del self.waiting[key]
+                self.turns_ready.notify_all()
 
     def expire(self, now):
         while self.items and next(iter(self.items.values()))[0] <= now:
@@ -1055,19 +1159,81 @@ def pcf_retrieval(store, ai, question, filters, context):
     return list(expanded.values())[:14], mode
 
 
-def rewritten_evidence(store, ai, question, filters, context, **options):
-    with store.measure("rewrite"):
-        plan = ai.rewrite_query(question)
-    if not plan:
+def rewritten_evidence(store, ai, question, filters, context, *, workers=None, original_query=None,
+                       cancel=None, **options):
+    def rewrite():
+        with store.measure("rewrite"):
+            return ai.rewrite_query(question)
+
+    if workers is None or not ai.retrieval_model_available:
+        plan = rewrite()
+        if plan:
+            scoped = rewritten_scope(filters, plan.filters)
+            for scope in (scoped, filters) if scoped != filters else (filters,):
+                evidence, mode = evidence_for(store, ai, question, scope, context, sub_queries=plan.sub_queries,
+                                              keywords=plan.keywords, **options)
+                if evidence:
+                    return evidence, mode, scope, len(plan.sub_queries)
         return None
-    scoped = rewritten_scope(filters, plan.filters)
-    scopes = (scoped, filters) if scoped != filters else (filters,)
-    for scope in scopes:
-        evidence, mode = evidence_for(store, ai, question, scope, context, sub_queries=plan.sub_queries,
-                                      keywords=plan.keywords, **options)
-        if evidence:
-            return evidence, mode, scope, len(plan.sub_queries)
-    return None
+
+    profile = store.search_profile
+    check = options.get("check")
+    original = question if original_query is None else original_query
+    full_query = f"{original} {context}".strip()
+    lexical_query = f"{full_query} {options.get('local_context', '')}".strip()
+
+    def checkpoint():
+        if cancel is not None:
+            cancel()
+
+    def run(task):
+        checkpoint()
+        with store.search_session(profile):
+            result = task()
+        checkpoint()
+        return result
+
+    def warm_embedding():
+        try:
+            ai.prefetch_query_embeddings(store, (full_query,))
+        except MODEL_ERRORS:
+            return False
+        return True
+
+    futures = []
+    try:
+        if check:
+            check()
+        plan_future = workers.submit(run, rewrite)
+        futures.append(plan_future)
+        lexical_future = workers.submit(run, lambda: lexical_candidates(store, lexical_query, filters))
+        futures.append(lexical_future)
+        embedding_future = None
+        if ai.embedding_index and options.get("semantic", True) and full_query:
+            embedding_future = workers.submit(run, warm_embedding)
+            futures.append(embedding_future)
+        plan = wait_for_search(plan_future, check)
+        scoped = rewritten_scope(filters, plan.filters) if plan else filters
+        # A narrowed scope needs its own FTS top-K, not just the surviving broad hits.
+        warm = None
+        if scoped == filters:
+            warm = (full_query, filters, wait_for_search(lexical_future, check))
+        else:
+            lexical_future.cancel()
+        embedding_failed = embedding_future is not None and not wait_for_search(embedding_future, check)
+        queries = (original, *(plan.sub_queries if plan else ()))
+        distinct = {}
+        for query in queries:
+            distinct.setdefault(normalized(compact_space(query)), query)
+        evidence, mode = evidence_for(
+            store, ai, question, scoped, context, sub_queries=tuple(distinct.values()),
+            keywords=plan.keywords if plan else (), warm_lexical=warm,
+            embedding_failed=embedding_failed, **options,
+        )
+        return evidence, mode, scoped, len(plan.sub_queries) if plan else 1
+    finally:
+        for future in futures:
+            future.cancel()
 
 
 def overlaps_evidence_window(row, window):
@@ -1081,18 +1247,27 @@ def overlaps_evidence_window(row, window):
                             == window["text"][start - window["start"]:end - window["start"]])
 
 
+def lexical_candidates(store, query, filters, required=()):
+    with store.measure("fts"):
+        if required:
+            hits = store.lexical(query, filters, fuzzy=True, required=required)
+            if hits:
+                return hits
+        return store.lexical(query, filters, fuzzy=True)
+
+
 def evidence_for(store, ai, question, filters, context, semantic=True, limit=9, expand=False, *, thread_hops=1,
                  max_evidence=None, local_context="", sub_queries=(), keywords=(), check=None, intent=None,
-                 allow_rerank=True, embedding_timeout=None):
+                 allow_rerank=True, embedding_timeout=None, warm_lexical=None, embedding_failed=False, on_rerank=None):
     search_text = f"{question} {context}".strip()
     rerank = allow_rerank and semantic and search_text and ai.rerank_enabled
     candidate_limit = max(RAG_CANDIDATE_LIMIT if rerank else 40, limit)
     pools = []
-    mode = "keyword"
+    mode = "keyword_only" if embedding_failed else "keyword"
     questions = sub_queries or (question,)
     queries = [f"{sub_query} {context}".strip() for sub_query in questions]
     semantic_options = {"limit": RAG_CANDIDATE_LIMIT, "min_similarity": RAG_MIN_SIMILARITY}
-    use_semantic = semantic and bool(ai.embedding_index)
+    use_semantic = semantic and bool(ai.embedding_index) and not embedding_failed
     if use_semantic and (len(queries) > 1 or embedding_timeout is not None):
         if check:
             check()
@@ -1110,15 +1285,14 @@ def evidence_for(store, ai, question, filters, context, semantic=True, limit=9, 
         if len(sub_queries) > 1:
             query_terms = set(query_words(sub_query, fuzzy=True))
             required = [keyword for keyword in keywords if query_terms.intersection(query_words(keyword, fuzzy=True))]
-        with store.measure("fts"):
-            if required:
-                lexical = store.lexical(lexical_query, filters, fuzzy=True, required=required)
-                if not lexical:
-                    lexical = store.lexical(lexical_query, filters, fuzzy=True)
-            else:
-                lexical = store.lexical(lexical_query, filters, fuzzy=True)
+        if warm_lexical is not None and (query, filters) == warm_lexical[:2]:
+            lexical = warm_lexical[2]
+        else:
+            lexical = lexical_candidates(store, lexical_query, filters, required)
         pools.append((lexical, 1.2))
         if use_semantic and query:
+            if check:
+                check()
             try:
                 semantic_rows = ai.semantic_search(store, query, filters, **semantic_options)
                 if semantic_rows:
@@ -1131,9 +1305,15 @@ def evidence_for(store, ai, question, filters, context, semantic=True, limit=9, 
     recent = needs_recency_boost(intent, filters)
     ranked = reciprocal_rank(pools, None, recent=recent)
     seeds = dedupe_by_content(ranked)[:candidate_limit]
+    if check:
+        check()
+    if on_rerank:
+        on_rerank(len(seeds), rerank and len(seeds) > 1)
     if rerank and len(seeds) > 1:
         with store.measure("rerank"):
             seeds = ai.rerank_candidates(search_text, seeds, limit=candidate_limit, text_limit=1100)
+    if check:
+        check()
     seeds = prioritize_attachments(seeds, filters)
     chosen = []
     counts = {}
@@ -1175,7 +1355,7 @@ def evidence_for(store, ai, question, filters, context, semantic=True, limit=9, 
 
 def supplemental_evidence(store, ai, question, filters, context, evidence, mode, query_count, *,
                           ceiling=ANSWER_EVIDENCE_LIMIT, expand=True, check=None, review_slots=None,
-                          allow_intranet_evidence=True):
+                          allow_intranet_evidence=True, worker_check=None, allow_rerank=True):
     """Run at most one supplemental retrieval under the current scope and budget."""
     unchanged = evidence, mode, (), False
     complex_question = bool(query_count > 1 or SYNTHESIS_QUESTION.search(question) or COMPARISON_QUESTION.search(question))
@@ -1205,15 +1385,19 @@ def supplemental_evidence(store, ai, question, filters, context, evidence, mode,
 
     def search(stop):
         def time_check():
+            if worker_check:
+                worker_check()
             if time.monotonic() >= stop:
                 raise TimeoutError("supplemental_search")
 
+        time_check()
         with store.search_session(profile):
             windows = {row["passage"] for row in evidence if row.get("window")}
             visible = store.passages([row["passage"] for row in evidence[:8]], filters, windows=windows)
             remaining = stop - time.monotonic()
             if remaining < .25:
                 return None
+            time_check()
             gap = ai.diagnose_evidence_gap(question, visible, timeout=min(2.5, remaining), **gap_options)
             if not gap:
                 return None
@@ -1233,7 +1417,7 @@ def supplemental_evidence(store, ai, question, filters, context, evidence, mode,
     with store.measure("followup"):
         if check:
             check()
-        extra = bounded_task(ai.followup_slot, remaining, search, "supplemental-search")
+        extra = bounded_task(ai.followup_slot, remaining, search, "supplemental-search", check=check)
         if check:
             check()
     if extra is None:
@@ -1251,7 +1435,7 @@ def supplemental_evidence(store, ai, question, filters, context, evidence, mode,
         leading = min(leading, max(0, review_slots - min(2, len(new))))
     merged = [*primary[:leading], *new[:4], *primary[leading:], *new[4:]]
     remaining = deadline - time.monotonic()
-    if trusted and new and ai.rerank_enabled and remaining >= 2:
+    if allow_rerank and trusted and new and ai.rerank_enabled and remaining >= 2:
         def rerank(stop):
             with store.search_session(profile):
                 candidates = merged[:32]
