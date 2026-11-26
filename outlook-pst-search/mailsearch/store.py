@@ -1731,6 +1731,44 @@ class Store:
                 (json.dumps(sorted(mails)),),
             ).fetchall()
 
+    def evidence_attachment_names(self, mails):
+        names = defaultdict(list)
+        with self.connection() as conn:
+            for mail in mails:
+                names[mail] = [row[0][:160] for row in conn.execute(
+                    """SELECT DISTINCT a.name FROM attachments a WHERE a.mail=? AND EXISTS
+                       (SELECT 1 FROM passages p WHERE p.attachment=a.id AND p.location<>'파일명')
+                       ORDER BY a.name LIMIT 6""", (mail,),
+                )]
+        return names
+
+    def attachment_evidence(self, mails, filenames, filters, question):
+        """Find indexed attachment text only on the supplied, currently scoped mails."""
+        if not mails or not filenames:
+            return []
+        where, params = self.scope(filters)
+        terms = query_words(question, fuzzy=True)[:8]
+        score = " + ".join("(instr(lower(p.text), lower(?)) > 0)" for _ in terms)
+        order = f"({score}) DESC, p.start, p.id" if terms else "p.start, p.id"
+        found = []
+        with self.connection() as conn:
+            for name in filenames[:2]:
+                attachments = conn.execute(
+                    f"""SELECT a.id FROM json_each(?) ids CROSS JOIN mails m ON m.id=ids.value
+                        CROSS JOIN sources s ON s.id=m.source CROSS JOIN attachments a ON a.mail=m.id
+                        WHERE {where} AND instr(lower(a.name), lower(?)) > 0
+                        AND EXISTS (SELECT 1 FROM passages p WHERE p.attachment=a.id AND p.location<>'파일명')
+                        ORDER BY ids.key, length(a.name), a.id LIMIT 1""", (json.dumps(mails), *params, name),
+                ).fetchall()
+                for attachment in attachments:
+                    found.extend(row[0] for row in conn.execute(
+                        f"""SELECT p.id FROM passages p WHERE p.attachment=? AND p.location<>'파일명'
+                            ORDER BY {order} LIMIT 3""", (attachment["id"], *terms),
+                    ))
+            ids = list(dict.fromkeys(found))
+            visible = {row["passage"]: row for row in self.passages(ids, filters, conn)}
+        return [visible[pid] for pid in ids if pid in visible]
+
     def related(self, seeds, filters, *, hops=1, question=""):
         if not seeds:
             return []
