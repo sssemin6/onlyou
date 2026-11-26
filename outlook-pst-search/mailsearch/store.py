@@ -23,6 +23,18 @@ from pathlib import Path
 
 from .pcf import COMMENT_HEADER, PCF_CELL, PCF_FIELDS, case_key, cell_location, pcf_field_value
 from .outlook import DEFAULT_OUTLOOK
+from .extract import DOCUMENT_SUFFIXES, UNSUPPORTED_FORMAT
+
+
+def embedding_text_eligible(text):
+    remaining = 15
+    has_text = False
+    for char in text:
+        remaining -= not char.isspace()
+        has_text = has_text or char.isalnum()
+        if remaining <= 0 and has_text:
+            return True
+    return False
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS sources (
@@ -1031,6 +1043,7 @@ class Store:
         conn.execute("PRAGMA temp_store=MEMORY")
 
         conn.create_function("pcf_field_matches", 4, pcf_field_value)
+        conn.create_function("embedding_text_eligible", 1, embedding_text_eligible, deterministic=True)
         return conn
 
     @contextlib.contextmanager
@@ -1068,8 +1081,9 @@ class Store:
             sources = []
             for row in conn.execute("SELECT * FROM sources ORDER BY id"):
                 version = row["pending"] or row["active"]
-                problems = conn.execute("""SELECT item,code FROM problems WHERE source=? AND version=?
-                    ORDER BY code='pst_in_use' DESC,item LIMIT 5""", (row["id"], version)).fetchall()
+                problems = conn.execute("""SELECT item,code FROM problems WHERE source=? AND version=? AND code<>?
+                    ORDER BY code IN ('pst_in_use','pst_access_denied') DESC,item LIMIT 5""",
+                    (row["id"], version, UNSUPPORTED_FORMAT)).fetchall()
                 deferred_psts = conn.execute("""SELECT COUNT(*) FROM problems WHERE source=? AND version=?
                     AND code='pst_in_use'""", (row["id"], version)).fetchone()[0]
                 sources.append({**dict(row), "counts": counts.get(row["id"], {}),
@@ -1157,8 +1171,9 @@ class Store:
             for start, text in sections(mail["subject"] or "본문 없음"):
                 self.add_passage(conn, mail_id, mail, None, "", "제목", start, text)
         for name, _ in mail["attachments"]:
+            status = "대기" if Path(name).suffix.casefold() in DOCUMENT_SUFFIXES else UNSUPPORTED_FORMAT
             attachment_id = conn.execute(
-                "INSERT INTO attachments(mail,name,status) VALUES(?,?,'대기')", (mail_id, name)
+                "INSERT INTO attachments(mail,name,status) VALUES(?,?,?)", (mail_id, name, status)
             ).lastrowid
             self.add_passage(conn, mail_id, mail, attachment_id, name, "파일명", 0, name)
         self.add_quick_terms(conn, mail_id, mail)
