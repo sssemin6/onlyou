@@ -1527,6 +1527,102 @@ class Integration(unittest.TestCase):
         for year in (1900, 2025, 2099):
             self.assertEqual(parse_rewrite(raw, f"{year}년 업체는?").sub_queries, tuple(raw["sub_queries"]))
 
+    def test_natural_header_claims_require_real_names_dates_and_business_evidence(self):
+        row = {"id": 1, "passage": 2, "source": 1, "path": "sample.eml", "updated": None, "folder": "/",
+               "sent": "2026-04-09T12:30:00+00:00", "sender": "현대라이프보트 <info@hyundailifeboats.com>",
+               "recipient": "sales@palfinger.com", "subject": "H3097 LIFE BOAT drawing 500 USD", "attachment": None,
+               "location": "본문", "text": "The drawing is attached."}
+        cases = (
+            ("3097호선 LIFE BOAT 교신 업체는 Palfinger(sales@palfinger.com)로 확인됩니다.", row["recipient"], True),
+            ("업체는 현대라이프보트(hyundailifeboats.com) 측과 교신했습니다.", row["sender"], True),
+            ("Palfinger와 교신했습니다.", row["recipient"], True),
+            ("2026년 4월 9일 발송한 메일의 수신자는 sales@palfinger.com입니다.", row["recipient"], True),
+            ("수신자는 sales@palfinger.com입니다.", row["sender"], False),
+            ("3097호선 LIFE BOAT 업체는 없는회사입니다.", row["subject"], False),
+            ("업체는 없는회사(sales@palfinger.com)로 확인됩니다.", row["recipient"], False),
+            ("업체는 교신 메일 관련입니다.", row["sender"], False),
+            ("업체는 palfinger.com 입니다.", "H3097 LIFE BOAT drawing", True),
+            ("3098호선 업체는 Palfinger로 확인됩니다.", row["recipient"], False),
+            ("2026년 9월 4일 발송한 메일의 업체는 Palfinger입니다.", row["recipient"], False),
+            ("Palfinger가 500 USD에 합의했습니다.", row["subject"], False),
+            ("납기일은 2026년 4월 9일입니다.", row["sent"], False),
+            ("Palfinger가 도면 승인을 철회했습니다.", row["recipient"], False),
+        )
+        for claim, quote, accepted in cases:
+            with self.subTest(claim=claim):
+                result = validate({"status": "answered", "claims": [
+                    {"text": claim, "citations": [{"source": 2, "quote": quote}]},
+                ]}, [row], "3097 LIFE BOAT 업체는?")
+                self.assertEqual(result["status"], "answered" if accepted else "insufficient")
+        result = validate({"status": "answered", "claims": [
+            {"text": "발송일은 2026년 4월 9일입니다.", "citations": [{"source": 2, "quote": row["sent"]}]},
+        ]}, [row], "메일 발송일은?")
+        self.assertEqual(result["status"], "answered")
+
+    def test_intranet_follow_up_reuses_live_scoped_anchors_and_can_reset(self):
+        folder = Path(self.workspace.name) / "gateway-follow-up"
+        folder.mkdir()
+        messages = (
+            ("AtlasGateway", "구매팀", "The supplier sent a drawing for review.", ""),
+            ("Drawing review reply", "김 부장", "The drawing review is complete.", "gateway-1"),
+            ("Unrelated drawing", "김 부장", "An unrelated drawing review is still pending.", ""),
+        )
+        for day, (subject, sender, body, parent) in enumerate(messages, 1):
+            msg = EmailMessage()
+            msg["Subject"] = subject
+            msg["From"] = f"{sender} <sender{day}@example.invalid>"
+            msg["Date"] = f"{day} Jan 2026 12:00:00 +0000"
+            msg["Message-ID"] = f"<gateway-{day}@example.invalid>"
+            if parent:
+                msg["In-Reply-To"] = f"<{parent}@example.invalid>"
+            msg.set_content(body)
+            (folder / f"{day}.eml").write_bytes(msg.as_bytes())
+        source = self.indexer.register(folder)
+        self.assertEqual(await_source(self.store, source, {"ready", "error"})["state"], "ready")
+        self.assertEqual(self.call("/api/intranet/settings", {"action": "apply", "key": "fixture-key", "selections": {
+            "answer": "answer-model-a", "embedding": "", "rerank": "",
+        }})[0], 200)
+        route = "/api/intranet/answer"
+        filters = {"source": source, "tab": "mail"}
+
+        def complete(_instructions, content, **_options):
+            data = json.loads(content)
+            subject = "AtlasGateway" if data["question"] == "AtlasGateway" else "Drawing review reply"
+            item = next(item for item in data["evidence"] if item["context"]["subject"] == subject)
+            quote = item["text"].strip()
+            return {"status": "answered", "claims": [{"text": quote, "citations": [{"source": item["source"], "quote": quote}]}]}
+
+        with (patch.dict(os.environ, MAILSEARCH_QUERY_REWRITE="0", MAILSEARCH_AGENTIC_RETRY="0"),
+              patch("mailsearch.server.evidence_for", wraps=evidence_for) as retrieve,
+              patch.object(self.app.external, "complete", side_effect=complete) as wire):
+            status, first = self.call(route, {"query": "AtlasGateway", "filters": filters})
+            self.assertEqual((status, first["status"]), (200, "answered"))
+            anchor = first["claims"][0]["citations"][0]["passage"]
+            session = first["conversation"]
+            follow = {"query": "그중 최신 회신은?", "filters": filters, "conversation": session}
+            status, second = self.call(route, follow)
+            self.assertEqual((status, second["status"], second["conversation"]), (200, "answered", session))
+            self.assertIn("AtlasGateway", retrieve.call_args.kwargs["local_context"])
+            self.assertEqual(second["results"][0]["passage"], anchor)
+            self.assertIn("이전 질문: AtlasGateway", json.loads(wire.call_args.args[1])["question"])
+            named = {**follow, "query": "방금 메일에서 김 부장 회신만 확인해줘"}
+            status, replies = self.call(route, named)
+            self.assertEqual((status, replies["status"]), (200, "answered"))
+            self.assertEqual([row["subject"] for row in replies["results"]], ["Drawing review reply"])
+
+            wire.reset_mock()
+            rejected = self.call(route, {**follow, "filters": {**filters, "source": source + 99999}})[1]
+            self.assertEqual(rejected["results"], [])
+            self.assertEqual(retrieve.call_args.kwargs["local_context"], "")
+            wire.assert_not_called()
+            self.assertEqual(self.call(route, {**follow, "conversation": "invalid"})[0], 400)
+            self.assertEqual(self.call("/api/answer/reset", {"session_id": session})[0], 200)
+            wire.side_effect = None
+            wire.return_value = {"status": "insufficient", "claims": []}
+            fresh = self.call(route, follow)[1]
+            self.assertNotEqual(fresh["conversation"], session)
+            self.assertEqual(retrieve.call_args.kwargs["local_context"], "")
+
     def test_fast_and_attachment_search(self):
         source = self.import_mail()
         status, data = self.call("/api/search", {"query": "A-17", "filters": {"sender": "buy@example.invalid"}})
