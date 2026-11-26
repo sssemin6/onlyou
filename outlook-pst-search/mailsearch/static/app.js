@@ -33,6 +33,9 @@ const issueNames = {
   readpst_missing: "PST 추출 도구(readpst)를 설치하거나 실행 경로를 지정하세요.",
   pst_in_use: "Outlook 등에서 사용 중인 PST입니다. Outlook 종료 후 갱신하거나 Outlook 연결로 등록하세요.",
   pst_access_denied: "PST를 읽을 권한이 없습니다. 파일과 공유 폴더의 읽기 권한을 확인하세요.",
+  source_ignore_folder: "제외할 하위 폴더를 찾을 수 없습니다. 원본 경로를 확인하세요.",
+  source_ignore_kind: "폴더로 등록한 보관함에서 하위 폴더를 제외할 수 있습니다.",
+  source_ignore_settings: "폴더 제외 규칙을 저장하거나 읽을 수 없습니다. 앱 데이터 폴더를 확인하세요.",
   attachment_missing: "첨부 원본을 읽을 수 없습니다. 원본 메일과 보관함 경로를 확인하세요.",
   attachment_changed: "색인할 때와 원본이 달라졌습니다. 보관함을 갱신한 뒤 다시 시도하세요.",
   pst_export: "PST 추출에 실패했습니다. Outlook에서 해당 파일이 열리는지, 로컬 디스크에 여유 공간이 있는지 확인하세요.",
@@ -441,9 +444,37 @@ async function showSources() {
       if (source.deferred_psts) {
         entry.append(node("p", "X 사용 중이라 보류된 PST " + indexingNumber.format(source.deferred_psts) + "개", "issue"));
       }
+      const offeredFolders = new Set();
       for (const problem of source.problems || []) {
         const reason = issueNames[problem.code] || problem.code;
-        issues.append(node("li", problem.item + " · " + reason));
+        const line = node("li", problem.item + " · " + reason);
+        const slash = problem.item.indexOf("/");
+        if (slash > 0 && source.kind === "eml_dir" &&
+            !workingIndexStates.has(source.state) && !["queued", "removing", "remove_failed"].includes(source.state)) {
+          const folder = problem.item.slice(0, slash);
+          if (!offeredFolders.has(folder)) {
+            offeredFolders.add(folder);
+            const button = node("button", "이 폴더 제외 후 갱신", "text-button");
+            button.type = "button";
+            button.title = folder;
+            button.dataset.action = "ignore-" + source.id + "-" + folder;
+            button.addEventListener("click", async () => {
+              button.disabled = true;
+              try {
+                await call("/api/sources/" + source.id + "/ignore", { pattern: folder + "/" });
+                clearSearch();
+                notice(folder + " 폴더를 제외하고 보관함을 갱신합니다.");
+                await showSources();
+              } catch (error) {
+                notice(error.message);
+              } finally {
+                button.disabled = false;
+              }
+            });
+            line.append(" ", button);
+          }
+        }
+        issues.append(line);
       }
       if (issues.childElementCount) entry.append(issues);
     }
