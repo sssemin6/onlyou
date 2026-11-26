@@ -394,6 +394,17 @@ kbd {
 .answer h2 { margin-bottom: 6px; font: 800 1.22rem/1.4 var(--serif); }
 .answer-status { font-size: .82rem; color: var(--muted); }
 .answer-claim { margin-top: 11px; }
+.answer-markdown { line-height: 1.65; min-width: 0; }
+.answer-markdown h3, .answer-markdown h4 { margin: .9em 0 .35em; }
+.answer-markdown p, .answer-markdown ul, .answer-markdown ol { margin: .6em 0; }
+.answer-markdown p, .answer-draft { white-space: pre-wrap; }
+.answer-draft { margin-top: .65em; }
+.answer-markdown ul, .answer-markdown ol { padding-inline-start: 1.5em; }
+.answer-markdown code { padding: .1em .3em; border-radius: 3px; background: var(--paper); }
+.answer-table-wrap { max-width: 100%; overflow-x: auto; margin: .75em 0; }
+.answer-table-wrap table { width: max-content; min-width: 100%; border-collapse: collapse; background: var(--paper); }
+.answer-table-wrap th, .answer-table-wrap td { border: 1px solid var(--line); padding: .4em .65em; text-align: left; }
+.answer-table-wrap th { background: var(--gold); }
 .cite {
   margin: 0 3px 2px;
   padding: 0 6px;
