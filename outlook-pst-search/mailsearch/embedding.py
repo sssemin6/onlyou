@@ -21,7 +21,10 @@ CA_FILE_ENV = "MAILSEARCH_GATEWAY_CA_FILE"
 logger = logging.getLogger("mailsearch.gateway")
 IDLE_LIMIT = 4
 IDLE_TTL = 60
-STALE_CONNECTION = (http.client.RemoteDisconnected, http.client.BadStatusLine, BrokenPipeError)
+STALE_CONNECTION = (
+    http.client.RemoteDisconnected, http.client.BadStatusLine, BrokenPipeError,
+    ConnectionResetError, ConnectionAbortedError, ssl.SSLEOFError,
+)
 
 
 class GatewayConnections:
@@ -185,7 +188,7 @@ def request_gateway_json(origin, path, payload, headers, *, timeout, max_bytes, 
         raise
     except ssl.SSLError as exc:
         logger.error("POST %s: %s (library=%s, reason=%s)",
-                     destination, type(exc).__name__, exc.library, exc.reason)
+                     destination, type(exc).__name__, getattr(exc, "library", None), getattr(exc, "reason", None))
         raise
     except (OSError, http.client.HTTPException) as exc:
         logger.error("POST %s: %s (errno=%s, winerror=%s)", destination, type(exc).__name__,
