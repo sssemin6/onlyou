@@ -1385,26 +1385,31 @@ class Integration(unittest.TestCase):
             ]}
 
         gateway = self.ai.embedding_api
+        def markdown_reply(_origin, _path, options, _headers, **_kwargs):
+            evidence = next(item for item in json.loads(options["messages"][-1]["content"])["evidence"] if quote in item["text"])
+            self.assertFalse(options["stream"])
+            yield {"choices": [{"message": {"content": f"최종 승인 납품일은 4월 25일입니다. [{evidence['source']}]"}}]}
+
         with (patch.dict(os.environ, MAILSEARCH_AGENTIC_RETRY="1"),
               patch.object(gateway, "rewrite_query", return_value={
                   "sub_queries": ["A-17 납기"], "keywords": ["A-17"], "filters": {},
               }) as rewrite,
               patch.object(gateway, "diagnose_evidence_gap", return_value={"sufficient": True}) as diagnose,
-              patch.object(self.app.external, "complete", side_effect=complete) as wire):
+              patch("mailsearch.external.request_gateway_stream", side_effect=markdown_reply) as wire):
             self.assertEqual(self.call(route, {**payload, "filters": {"tab": "pcf"}})[0], 400)
             status, result = self.call(route, payload)
             self.assertEqual((status, result["provider"]), (200, "intranet"))
             self.assertIn(result["status"], ("answered", "partial"))
-            claim, = result["claims"]
-            citation, = claim["citations"]
-            self.assertEqual(citation["quote"], quote)
+            self.assertEqual((result["format"], result["claims"]), ("markdown", []))
+            citation, = result["sources"]
+            self.assertIn(quote, citation["quote"])
             self.assertIn(quote, self.call(f"/api/evidence/{citation['passage']}")[1]["text"])
             self.assertNotIn("review", result)
             rewrite.assert_called_once()
             diagnose.assert_called_once()
             wire.assert_called_once()
             self.assertEqual(wire.call_args.kwargs["timeout"], 60)
-            self.assertTrue(all(item.get("context") for item in json.loads(wire.call_args.args[1])["evidence"]))
+            self.assertTrue(all(item.get("context") for item in json.loads(wire.call_args.args[2]["messages"][-1]["content"])["evidence"]))
 
         options = {"action": "apply", "destination": CHAT_URL, "model": "generic-model", "key": "generic-key"}
         self.assertEqual(self.call("/api/external/settings", options)[0], 200)
@@ -1463,10 +1468,11 @@ class Integration(unittest.TestCase):
         payload = {"query": question, "filters": {"source": source, "tab": "mail"}}
         claim = "3097호선 LIFE BOAT 업체는 vendor-boat입니다"
         sent_payloads = []
-        quote = vendor
 
-        def complete(instructions, content, *, token_limit, timeout):
-            data = json.loads(content)
+        def markdown_reply(_origin, _path, options, _headers, **_kwargs):
+            messages = options["messages"]
+            instructions = messages[0]["content"]
+            data = json.loads(messages[-1]["content"])
             sent_payloads.append(data)
             item = next(item for item in data["evidence"] if item["context"]["subject"] == subject)
             self.assertIn(vendor, item["context"]["recipient"])
@@ -1475,21 +1481,18 @@ class Integration(unittest.TestCase):
             self.assertIn("교신 상대 후보", instructions)
             if data.get("check_aspects"):
                 self.assertIn("미확인으로 구분", instructions)
-            return {"status": "answered", "claims": [
-                {"text": claim, "citations": [{"source": item["source"], "quote": quote}]},
-            ]}
+            yield {"choices": [{"message": {"content": f"{claim} [{item['source']}]"}}]}
 
         gateway = self.ai.embedding_api
         with (patch.dict(os.environ, MAILSEARCH_AGENTIC_RETRY="0", MAILSEARCH_QUERY_REWRITE="1"),
               patch.object(gateway, "rewrite_query", return_value={
                   "sub_queries": ["H3097 LIFEBOAT", "LIFE BOAT drawing"], "keywords": [], "filters": {},
               }),
-              patch.object(self.app.external, "complete", side_effect=complete)):
-            for quote in (vendor, subject):
-                status, result = self.call("/api/intranet/answer", payload)
-                self.assertEqual((status, result["status"], result["provider"]), (200, "answered", "intranet"))
-                self.assertEqual(result["claims"][0]["text"], claim)
-                self.assertEqual(result["claims"][0]["citations"][0]["quote"], quote)
+              patch("mailsearch.external.request_gateway_stream", side_effect=markdown_reply)):
+            status, result = self.call("/api/intranet/answer", payload)
+            self.assertEqual((status, result["status"], result["provider"]), (200, "answered", "intranet"))
+            self.assertIn(claim, result["markdown"])
+            self.assertEqual(result["sources"][0]["subject"], subject)
             aspects = ("계약 체결 여부",)
             with patch("mailsearch.server.supplemental_evidence", side_effect=lambda store, ai, question, filters,
                        context, evidence, mode, query_count, **options: (evidence, mode, aspects, True)):
@@ -1586,26 +1589,32 @@ class Integration(unittest.TestCase):
         route = "/api/intranet/answer"
         filters = {"source": source, "tab": "mail"}
 
-        def complete(_instructions, content, **_options):
-            data = json.loads(content)
+        def markdown_reply(_origin, _path, options, _headers, **_kwargs):
+            data = json.loads(options["messages"][-1]["content"])
             subject = "AtlasGateway" if data["question"] == "AtlasGateway" else "Drawing review reply"
             item = next(item for item in data["evidence"] if item["context"]["subject"] == subject)
             quote = item["text"].strip()
-            return {"status": "answered", "claims": [{"text": quote, "citations": [{"source": item["source"], "quote": quote}]}]}
+            yield {"choices": [{"message": {"content": f"{quote} [{item['source']}]"}}]}
 
         with (patch.dict(os.environ, MAILSEARCH_QUERY_REWRITE="0", MAILSEARCH_AGENTIC_RETRY="0"),
               patch("mailsearch.server.evidence_for", wraps=evidence_for) as retrieve,
-              patch.object(self.app.external, "complete", side_effect=complete) as wire):
+              patch("mailsearch.external.request_gateway_stream", side_effect=markdown_reply) as wire):
             status, first = self.call(route, {"query": "AtlasGateway", "filters": filters})
             self.assertEqual((status, first["status"]), (200, "answered"))
-            anchor = first["claims"][0]["citations"][0]["passage"]
+            anchor = first["sources"][0]["passage"]
             session = first["conversation"]
             follow = {"query": "그중 최신 회신은?", "filters": filters, "conversation": session}
             status, second = self.call(route, follow)
             self.assertEqual((status, second["status"], second["conversation"]), (200, "answered", session))
             self.assertIn("AtlasGateway", retrieve.call_args.kwargs["local_context"])
             self.assertEqual(second["results"][0]["passage"], anchor)
-            self.assertIn("이전 질문: AtlasGateway", json.loads(wire.call_args.args[1])["question"])
+            messages = wire.call_args.args[2]["messages"]
+            self.assertEqual(messages[1:-1], [
+                {"role": "user", "content": "AtlasGateway"},
+                {"role": "assistant", "content": first["markdown"]},
+            ])
+            self.assertEqual(json.loads(messages[-1]["content"])["question"], follow["query"])
+            self.assertIn("evidence", json.loads(messages[-1]["content"]))
             named = {**follow, "query": "방금 메일에서 김 부장 회신만 확인해줘"}
             status, replies = self.call(route, named)
             self.assertEqual((status, replies["status"]), (200, "answered"))
@@ -1619,7 +1628,7 @@ class Integration(unittest.TestCase):
             self.assertEqual(self.call(route, {**follow, "conversation": "invalid"})[0], 400)
             self.assertEqual(self.call("/api/answer/reset", {"session_id": session})[0], 200)
             wire.side_effect = None
-            wire.return_value = {"status": "insufficient", "claims": []}
+            wire.return_value = (event for event in ())
             fresh = self.call(route, follow)[1]
             self.assertNotEqual(fresh["conversation"], session)
             self.assertEqual(retrieve.call_args.kwargs["local_context"], "")
@@ -1662,14 +1671,13 @@ class Integration(unittest.TestCase):
         self.assertEqual(self.call(route, payload, token=False)[0], 403)
         generating, release = threading.Event(), threading.Event()
 
-        def complete(_instructions, content, **_options):
+        def markdown_reply(_origin, _path, options, _headers, **_kwargs):
+            self.assertTrue(options["stream"])
+            row = next(row for row in json.loads(options["messages"][-1]["content"])["evidence"] if quote in row["text"])
+            yield {"choices": [{"delta": {"content": "## 승인 결과\n최종 승인 납품일은 "}}]}
             generating.set()
             self.assertTrue(release.wait(4))
-            row = next(row for row in json.loads(content)["evidence"] if quote in row["text"])
-            return {"status": "answered", "claims": [
-                {"text": "최종 승인 납품일은 4월 25일입니다.", "citations": [{"source": row["source"], "quote": quote}]},
-                {"text": "납품일은 7월 15일입니다.", "citations": [{"source": row["source"], "quote": quote}]},
-            ]}
+            yield {"choices": [{"delta": {"content": f"4월 25일입니다. [{row['source']}][99]"}}]}
 
         def next_event(response, name):
             self.assertEqual(response.readline(), f"event: {name}\n".encode())
@@ -1680,7 +1688,7 @@ class Integration(unittest.TestCase):
         conn = http.client.HTTPConnection("127.0.0.1", self.app.server_port, timeout=8)
         with (patch.dict(os.environ, MAILSEARCH_QUERY_REWRITE="0", MAILSEARCH_AGENTIC_RETRY="0"),
               patch.object(self.ai.embedding_api, "rerank", side_effect=lambda query, rows: list(range(len(rows)))) as rerank,
-              patch.object(self.app.external, "complete", side_effect=complete)):
+              patch("mailsearch.external.request_gateway_stream", side_effect=markdown_reply)):
             try:
                 conn.request("POST", route, json.dumps(payload),
                              {"X-Mail-Session": self.app.token, "Content-Type": "application/json"})
@@ -1692,7 +1700,9 @@ class Integration(unittest.TestCase):
                 self.assertGreater(stages[1]["candidates"], 1)
                 self.assertGreater(stages[2]["evidence"], 0)
                 self.assertTrue(generating.wait(1))
+                self.assertEqual(next_event(response, "delta")["text"], "## 승인 결과\n최종 승인 납품일은 ")
                 release.set()
+                self.assertIn("[99]", next_event(response, "delta")["text"])
                 result = next_event(response, "complete")
                 self.assertEqual(response.read(), b"")
             finally:
@@ -1700,8 +1710,10 @@ class Integration(unittest.TestCase):
                 conn.close()
         rerank.assert_called_once()
         self.assertRegex(result["conversation"], r"^[\w-]{32}$")
-        self.assertEqual([claim["text"] for claim in result["claims"]], ["최종 승인 납품일은 4월 25일입니다."])
-        self.assertEqual(result["claims"][0]["citations"][0]["quote"], quote)
+        self.assertEqual((result["format"], result["claims"]), ("markdown", []))
+        self.assertIn("최종 승인 납품일은 4월 25일입니다.", result["markdown"])
+        self.assertNotIn("[99]", result["markdown"])
+        self.assertIn(quote, result["sources"][0]["quote"])
 
     def test_intranet_concurrency_serializes_each_conversation_and_excludes_settings(self):
         source = self.import_mail()
@@ -1712,23 +1724,23 @@ class Integration(unittest.TestCase):
         first_started, two_started, release = threading.Event(), threading.Event(), threading.Event()
         lock = threading.Lock()
         seen = []
+        histories = []
         key = self.app.answer_sessions.begin("")[0]
         other = self.app.answer_sessions.begin("")[0]
         quote = "요청 주신 4월 25일 납품으로 최종 승인합니다."
 
-        def complete(_instructions, content, **_options):
-            data = json.loads(content)
+        def markdown_reply(_origin, _path, options, _headers, **_kwargs):
+            data = json.loads(options["messages"][-1]["content"])
             question = data["question"]
             with lock:
                 seen.append(question)
+                histories.append(options["messages"][1:-1])
                 first_started.set()
                 if len(seen) == 2:
                     two_started.set()
             self.assertTrue(release.wait(4))
             row = next(row for row in data["evidence"] if quote in row["text"])
-            return {"status": "answered", "claims": [
-                {"text": "최종 승인 납품일은 4월 25일입니다.", "citations": [{"source": row["source"], "quote": quote}]},
-            ]}
+            yield {"choices": [{"message": {"content": f"최종 승인 납품일은 4월 25일입니다. [{row['source']}]"}}]}
 
         original = "A-17 납품일 첫 질문"
         different_question = "A-17 납품일 다른 대화"
@@ -1739,7 +1751,7 @@ class Integration(unittest.TestCase):
 
         with (ThreadPoolExecutor(max_workers=3) as clients,
               patch.dict(os.environ, MAILSEARCH_QUERY_REWRITE="0", MAILSEARCH_AGENTIC_RETRY="0"),
-              patch.object(self.app.external, "complete", side_effect=complete)):
+              patch("mailsearch.external.request_gateway_stream", side_effect=markdown_reply)):
             first = clients.submit(ask, original, key)
             try:
                 self.assertTrue(first_started.wait(2))
@@ -1755,7 +1767,11 @@ class Integration(unittest.TestCase):
             for future in (first, second, different):
                 status, result = future.result(timeout=3)
                 self.assertEqual((status, result["status"]), (200, "answered"))
-        self.assertEqual(seen, [original, different_question, f"{follow_up}\n이전 질문: {original}"])
+        self.assertEqual(seen, [original, different_question, follow_up])
+        self.assertEqual(histories[:2], [[], []])
+        self.assertEqual(histories[2][0], {"role": "user", "content": original})
+        self.assertEqual(histories[2][1]["role"], "assistant")
+        self.assertIn("4월 25일", histories[2][1]["content"])
 
         settings_started, finish_settings = threading.Event(), threading.Event()
 
@@ -1790,7 +1806,7 @@ class Integration(unittest.TestCase):
         key = self.app.answer_sessions.begin("")[0]
         with (patch.dict(os.environ, MAILSEARCH_QUERY_REWRITE="1", MAILSEARCH_AGENTIC_RETRY="0"),
               patch.object(self.ai, "rewrite_query", side_effect=rewrite),
-              patch.object(self.app.external, "complete") as generate):
+              patch.object(self.app.external, "answer_markdown") as generate):
             try:
                 conn.request("POST", "/api/intranet/answer/stream",
                              json.dumps({"query": "A-17 납품일", "conversation": key, "filters": {"source": source}}),
