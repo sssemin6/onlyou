@@ -110,10 +110,7 @@ def warn_unverified(destination, runtime=False):
         logger.warning("TLS certificate verification disabled for %s (test only: connection test or %s=0)", destination, VERIFY_ENV)
 
 
-def request_gateway_json(origin, path, payload, headers, *, timeout, max_bytes, tls=None, retry_stale=False):
-    """Send to the configured gateway and log transport errors without request or response data."""
-    endpoint = urlsplit(origin)
-    destination = endpoint.netloc + path
+def gateway_tls_context(endpoint, path, tls):
     runtime = tls is not None and path in tls.unverified_paths
     verify = os.environ.get(VERIFY_ENV, "1").strip() if tls is None else ("1" if tls.verify and not runtime else "0")
     ca_file = os.environ.get(CA_FILE_ENV, "").strip() if tls is None else ("" if runtime else tls.ca_file)
@@ -129,6 +126,14 @@ def request_gateway_json(origin, path, payload, headers, *, timeout, max_bytes, 
 
     if verify == "0":
         warn_unverified(endpoint.netloc, runtime)
+    return verify, ca_file, context
+
+
+def request_gateway_json(origin, path, payload, headers, *, timeout, max_bytes, tls=None, retry_stale=False):
+    """Send to the configured gateway and log transport errors without request or response data."""
+    endpoint = urlsplit(origin)
+    destination = endpoint.netloc + path
+    verify, ca_file, context = gateway_tls_context(endpoint, path, tls)
     port = endpoint.port or 443
     key = (endpoint.hostname, port, verify, ca_file)
     deadline = monotonic() + timeout
@@ -194,6 +199,61 @@ def request_gateway_json(origin, path, payload, headers, *, timeout, max_bytes, 
         logger.error("POST %s: %s (errno=%s, winerror=%s)", destination, type(exc).__name__,
                      getattr(exc, "errno", None), getattr(exc, "winerror", None))
         raise
+
+
+def request_gateway_stream(origin, path, payload, headers, *, timeout, tls=None):
+    """Read a generation POST once and yield complete SSE messages or one JSON response."""
+    endpoint = urlsplit(origin)
+    _, _, context = gateway_tls_context(endpoint, path, tls)
+    connection = http.client.HTTPSConnection(endpoint.hostname, endpoint.port or 443, timeout=timeout, context=context)
+    response = None
+    try:
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        connection.request("POST", path, body, {**headers, "Connection": "close"})
+        response = connection.getresponse()
+        if response.status != 200:
+            logger.error("POST %s%s: HTTP %d", endpoint.netloc, path, response.status)
+            raise GatewayRequestError(response.status)
+        media_type = response.getheader("Content-Type", "").partition(";")[0].strip().lower()
+        if media_type == "application/json":
+            data = response.read(MAX_RESPONSE_BYTES + 1)
+            if len(data) > MAX_RESPONSE_BYTES:
+                raise ValueError("gateway_response_size")
+            if isinstance(response.length, int) and response.length:
+                raise http.client.IncompleteRead(data, response.length)
+            yield json.loads(data)
+            return
+        if media_type != "text/event-stream":
+            raise ValueError("gateway_content_type")
+        deadline = monotonic() + timeout
+        remaining = MAX_RESPONSE_BYTES
+        fields = []
+        while True:
+            if monotonic() >= deadline:
+                raise TimeoutError("gateway_stream_timeout")
+            raw = response.readline(remaining + 1)
+            if not raw and isinstance(response.length, int) and response.length:
+                raise http.client.IncompleteRead(b"", response.length)
+            remaining -= len(raw)
+            if remaining < 0:
+                raise ValueError("gateway_response_size")
+            line = raw.rstrip(b"\r\n")
+            if not line:
+                if fields:
+                    data = b"\n".join(fields)
+                    fields.clear()
+                    if data.strip() == b"[DONE]":
+                        return
+                    yield json.loads(data)
+                if not raw:
+                    return
+            elif line.startswith(b"data:"):
+                data = line[5:]
+                fields.append(data[1:] if data.startswith(b" ") else data)
+    finally:
+        if response is not None:
+            response.close()
+        connection.close()
 
 
 class EmbeddingAPI:
