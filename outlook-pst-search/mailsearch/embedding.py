@@ -210,6 +210,8 @@ def request_gateway_stream(origin, path, payload, headers, *, timeout, tls=None)
     try:
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         connection.request("POST", path, body, {**headers, "Connection": "close"})
+        # A closing response owns the socket file after getresponse() detaches the socket.
+        sock = connection.sock
         response = connection.getresponse()
         if response.status != 200:
             logger.error("POST %s%s: HTTP %d", endpoint.netloc, path, response.status)
@@ -229,9 +231,14 @@ def request_gateway_stream(origin, path, payload, headers, *, timeout, tls=None)
         remaining = MAX_RESPONSE_BYTES
         fields = []
         while True:
+            remaining_time = deadline - monotonic()
+            if remaining_time <= 0:
+                raise TimeoutError("gateway_stream_timeout")
+            if sock is not None:
+                sock.settimeout(max(0.05, remaining_time))
+            raw = response.readline(remaining + 1)
             if monotonic() >= deadline:
                 raise TimeoutError("gateway_stream_timeout")
-            raw = response.readline(remaining + 1)
             if not raw and isinstance(response.length, int) and response.length:
                 raise http.client.IncompleteRead(b"", response.length)
             remaining -= len(raw)
