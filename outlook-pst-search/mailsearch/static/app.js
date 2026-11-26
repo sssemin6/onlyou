@@ -970,7 +970,7 @@ function renderAnswerMarkdown(markdown, sources) {
   const lines = markdown.split(/\r?\n/);
   const refs = new Map(sources.map((source) => [source.index, source]));
   const heading = /^(#{2,3})\s+(.+)$/;
-  const list = /^\s*(?:(\d+)\.|-)\s+(.+)$/;
+  const list = /^\s*(?:(\d+)\.|[-*])\s+(.+)$/;
   const cells = (line) => line.trim().replace(/^\||\|$/g, "").split("|").map((value) => value.trim());
   const tableStart = (i) => {
     if (!lines[i]?.includes("|") || !lines[i + 1]?.includes("|")) return false;
