@@ -180,8 +180,11 @@ class App(ThreadingHTTPServer):
         if hasattr(self, "search_workers"):
             self.search_workers.shutdown(wait=True, cancel_futures=True)
             self.retrieval_workers.shutdown(wait=True, cancel_futures=True)
-            if self.store.vector_index:
-                self.store.vector_index.close()
+            try:
+                if self.store.vector_index:
+                    self.store.vector_index.close()
+            finally:
+                self.store.close()
 
     @contextmanager
     def gateway_access(self, *, settings=False):
@@ -457,7 +460,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         try:
-            self.get_route()
+            with self.server.store.search_session():
+                self.get_route()
         except sqlite3.Error:
             self.send_json(503, {"error": "index_unavailable"})
 
@@ -604,6 +608,12 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(200, {"ok": True})
             elif route == "/api/search":
                 self.query(route, payload)
+            elif route == "/api/suggest":
+                _, _, filters = self.question_input(payload)
+                prefix = payload.get("prefix", "")
+                if not isinstance(prefix, str):
+                    raise ValueError("prefix")
+                self.send_json(200, {"suggestions": self.server.store.suggest(prefix[:450], filters)})
             elif route in {"/api/candidates", "/api/external/preview", "/api/pcf/preview", "/api/external/send", "/api/pcf/send"}:
                 send = route.endswith("/send")
                 profile = SearchProfile("pcf" if route.startswith("/api/pcf/") else "evidence")
