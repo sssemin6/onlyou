@@ -2351,6 +2351,29 @@ class Integration(unittest.TestCase):
             semantic.assert_not_called()
             rerank.assert_not_called()
 
+    def test_opt_in_quick_search_includes_only_the_mail_body_prefix(self):
+        path = Path(self.workspace.name) / "preview-body.eml"
+        message = EmailMessage()
+        message["Subject"] = "Drawing update"
+        message["From"] = "sender@example.invalid"
+        message.set_content("earlyneedle\n" + "Routine correspondence. " * 60 + "lateneedle")
+        message.add_attachment("attachmentneedle", subtype="plain", filename="report.txt")
+        path.write_bytes(message.as_bytes())
+        source = self.indexer.register(path)
+        self.assertEqual(await_source(self.store, source, {"ready", "error"})["state"], "ready")
+
+        def search(query, **options):
+            status, data = self.call("/api/search", {"query": query, "filters": {"source": source}, **options})
+            self.assertEqual(status, 200)
+            return data["results"]
+
+        self.assertFalse(search("earlyneedle", mode="quick"))
+        self.assertTrue(search("earlyneedle", mode="quick", quick_body=True))
+        for query in ("lateneedle", "attachmentneedle"):
+            with self.subTest(query=query):
+                self.assertFalse(search(query, mode="quick", quick_body=True))
+                self.assertTrue(search(query, mode="keyword", full_text=True))
+
     def test_quick_search_backfills_old_data_and_obeys_visibility(self):
         source = self.import_mail()
         with self.store.connection() as conn:
