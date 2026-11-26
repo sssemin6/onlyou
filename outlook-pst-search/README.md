@@ -12,7 +12,7 @@ Outlook 메일·업무 문서·선주 교신문(PCF)을 업무 PC에서 색인�
 4. 열린 브라우저에서 **자료 추가**를 누른 뒤, Outlook을 닫고 로컬 디스크에 보관한 PST 경로를 등록합니다. 여러 파일은 한 번씩 등록하거나 PST를 모아 둔 폴더를 등록합니다. 폴더를 등록하면 그 안의 .eml 메일, 모든 PST, 문서 파일(PDF·DOCX·XLSX·TXT)을 함께 가져오며, 빈 PST나 읽을 수 없는 PST는 건너뛰고 누락으로 표시합니다. 문서 파일 하나만 따로 등록할 수도 있습니다. Outlook이 사용하는 데이터 파일 대신 닫혀 있는 PST 사본을 등록하면 파일 교체·갱신 시점을 제어하기 쉽습니다.
 5. 브라우저에서 앱 탭을 모두 닫으면 앱도 종료됩니다(마지막 탭을 닫은 뒤 최대 10여 초 걸릴 수 있습니다). 콘솔로 실행한 경우 **Ctrl+C**로 종료합니다. 진행 중이던 색인은 다음 실행에서 **재개**할 수 있습니다.
 
-인터넷이 막혀 setup-windows.cmd를 쓸 수 없거나 직접 준비하려면 FTS5가 포함된 **SQLite 3.42 이상**을 사용하는 **Python 3.12 이상**을 설치하세요. SQLite 버전은 `py -3 -c "import sqlite3; print(sqlite3.sqlite_version)"`으로 확인합니다. readpst는 저장소의 `vendor\readpst-win64\readpst.exe`를 그대로 쓰거나 [MSYS2 MinGW libpst](https://packages.msys2.org/packages/mingw-w64-x86_64-libpst)에서 직접 준비합니다. 텍스트 PDF 첨부를 색인하려면 `pdftotext`가 필요한데, Git for Windows가 설치된 PC에서는 그에 포함된 `pdftotext`를 자동으로 사용하므로 별도 설치가 없어도 됩니다. 없다면 [Poppler](https://poppler.freedesktop.org/)에서 준비합니다. PowerShell에서 앱 폴더로 이동하고 실행합니다. 도구가 PATH에 있으면 `--readpst`와 `--pdftotext`를 생략할 수 있습니다.
+인터넷이 막혀 setup-windows.cmd를 쓸 수 없거나 직접 준비하려면 FTS5가 포함된 **SQLite 3.42 이상**을 사용하는 **Python 3.12 이상**을 설치하세요. SQLite 버전은 `py -3 -c "import sqlite3; print(sqlite3.sqlite_version)"`으로 확인합니다. readpst는 저장소의 `vendor\readpst-win64\readpst.exe`를 그대로 쓰거나 [MSYS2 MinGW libpst](https://packages.msys2.org/packages/mingw-w64-x86_64-libpst)에서 직접 준비합니다. PDF는 Git for Windows 또는 [Poppler](https://poppler.freedesktop.org/)의 `pdftotext`를 우선 사용합니다. 실행 가능한 도구가 없으면 앱과 같은 Python에 설치된 `pypdf` 또는 `PyMuPDF`로 페이지별 텍스트를 추출합니다. PowerShell에서 앱 폴더로 이동하고 실행합니다. 도구가 PATH에 있으면 `--readpst`와 `--pdftotext`를 생략할 수 있습니다.
 
 ```powershell
 .\start-windows.cmd --readpst "C:\msys64\mingw64\bin\readpst.exe" --pdftotext "C:\tools\poppler\bin\pdftotext.exe"
@@ -117,7 +117,9 @@ $env:MAILSEARCH_INTERNAL_INPUT_BYTES = "24000"
 - **빠른 검색**(`Enter`)은 메모리에서 품번, 제목, 발신자·수신자, 첨부파일 이름을 찾습니다. **본문 검색**은 전체 본문과 색인된 첨부파일 내부를, **의미 검색**은 키워드와 임베딩을 함께 검색합니다. `/`는 검색창으로 이동하고 `Ctrl+Enter`는 AI 질문을 실행합니다. `"A-17" & "승인"`은 두 표현을 모두, `"A-17" or "B-19"`는 하나라도 정확히 포함한 메일을 찾습니다.
 - **전체 / 메일 / 문서 / PCF** 탭에서 자료 종류를 고릅니다. **검색 범위**의 보관함을 선택하면 특정 자료 폴더 또는 파일로 좁힐 수 있습니다. 검색어를 비우면 선택 범위의 최신 자료가 표시됩니다.
 - 보관함에서 **자료 추가**를 눌러 PST·EML·문서 파일이나 폴더를 등록합니다. 자료 카드에는 종류별 건수와 누락·일부 색인 상태가 표시됩니다. 마지막 색인 뒤 바뀐 PST는 갱신 대상으로 표시합니다.
-- **문서 검색**은 PDF(페이지), DOCX(본문), XLSX(시트·셀), TXT를 찾습니다. 구형 DOC·XLS는 LibreOffice가 설치된 경우 읽기 전용으로 변환합니다. 인용에서 해당 파일과 페이지·셀 위치를 확인할 수 있습니다.
+- **문서 검색**은 PDF(페이지), DOCX(본문), XLSX(시트·셀), TXT를 찾습니다. 구형 DOC·XLS는 LibreOffice가 있으면 임시 사본을 변환합니다. LibreOffice가 없는 PC에서 XLS는 `xlrd`로 시트와 셀을 읽을 수 있습니다. PDF·XLS용 Python 폴백을 준비하려면 앱과 같은 Python에서 `py -3 -m pip install pypdf xlrd`를 실행할 수 있습니다. 오프라인 PC에서는 승인된 패키지 파일을 사용하세요. 추출 도구를 추가한 뒤 보관함을 갱신하면 미설치로 빠졌던 문서·첨부를 다시 처리합니다. 이미지로만 구성된 PDF 페이지는 기존 OCR 도구가 필요합니다.
+- 폴더 색인은 시스템·개발 폴더를 기본 제외합니다. 등록한 폴더의 루트에 UTF-8 `.mailsearchignore`를 두면 줄마다 폴더 이름이나 글롭을 추가할 수 있습니다. 예를 들어 `MSC.Software/`는 해당 이름의 폴더를, `projects/build-*/`는 등록 루트의 해당 경로를, `*.draft.txt`는 이름이 맞는 파일을 제외합니다. `#`으로 시작하는 줄은 주석입니다. 규칙을 바꾼 뒤 해당 보관함을 갱신하세요. 미지원 파일은 누락 건수에 포함되지 않습니다.
+- 사용 중인 PST는 Outlook을 종료한 뒤 갱신하거나 **Outlook 연결**로 등록합니다. PST 읽기 권한 오류는 잠금과 구분해 표시합니다.
 - **PCF 탭**에서 번호 또는 본문으로 검색합니다. 파일명에 PCF가 있는 Word 문서의 No. / Owner / Yard 표를 COMMENT별로 색인합니다. 검색 결과를 열면 해당 COMMENT의 셀 원문과 빈 회신을 확인할 수 있습니다. 번호가 여러 표나 파일에서 겹치면 후보를 선택합니다. 기존 PCF 보관함은 **갱신**하면 표를 다시 판독합니다.
 
 - **스캔 PDF**의 텍스트가 적은 페이지는 Poppler 렌더러와 Tesseract가 설치된 경우 OCR 대상으로 처리합니다. 인용에는 OCR 페이지 위치가 표시되며, 후보 중 읽지 못한 페이지는 일부 색인으로 표시합니다. 누락이 표시되면 파일과 도구를 확인하고 다시 색인할 수 있습니다.
