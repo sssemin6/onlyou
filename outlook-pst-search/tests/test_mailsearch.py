@@ -149,7 +149,7 @@ class Integration(unittest.TestCase):
         row = await_source(self.store, source, {"ready", "error"})
         self.assertEqual(row["state"], "ready")
         self.assertIsNone(row["issue"])
-        self.assertEqual((row["done"], row["omitted"]), (4, 1))
+        self.assertEqual((row["done"], row["omitted"]), (4, 0))
         return source
 
     def test_gateway_settings_probes_use_one_key_and_review_the_chosen_answer_model(self):
@@ -715,7 +715,7 @@ class Integration(unittest.TestCase):
         folder.mkdir()
         (folder / "old.pst").write_bytes(b"!BDN" + bytes(4) + b"SM" + bytes(2))
         (folder / "standalone.txt").write_text("Document content should be reused.", encoding="utf-8")
-        document = "공통 첨부 본문입니다."
+        document = "공통 첨부의 상세 본문을 확인합니다."
 
         def export(pst, stage, event, source):
             output = stage / "eml"
@@ -1969,7 +1969,7 @@ class Integration(unittest.TestCase):
         folder = Path(self.workspace.name) / "duplicate-attachments"
         folder.mkdir()
         body = "오늘 송부합니다.\n\n> 오래된 검토 98765\n\n새 회신입니다.\n-- \n서명비밀 19573"
-        data = "공유 첨부문단 30719".encode()
+        data = "공유 첨부문단 검사 기록입니다 30719".encode()
         copies = 50
         for idx in range(copies):
             msg = EmailMessage()
@@ -2214,7 +2214,7 @@ class Integration(unittest.TestCase):
             return SimpleNamespace(FolderPath=path, Folders=children, GetTable=lambda _: Table(entries))
 
         def item(path, subject):
-            return SimpleNamespace(Parent=SimpleNamespace(FolderPath=path), Subject=subject, Body="Fixture content.",
+            return SimpleNamespace(Parent=SimpleNamespace(FolderPath=path), Subject=subject, Body="Fixture message content.",
                                    SenderName="Operations", To="Warehouse", CC="", SentOn=None, Attachments=[])
 
         original = {"same": item("/Inbox", "Same"), "move": item("/Inbox", "Move"),
@@ -2474,7 +2474,7 @@ class Integration(unittest.TestCase):
         self.indexer.index_headers = index_headers
         self.indexer.command(source, "resume")
         latest = await_source(self.store, source, {"ready", "error"})
-        self.assertEqual((latest["state"], latest["done"], latest["omitted"]), ("ready", 4, 1))
+        self.assertEqual((latest["state"], latest["done"], latest["omitted"]), ("ready", 4, 0))
 
     def test_folder_mtime_change_during_embedding_keeps_completed_index(self):
         embed = self.indexer.index_embeddings
@@ -2487,7 +2487,7 @@ class Integration(unittest.TestCase):
         self.indexer.index_embeddings = change_folder
         source = self.indexer.register(self.mail)
         row = await_source(self.store, source, {"ready", "error"})
-        self.assertEqual((row["state"], row["done"], row["omitted"]), ("ready", 4, 1))
+        self.assertEqual((row["state"], row["done"], row["omitted"]), ("ready", 4, 0))
         self.assertEqual(row["embedding_done"], row["embedding_total"])
         self.assertGreater(row["embedding_done"], 0)
 
@@ -2508,7 +2508,7 @@ class Integration(unittest.TestCase):
             self.indexer.index_embeddings = previous_version
             source = self.indexer.register(self.mail)
             interrupted = await_source(self.store, source, {"error"})
-        self.assertEqual((interrupted["issue"], interrupted["done"], interrupted["omitted"]), ("changed", 4, 2))
+        self.assertEqual((interrupted["issue"], interrupted["done"], interrupted["omitted"]), ("changed", 4, 1))
         self.assertGreater(interrupted["embedding_done"], 0)
         deadline = time.monotonic() + 5
         while source in self.indexer.events and time.monotonic() < deadline:
@@ -2518,7 +2518,7 @@ class Integration(unittest.TestCase):
             self.assertEqual(self.call("/api/source-action", {"source": source, "action": "resume"})[0], 202)
             ready = await_source(self.store, source, {"ready", "error"})
         self.assertEqual((ready["state"], ready["active"], ready["omitted"], ready["embedding_done"]),
-                         ("ready", interrupted["pending"], 2, interrupted["embedding_done"]))
+                         ("ready", interrupted["pending"], 1, interrupted["embedding_done"]))
         visible = self.call("/api/sources?scan=0")[1]["sources"][0]
         self.assertEqual(visible["deferred_psts"], 1)
 
@@ -2561,7 +2561,7 @@ class Integration(unittest.TestCase):
         reopened.wake()
         ready = await_source(self.store, source, {"ready", "error"})
         self.assertEqual((ready["state"], ready["active"], ready["done"], ready["omitted"]),
-                         ("ready", row["pending"], 4, 1))
+                         ("ready", row["pending"], 4, 0))
         self.assertEqual(self.store.source(manual)["state"], "paused")
         with self.store.connection() as conn:
             self.assertEqual(conn.execute("SELECT id FROM mails WHERE source=? ORDER BY id", (source,)).fetchall(),
@@ -2805,6 +2805,102 @@ class Integration(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertIn({"item": "invalid.pst", "code": "pst_invalid"}, result["sources"][0]["problems"])
 
+    def test_folder_scan_prunes_ignored_trees_and_counts_only_supported_failures(self):
+        folder = self.mail / "scoped-scan"
+        folder.mkdir()
+        (folder / ".mailsearchignore").write_text("# installation and generated reports\nMSC.Software/\nprojects/build-*\n*.draft.txt\n",
+                                                 encoding="utf-8-sig")
+        for directory in (".GIT", "Node_Modules", "MSC.Software", "projects/build-42", "Windows"):
+            ignored = folder / directory
+            ignored.mkdir(parents=True)
+            (ignored / "ignored.pst").write_bytes(b"invalid PST")
+            (ignored / "ignored.txt").write_text("Excluded content")
+        for name in ("worker.exe", "library.dll", "log.tmp", "hidden.draft.txt"):
+            (folder / name).write_bytes(b"Ignore this file")
+        (folder / "broken.xlsx").write_bytes(b"invalid workbook")
+        (folder / "invalid.pst").write_bytes(b"invalid PST")
+        (folder / "notes.txt").write_text("Useful document text from the scan")
+        message = EmailMessage()
+        message["Subject"] = "Supported mail"
+        message.set_content("Useful mail text from the scan")
+        message.add_attachment(b"file", maintype="application", subtype="octet-stream", filename="binary.dll")
+        (folder / "mail.eml").write_bytes(message.as_bytes())
+        with self.assertLogs("mailsearch.runtime", level="INFO") as log:
+            source = self.indexer.register(folder)
+            row = await_source(self.store, source, {"ready", "error"})
+        self.assertEqual((row["state"], row["done"], row["omitted"], row["failed"]), ("ready", 2, 2, 0))
+        saved, = self.store.sources()
+        self.assertEqual({item["item"] for item in saved["problems"]}, {"invalid.pst", "broken.xlsx"})
+        self.assertEqual(set(self.store.pst_files(source)), {"invalid.pst/"})
+        self.assertEqual(self.indexer.pending_updates(row), [])
+        self.assertTrue(any("skipped 3 unsupported files" in entry for entry in log.output), log.output)
+        self.assertFalse(self.store.lexical("Excluded content", {"source": source}))
+
+    def test_pst_lock_and_windows_permission_errors_are_distinct(self):
+        folder = self.mail / "locks"
+        folder.mkdir()
+        for name in ("locked.pst", "denied.pst"):
+            (folder / name).write_bytes(b"!BDN" + bytes(4) + b"SM" + bytes(2))
+        (folder / "mail.eml").write_text("Subject: Indexable mail\n\nFixture message body.")
+
+        def access(path):
+            error = PermissionError("synthetic error")
+            error.winerror = 32 if path.name == "locked.pst" else 5
+            raise error
+
+        with patch("mailsearch.indexer.stable_input", side_effect=access):
+            source = self.indexer.register(folder)
+            row = await_source(self.store, source, {"ready", "error"})
+        self.assertEqual((row["state"], row["omitted"]), ("ready", 2))
+        saved, = self.call("/api/sources?scan=0")[1]["sources"]
+        self.assertEqual(saved["deferred_psts"], 1)
+        self.assertEqual({p["item"]: p["code"] for p in saved["problems"]},
+                         {"locked.pst": "pst_in_use", "denied.pst": "pst_access_denied"})
+
+    def test_refresh_retries_missing_pdf_inside_an_unchanged_mail(self):
+        folder = self.mail / "retry-extract"
+        folder.mkdir()
+        message = EmailMessage()
+        message["Subject"] = "Pdf fallback fixture"
+        message.set_content("Useful searchable mail body.")
+        message.add_attachment(b"synthetic pdf", maintype="application", subtype="pdf", filename="drawing.pdf")
+        (folder / "mail.eml").write_bytes(message.as_bytes())
+        self.indexer.pdf = None
+        with patch("mailsearch.extract.optional_reader", return_value=None):
+            source = self.indexer.register(folder)
+            first = await_source(self.store, source, {"ready", "error"})
+        self.assertEqual((first["state"], first["omitted"]), ("ready", 1))
+
+        with (patch("mailsearch.indexer.optional_reader", return_value=object()),
+              patch("mailsearch.extract.python_pdf_text",
+                    return_value=(["A recovered inspection report for the shipping assembly."], False))):
+            self.indexer.command(source, "refresh")
+            second = await_source(self.store, source, {"ready", "error"})
+        self.assertEqual((second["state"], second["omitted"]), ("ready", 0))
+        self.assertTrue(self.store.lexical("inspection report", {"source": source}))
+
+    def test_embedding_skips_filename_short_and_symbol_only_passages_but_keeps_fts(self):
+        folder = self.mail / "embedding-filter"
+        folder.mkdir()
+        for idx, body in enumerate(("ShortNeedle", "! " * 35, "This eligible inspection result is searchable.")):
+            message = EmailMessage()
+            message["Subject"] = f"Filter mail {idx}"
+            message.set_content(body)
+            if idx == 0:
+                message.add_attachment(b"data", maintype="application", subtype="octet-stream",
+                                       filename="Filenameneedle_Long_Name.dll")
+            (folder / f"{idx}.eml").write_bytes(message.as_bytes())
+        with patch.object(self.ai, "embed", return_value=[[1., .05, .12]]) as embed:
+            source = self.indexer.register(folder)
+            row = await_source(self.store, source, {"ready", "error"})
+        self.assertEqual((row["state"], row["embedding_done"], row["embedding_total"]), ("ready", 1, 1))
+        embed.assert_called_once()
+        self.assertEqual(len(embed.call_args.args[0]), 1)
+        self.assertIn("eligible inspection", embed.call_args.args[0][0])
+        scope = {"source": source}
+        self.assertTrue(self.store.lexical("ShortNeedle", scope))
+        self.assertTrue(self.store.lexical("Filenameneedle", scope))
+
     def test_background_embedding_uses_configured_timeout_and_reduces_timed_out_batch(self):
         folder = Path(self.workspace.name) / "embedding-batches"
         folder.mkdir()
@@ -2829,6 +2925,35 @@ class Integration(unittest.TestCase):
         self.assertEqual((row["state"], row["issue"], row["embedding_done"], row["embedding_total"]),
                          ("ready", None, 37, 37))
         self.assertEqual(requests, [(size, 50) for size in (32, 16, 8, 8, 8, 8, 5)])
+
+    def test_gateway_defaults_to_64_and_accepts_128_with_half_size_retry(self):
+        gateway = IntranetAI("test-key", {"answer": "", "embedding": "bge-m3", "rerank": ""})
+        self.ai.configure_embedding("embed", gateway)
+        for name in ("default-size", "large-batch"):
+            folder = self.mail / name
+            folder.mkdir()
+            for idx in range(133):
+                (folder / f"{idx}.txt").write_text(f"Eligible indexing text for inspection item {idx}.")
+        batches = []
+
+        def embed(texts, timeout):
+            batches.append((len(texts), timeout))
+            if len(texts) > 64:
+                raise TimeoutError()
+            return [[1., .05, .12] for _ in texts]
+
+        with patch.object(gateway, "embed", side_effect=embed):
+            source = self.indexer.register(self.mail / "default-size")
+            self.assertEqual(await_source(self.store, source, {"ready", "error"})["embedding_total"], 133)
+            self.assertEqual(batches, [(64, 60), (64, 60), (5, 60)])
+            batches.clear()
+            large = Indexer(self.store, ai=self.ai, embedding_batch_size=128, embedding_batch_timeout=50)
+            self.addCleanup(large.stop)
+            with self.assertLogs("mailsearch.gateway", "WARNING"):
+                source = large.register(self.mail / "large-batch")
+                row = await_source(self.store, source, {"ready", "error"})
+            self.assertEqual((row["state"], row["embedding_done"], row["embedding_total"]), ("ready", 133, 133))
+            self.assertEqual(batches, [(128, 50), (64, 50), (64, 50), (5, 50)])
 
     def test_raw_attachment_download_survives_missing_text_and_old_pst_indexes(self):
         pst = self.mail / "source.pst"
@@ -2861,11 +2986,10 @@ class Integration(unittest.TestCase):
                 connection.close()
 
         with (patch("mailsearch.indexer.subprocess.Popen", side_effect=export_numbered) as launcher,
-              patch("mailsearch.indexer.extract_attachment", side_effect=[
-                    ("미지원 형식", []), ("추출 실패 또는 암호화", [])])):
+              patch("mailsearch.indexer.extract_attachment", return_value=("추출 실패 또는 암호화", []))):
             source = self.indexer.register(pst)
             row = await_source(self.store, source, {"ready", "error"})
-            self.assertEqual((row["state"], row["omitted"]), ("ready", 2))
+            self.assertEqual((row["state"], row["omitted"]), ("ready", 1))
             result = self.call("/api/search", {"query": "binary", "mode": "keyword"})[1]["results"][0]
             info = self.call(f"/api/evidence/{result['passage']}")[1]
             picture, document = info["attachments"]
@@ -3938,6 +4062,27 @@ class AttachmentsAndCitations(unittest.TestCase):
 
 
 class WordPCFProcessing(unittest.TestCase):
+    def test_read_only_xls_fallback_respects_cell_locations_and_limits(self):
+        book = MagicMock(nsheets=2)
+        book.__enter__.return_value = book
+        book.sheet_by_index.side_effect = [
+            SimpleNamespace(name="견적", nrows=1, row_values=lambda row: ["품번", "", "320000"]),
+            SimpleNamespace(name="검토", nrows=1, row_values=lambda row: ["최종 검토용 본문"]),
+        ]
+        xlrd = MagicMock()
+        xlrd.biffh.XLRDError = ValueError
+        xlrd.open_workbook.return_value = book
+        xlrd.cellname.side_effect = lambda row, col: f"{'ABC'[col]}{row + 1}"
+        with (tempfile.TemporaryDirectory() as tmp, patch("mailsearch.extract.office_binary", return_value=None),
+              patch("mailsearch.extract.optional_reader", return_value=xlrd),
+              patch("mailsearch.extract.MAX_LOCATIONS", 1)):
+            result = extract_bytes(b"legacy bytes", ".xls", tmp, None)
+            self.assertEqual(result, ("일부 색인", [("견적!A1~C1", "A1 품번 | C1 320000")]))
+            xlrd.open_workbook.assert_called_once_with(file_contents=b"legacy bytes", on_demand=True)
+            book.__exit__.assert_called_once()
+            with patch("mailsearch.extract.optional_reader", return_value=None):
+                self.assertEqual(extract_bytes(b"legacy bytes", ".xls", tmp, None), ("변환기 미설치(구형 Office)", []))
+
     def test_legacy_uses_extension_without_leading_dot(self):
         for old, new in ((".doc", "docx"), (".xls", "xlsx")):
             with tempfile.TemporaryDirectory() as tmp:
