@@ -60,19 +60,19 @@ class IntranetAI(EmbeddingAPI):
         return cls(key, selections, origin=origin, answer_models=answer_models, tls=tls)
 
     def rewrite_query(self, instructions, prompt, *, timeout):
-        return self.retrieval_completion(instructions, prompt, QUERY_REWRITE_TOKEN_LIMIT, timeout)
+        return self.retrieval_completion(instructions, prompt, QUERY_REWRITE_TOKEN_LIMIT, timeout, retry_stale=True)
 
     def diagnose_evidence_gap(self, instructions, prompt, *, timeout):
         return self.retrieval_completion(instructions, prompt, GAP_TOKEN_LIMIT, timeout)
 
-    def retrieval_completion(self, instructions, prompt, token_limit, timeout):
+    def retrieval_completion(self, instructions, prompt, token_limit, timeout, *, retry_stale=False):
         response = self.request(CHAT_PATH, {
             "model": self.rewrite_model,
             "messages": [{"role": "system", "content": instructions}, {"role": "user", "content": prompt}],
             "max_tokens": token_limit,
             "temperature": 0,
             "stream": False,
-        }, timeout)
+        }, timeout, retry_stale=retry_stale)
         content = response["choices"][0]["message"]["content"]
         fenced = re.fullmatch(r"\s*```(?:json)?\s*(.*?)\s*```\s*", content, re.S | re.I)
         return json.loads(fenced[1] if fenced else content)
@@ -80,7 +80,7 @@ class IntranetAI(EmbeddingAPI):
     def rerank(self, query, documents, timeout=15):
         data = self.request(RERANK_PATH, {
             "model": self.models["rerank"], "query": query, "documents": documents, "top_n": len(documents),
-        }, timeout)
+        }, timeout, retry_stale=True)
         results = data.get("results") if isinstance(data, dict) else None
         if not isinstance(results, list) or len(results) != len(documents):
             raise ValueError("rerank_response")
