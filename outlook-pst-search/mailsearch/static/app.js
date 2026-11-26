@@ -1073,8 +1073,9 @@ function showReview(data, pcf) {
     original.addEventListener("click", () => openEvidence(title.passage, null, title.window));
     card.append(label, original);
     if (excerpt.context) {
-      const { subject, sender, sent, attachment, location } = excerpt.context;
-      card.append(node("p", "함께 전송 · " + [subject, sender, sent, attachment, location].filter(Boolean).join(" · ")));
+      const { subject, sender, recipient, sent, attachment, location } = excerpt.context;
+      card.append(node("p", "함께 전송 · " +
+        [subject, sender, recipient && "수신 " + recipient, sent, attachment, location].filter(Boolean).join(" · ")));
     }
     card.append(node("p", excerpt.text || "원본 셀 빈칸"));
     excerpts.append(card);
