@@ -56,7 +56,7 @@ ANSWER_ASPECT = re.compile(
     r"결제\s*조건|지급\s*조건|승인\s*여부"
 )
 ASPECT_SEPARATOR = re.compile(r"\s*(?:[,·/]|와|과|및|그리고|이랑|하고|랑|도)\s*")
-FOLLOW_UP = re.compile(r"^(?:그중|그\s*중|그\s*메일|그\s*자료|그\s*건|그때|방금|직전|아까|앞서|같은\s*(?:건|자료))|다시|이어서")
+FOLLOW_UP = re.compile(r"^(?:그럼|그러면|그\s*(?:중|메일|자료|건|업체|담당자)|그때|방금|직전|아까|앞서|같은\s*(?:건|자료))|다시|이어서")
 FOLLOW_UP_REPLY = re.compile(
     r"(?<!\w)(?P<sender>[가-힣]{1,5}\s*(?:부장|과장|차장|대리|팀장|실장|본부장|담당자))"
     r"\s*(?:님)?(?:의|이|가)?\s*(?:회신|답장)"
@@ -889,7 +889,7 @@ def dedupe_by_content(rows):
     return list(unique.values())
 
 
-def combine_answer_evidence(pools, anchors=()):
+def combine_answer_evidence(pools, anchors=(), *, limit=ANSWER_EVIDENCE_LIMIT):
     """Interleave ranked hits so one project cannot consume the whole evidence window."""
     found = {}
     duplicates = set()
@@ -899,7 +899,7 @@ def combine_answer_evidence(pools, anchors=()):
         if row["passage"] not in found and key not in duplicates:
             found[row["passage"]] = row
             duplicates.add(key)
-        if len(found) == ANSWER_EVIDENCE_LIMIT:
+        if len(found) == limit:
             break
     return list(found.values())
 
@@ -1317,7 +1317,7 @@ ITEM_CODE = re.compile(r"(?<![A-Za-z0-9])[A-Za-z0-9]+(?:[-_][A-Za-z0-9]+)+")
 PROPOSAL = re.compile(r"요청|제안|예정|초안|검토|tentative|request|propos", re.I)
 CLAUSE = re.compile(r"[^\n!?。]+?(?:\.(?!\d)|(?=[\n!?。])|$)")
 BUSINESS_QUESTION = re.compile(r"납기|납품|출하|출고|입고|일정|마감|공급가|단가|금액|가격|비용|견적가|예산|대금")
-MAIL_SENT_FACT = re.compile(r"발송(?:일|\s*시각|\s*날짜|했|됐|되었)|보낸\s*(?:날|시각)|보냈|송부했")
+MAIL_SENT_FACT = re.compile(r"발송(?:일|\s*시각|\s*날짜|했|됐|되었|한|된)|보낸|보냈|송부했")
 HEADER_ROLES = {
     "발신자": ("sender",), "발신인": ("sender",), "보낸 사람": ("sender",),
     "수신자": ("recipient",), "수신인": ("recipient",), "받는 사람": ("recipient",),
@@ -1325,12 +1325,32 @@ HEADER_ROLES = {
 }
 PARTICIPANT_ROLES = r"업체(?:명)?|공급사|제조사|벤더|담당자|교신\s*상대(?:방)?|상대방|vendor|supplier|maker"
 HEADER_ROLE = "|".join((*map(re.escape, HEADER_ROLES), PARTICIPANT_ROLES))
+HEADER_NAME = r"[^,，!?。;；\n]+?"
+HEADER_END = (r"(?:입니다|이에요|예요|이다|\s*(?:측)?(?:으?로)\s*(?:확인됩니다|확인됐습니다|확인되었습니다|파악됩니다)|"
+              r"\s*(?:측)?\s*(?:과|와)\s*(?:교신|연락)(?:했|하였)습니다)?[.!?。]?$")
 HEADER_IDENTITY = re.compile(
-    rf"(?P<role>{HEADER_ROLE})(?:[은는이가]\s*|\s*[:：]\s*)"
-    r"(?P<name>[^!?。;\n]+?)(?:입니다|이에요|예요|이다)?[.!?。]?$", re.I,
+    rf"(?P<role>{HEADER_ROLE})\s*(?:[은는이가]\s*|[:：]\s*)(?P<name>{HEADER_NAME}){HEADER_END}", re.I,
 )
 HEADER_IDENTITY_REVERSED = re.compile(
-    rf"^(?P<name>[^!?。;\n]+?)[은는이가]\s*(?P<role>{HEADER_ROLE})(?:입니다|이에요|예요|이다)[.!?。]?$", re.I,
+    rf"^(?P<name>{HEADER_NAME})[은는이가]\s*(?P<role>{HEADER_ROLE}){HEADER_END}", re.I,
+)
+HEADER_CORRESPONDENCE = re.compile(
+    rf"^(?:(?:메일|이메일)로\s+)?(?P<name>{HEADER_NAME})\s*(?:측)?\s*(?:과|와)\s*(?:교신|연락)(?:했|하였)습니다[.!?。]?$",
+    re.I,
+)
+HEADER_TOKEN = re.compile(r"[a-z0-9_+.-]+@[a-z0-9-]+(?:\.[a-z0-9-]+)+|[a-z0-9가-힣]+(?:[._-][a-z0-9가-힣]+)*", re.I)
+HEADER_GENERIC = frozenset((
+    "업체", "업체명", "회사", "공급사", "제조사", "벤더", "담당자", "확인", "교신", "연락", "메일", "이메일", "관련",
+    "발신자", "수신자", "제목", "첨부명", "첨부파일명", "상대방", "주소", "도메인", "vendor", "supplier", "maker", "email",
+))
+HEADER_DATE = re.compile(
+    r"(?<!\d)(?:(?P<year>\d{4})[-./](?P<month>\d{1,2})[-./](?P<day>\d{1,2})(?!\d)|"
+    r"(?:(?P<ko_year>\d{4})\s*년\s*)?(?P<ko_month>\d{1,2})\s*월\s*(?P<ko_day>\d{1,2})\s*일)"
+)
+HEADER_SENT_ONLY = re.compile(
+    r"^(?:(?:이\s*메일(?:의)?\s*)?(?:발송일(?:자)?|발송\s*(?:날짜|시각)|보낸\s*(?:날(?:짜)?|시각))\s*[은는이가:]?\s*"
+    r"@DATE@(?:(?:T|\s+)(?P<clock>\d{1,2}:\d{2}(?::\d{2})?(?:Z|[+-]\d{2}:\d{2})?))?\s*(?:입니다|였습니다|이다)?"
+    r"|@DATE@\s*에?\s*(?:메일을?\s*)?(?:보냈|발송했|발송됐|송부했)습니다)[.!?。]?$"
 )
 
 
@@ -1499,30 +1519,61 @@ def supports_synthesis(text, quotes, rows, metadata):
     return len(used) >= 2
 
 
+def header_dates_match(dates, sent):
+    actual = re.match(r"(\d{4})-(\d\d)-(\d\d)", sent)
+    if not actual:
+        return False
+    year, month, day = map(int, actual.groups())
+    for date in dates:
+        if date["year"]:
+            expected_year, expected_month, expected_day = date.groups()[:3]
+        else:
+            expected_year, expected_month, expected_day = date.groups()[3:]
+        if (expected_year and int(expected_year) != year) or (int(expected_month), int(expected_day)) != (month, day):
+            return False
+    return True
+
+
 def supports_header_claim(text, headers, numbers, *, business_date, sent_date):
-    if APPROVED.search(text) or CANCELLED.search(text) or STATE.search(text) or UNSETTLED.search(text):
+    if business_date or any(pattern.search(text) for pattern in (BUSINESS_QUESTION, APPROVED, CANCELLED, STATE, UNSETTLED)):
         return False
-    if sent_date and MAIL_SENT_FACT.search(text) and not BUSINESS_QUESTION.search(text):
-        return bool(numbers) and any("sent" in quoted and numbers <= number_values(source_metadata(row)["sent"])
-                                     for quoted, row in headers)
-    if business_date or BUSINESS_QUESTION.search(text) or fact_values(text):
+    dates = list(HEADER_DATE.finditer(text)) if MAIL_SENT_FACT.search(text) else []
+    date_hint = HEADER_DATE.sub("@DATE@", text) if dates else text
+    if fact_values(date_hint):
         return False
-    identity = HEADER_IDENTITY.search(text) or HEADER_IDENTITY_REVERSED.fullmatch(text)
-    if not identity:
+    sent_only = HEADER_SENT_ONLY.fullmatch(date_hint) if dates and sent_date else None
+    identity = HEADER_IDENTITY.search(text) or HEADER_IDENTITY_REVERSED.fullmatch(text) or HEADER_CORRESPONDENCE.fullmatch(text)
+    fields = HEADER_ROLES.get(identity.groupdict().get("role") if identity else None,
+                              ("sender", "recipient", "subject", "attachment"))
+    name = identity["name"] if identity else ""
+    tokens = [token for token in HEADER_TOKEN.findall(name.casefold())
+              if len(token) >= 2 and any(char.isalpha() for char in token) and token not in HEADER_GENERIC]
+    if not sent_only and not tokens:
         return False
-    name = compact_space(identity["name"].strip(" \"'“”‘’"))
-    if not name:
-        return False
-    named = re.compile(r"(?<![\w-])" + re.escape(name) + r"(?![\w-])", re.I)
-    fields = HEADER_ROLES.get(identity["role"], ("sender", "recipient", "subject", "attachment"))
+    # Match the named party, not just project words elsewhere in the claim. Match each
+    # name and address given together so a valid email cannot vouch for an invented name.
+    stated = {number.lstrip("0") or "0" for number in numbers}
     for quoted, row in headers:
-        # The claimed name and project number must refer to the same cited mail.
+        context = source_metadata(row)
+        sent = context.get("sent", "")
+        if dates and not header_dates_match(dates, sent):
+            continue
+        if sent_only:
+            clock = sent_only["clock"]
+            if "sent" in quoted and (clock is None or sent[11:].startswith(clock)):
+                return True
+            continue
         if not quoted.intersection(fields):
             continue
-        context = source_metadata(row)
-        if (numbers <= number_values(" ".join(context.get(field, "")
-                                              for field in ("subject", "attachment", "sender", "recipient")))
-                and any(named.search(compact_space(context.get(field, ""))) for field in fields)):
+        available = number_values(" ".join(context.get(field, "") for _, field in MAIL_HEADERS))
+        if not stated <= {number.lstrip("0") or "0" for number in available}:
+            continue
+        values = set(HEADER_TOKEN.findall(" ".join(context.get(field, "") for field in fields).casefold()))
+        for address in tuple(values):
+            if "@" in address:
+                domain = address.split("@", 1)[1]
+                values.update((domain, domain.split(".", 1)[0]))
+        if all(token in values for token in tokens):
             return True
     return False
 
@@ -1530,7 +1581,7 @@ def supports_header_claim(text, headers, numbers, *, business_date, sent_date):
 def validate(result, candidates, question="", *, text_for=source_text, pcf=False, claim_limit=5, text_limit=440,
              complete=True):
     business_date = BUSINESS_QUESTION.search(question)
-    sent_date = re.search(r"발송일|발송\s*(?:시각|날짜)|(?:메일|회신)(?:이|을)?\s*언제\s*(?:보냈|왔)", question)
+    sent_date = (MAIL_SENT_FACT.search(question) or re.search(r"(?:메일|회신)(?:이|을)?\s*언제|최신\s*(?:회신|메일)", question))
     metadata = not pcf and text_for is source_text
     if not pcf:
         conflict = conflicting_decisions(question, candidates)
