@@ -29,13 +29,14 @@ from .answer import (ANSWER_CLAIM_LIMIT, ANSWER_EVIDENCE_LIMIT, ANSWER_TEXT_LIMI
                      answer_groups, answer_plan, combine_answer_evidence, dedupe_by_content, delivery_date_answer, evidence_for,
                      follow_up_evidence, follow_up_replies, follow_up_reply_sender,
                      map_citations, merge_rows, pcf_candidates, pcf_retrieval, pcf_word, public_row,
-                     report_unconfirmed_aspects, rewritten_evidence, source_text, supplemental_evidence, validate)
+                     report_unconfirmed_aspects, rewritten_evidence, source_text, supplemental_evidence, validate,
+                     validate_markdown_answer)
 from .api_settings import ApiSettings, write_api_settings
 from .embedding import (CA_FILE_ENV, GatewayTLSOptions, MODEL as BGE_MODEL, PATH as EMBEDDING_PATH,
                         gateway_origin, logger as gateway_logger)
 from .external import (
     DEFAULT_MODEL, DEFAULT_URL, MAX_EXCERPTS, MAX_GATEWAY_EXCERPTS, MAX_INTERNAL_EXCERPTS,
-    MAX_PCF_CELLS, ExternalAI, ExternalRequestError, Reviews, pack_excerpts, pcf_batches, pcf_input_fits,
+    MAX_PCF_CELLS, ExternalAI, ExternalRequestError, Reviews, compact_json, pack_excerpts, pcf_batches, pcf_input_fits,
 )
 from .extract import MAX_ATTACHMENT
 from .filesystem import local_path, source_path
@@ -887,7 +888,7 @@ class Handler(BaseHTTPRequestHandler):
             store, ai, question, filters, f"{follow_up} {context}".strip()[:450], evidence, mode, query_count,
             ceiling=32 if budget else 9, expand=bool(budget),
             review_slots=None if budget else MAX_EXCERPTS, allow_intranet_evidence=external.intranet,
-            check=check, worker_check=worker_check, allow_rerank=worker_check is None,
+            check=check, worker_check=worker_check, allow_rerank=worker_check is None, expand_targets=worker_check is not None,
         )
         return evidence, filters, aspects, follow_up
 
@@ -960,7 +961,7 @@ class Handler(BaseHTTPRequestHandler):
                               *, stream):
         sessions = self.server.answer_sessions
         session_id, handle, turns = sessions.begin(conversation)
-        evidence, scope, aspects, follow_up = self.retrieve_external_evidence(
+        evidence, scope, aspects, _ = self.retrieve_external_evidence(
             question, context, filters, external, budget, budget, turns=turns,
             check=check, worker_check=worker_check,
             on_rerank=lambda count, remote: stage(
@@ -968,18 +969,22 @@ class Handler(BaseHTTPRequestHandler):
             ),
         )
         check()
-        previous = next((turn[0] for turn in reversed(turns) if turn[2]), "") if follow_up else ""
-        model_question = f"{question}\n이전 질문: {previous[:250]}" if previous else question
         with self.server.store.measure("context"):
-            excerpts = pack_excerpts(model_question, evidence, budget, with_context=True,
+            history = self.intranet_history(turns, scope, budget)
+            history_bytes = len(compact_json(history).encode("utf-8")) if history else 0
+            excerpts = pack_excerpts(question, evidence, budget - history_bytes, with_context=True,
                                      chars=external.review_chars, max_excerpts=MAX_GATEWAY_EXCERPTS, gap_aspects=aspects)
         if not excerpts:
-            result = report_unconfirmed_aspects({"status": "insufficient", "claims": []}, aspects)
+            result = validate_markdown_answer("", (), gap_aspects=aspects)
             result.update(results=[], provider="intranet")
         else:
-            status, result = self.generate_external_answer(
-                external, question, excerpts, scope, gap_aspects=aspects, provider="intranet", model_question=model_question,
-                check=check, on_generate=lambda: stage(
+            def delta(text):
+                check()
+                self.send_answer_event("delta", {"text": text})
+
+            status, result = self.generate_intranet_markdown(
+                external, question, excerpts, scope, history=history, gap_aspects=aspects,
+                check=check, on_delta=delta if stream else None, on_generate=lambda: stage(
                     "generating", "사내 AI가 답변을 작성 중입니다...", evidence=len(excerpts),
                 ),
             )
@@ -991,6 +996,50 @@ class Handler(BaseHTTPRequestHandler):
             self.send_answer_event("complete", result)
         sessions.record(session_id, handle, question, result)
         return 200, result
+
+    def intranet_history(self, turns, scope, budget):
+        ids = list(dict.fromkeys(pid for turn in turns for pid in turn[2]))
+        visible = {row["passage"] for row in self.server.store.passages(ids, scope)} if ids else set()
+        history = []
+        for question, _, citations, summary in reversed(turns[-3:]):
+            if not summary or not visible.issuperset(citations):
+                continue
+            pair = [{"role": "user", "content": question}, {"role": "assistant", "content": summary}]
+            if len(compact_json([*pair, *history]).encode("utf-8")) > budget // 4:
+                break
+            history[:0] = pair
+        return history
+
+    def generate_intranet_markdown(self, external, question, excerpts, scope, *, history, gap_aspects,
+                                   check, on_delta, on_generate):
+        store = self.server.store
+        ids = [item.passage for item in excerpts]
+        windows = {item.passage for item in excerpts if item.window_start is not None}
+
+        def verified_excerpts():
+            rows = {row["passage"]: row for row in store.passages(ids, scope, windows=windows)}
+            if all(item.passage in rows and item.original_in(rows[item.passage]) for item in excerpts):
+                return [rows[pid] for pid in ids]
+            return []
+
+        if not verified_excerpts():
+            return 409, {"error": "external_source_changed"}
+        check()
+        on_generate()
+        try:
+            with store.measure("generation"):
+                markdown = external.answer_markdown(question, excerpts, history=history, gap_aspects=gap_aspects,
+                                                    on_delta=on_delta)
+        except (OSError, ValueError, RuntimeError, KeyError, IndexError, TypeError, http.client.HTTPException) as exc:
+            return 200, {"status": "external_unavailable", "format": "markdown", "markdown": "", "sources": [],
+                         "claims": [], "results": [], "provider": "intranet", "reason": type(exc).__name__}
+        check()
+        with store.measure("validation"):
+            rows = verified_excerpts()
+            if not rows:
+                return 409, {"error": "external_source_changed"}
+            result = validate_markdown_answer(markdown, excerpts, question=question, rows=rows, gap_aspects=gap_aspects)
+        return 200, {**result, "results": [public_row(row) for row in rows], "provider": "intranet"}
 
     def start_answer_stream(self):
         self.close_connection = True
