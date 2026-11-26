@@ -25,7 +25,7 @@ from pathlib import Path, PureWindowsPath
 from types import SimpleNamespace
 
 from mailsearch.api_settings import ApiSettings, user_dpapi
-from mailsearch.answer import (QUERY_EMBEDDING_TIMEOUT, QUERY_REWRITE_TIMEOUT, AnswerSessions, LocalAI,
+from mailsearch.answer import (QUERY_EMBEDDING_TIMEOUT, QUERY_REWRITE_TIMEOUT, AnswerSessions, LocalAI, LocalModelHTTPError,
                                answer_groups, answer_plan, combine_answer_evidence, dedupe_by_content, delivery_date_answer,
                                evidence_for, latest_thread_decisions, needs_recency_boost, parse_evidence_gap, parse_rewrite,
                                reciprocal_rank, report_unconfirmed_aspects, rewritten_evidence,
@@ -35,7 +35,7 @@ from mailsearch.external import ExternalAI, Excerpt, Reviews, pack_excerpts, pcf
 from mailsearch.extract import convert_legacy, extract_attachment, extract_bytes
 from mailsearch.filesystem import DRIVE_REMOTE, is_unc_share, local_path, source_path
 from mailsearch.intranet import CHAT_PATH, RERANK_PATH, IntranetAI, LOCAL_EMBEDDING
-from mailsearch.indexer import ImportIssue, Indexer, folder_files
+from mailsearch.indexer import ImportIssue, Indexer, embedding_input, folder_files
 from mailsearch.ollama_setup import (InstallCommandError, install_ollama, package_progress,
                                     pull_model, run_install_command, winget_binary)
 from mailsearch.outlook import OutlookError, OutlookStore
@@ -2073,6 +2073,33 @@ class Integration(unittest.TestCase):
             self.assertEqual(ai.embed_local("embed", ["query"]), vector)
             self.assertEqual(model.call_count, 2)
 
+    def test_ollama_http_500_invalidates_readiness_and_relaunches_the_owned_process(self):
+        ai = LocalAI("", "embed")
+        crashed = MagicMock()
+        crashed.poll.return_value = 1
+        relaunched = MagicMock()
+        relaunched.poll.return_value = None
+        ai.server = crashed
+        ai.embed_ready = {"embed": ("embed:latest", time.monotonic() + 30)}
+        with patch("mailsearch.answer.http.client.HTTPConnection") as connection:
+            response = connection.return_value.getresponse.return_value
+            response.status = 500
+            with self.assertRaises(LocalModelHTTPError) as raised:
+                ai.embed_local("embed", ["text"])
+            self.assertEqual(raised.exception.status, 500)
+            response.read.assert_not_called()
+            self.assertFalse(ai.embed_ready)
+            self.assertIsNone(ai.server)
+        with (patch.object(ai, "ollama_models", side_effect=[ConnectionRefusedError(), []]),
+              patch.object(ai, "ensure_model", return_value="embed:latest"),
+              patch.object(ai, "call", return_value={"embeddings": [[1., .05, .12]]}),
+              patch("mailsearch.answer.ollama_binary", return_value="ollama"),
+              patch("mailsearch.answer.subprocess.Popen", return_value=relaunched) as launch):
+            self.assertEqual(ai.embed_local("embed", ["text"]), [[1., .05, .12]])
+        launch.assert_called_once()
+        self.assertIs(ai.server, relaunched)
+        crashed.terminate.assert_not_called()
+
     def test_answer_expands_thread_and_delivers_sources_in_chronological_order(self):
         folder = Path(self.workspace.name) / "thread"
         folder.mkdir()
@@ -2725,6 +2752,7 @@ class Integration(unittest.TestCase):
             if len(sizes) == 2:
                 second_batch.set()
                 release.wait(timeout=8)
+            if 2 <= len(sizes) <= 6:
                 error = ConnectionAbortedError("private diagnostic text")
                 error.winerror = 10053
                 raise error
@@ -2732,6 +2760,7 @@ class Integration(unittest.TestCase):
 
         with (patch.object(self.indexer, "export", return_value=extracted),
               patch.object(self.ai, "embed", side_effect=embed),
+              patch("mailsearch.indexer.EMBEDDING_RETRY_DELAY", 0),
               self.assertLogs("mailsearch.gateway", level="ERROR") as logs):
             status, result = self.call("/api/sources", {"path": str(target)})
             self.assertEqual(status, 202)
@@ -2761,7 +2790,7 @@ class Integration(unittest.TestCase):
             row = await_source(self.store, source, {"ready", "error"})
             self.assertEqual((row["state"], row["issue"], row["embedding_done"], row["embedding_total"]),
                              ("ready", None, 30, 30))
-            self.assertEqual(sizes, [24, 6, 6])
+            self.assertEqual(sizes, [24, 6, 3, 1, 1, 1, 6])
             self.ai.configure_embedding("another-model", None)
             status, result = self.call("/api/sources?scan=0")
             self.assertEqual(status, 200)
@@ -3040,6 +3069,115 @@ class Integration(unittest.TestCase):
         self.assertEqual((row["state"], row["issue"], row["embedding_done"], row["embedding_total"]),
                          ("ready", None, 37, 37))
         self.assertEqual(requests, [(size, 50) for size in (32, 16, 8, 8, 8, 8, 5)])
+
+    def test_ollama_http_500_halves_the_batch_then_recovers_after_ten_successes(self):
+        folder = self.mail / "split-and-grow"
+        folder.mkdir()
+        for idx in range(144):
+            (folder / f"{idx:03}.txt").write_text(f"Searchable inspection material number {idx}.")
+        sizes = []
+
+        def embed(texts, timeout):
+            sizes.append(len(texts))
+            if len(sizes) == 1:
+                raise LocalModelHTTPError(500)
+            return [[1., .05, .12] for _ in texts]
+
+        with (patch.object(self.ai, "embed", side_effect=embed),
+              patch("mailsearch.indexer.EMBEDDING_RETRY_DELAY", 0),
+              self.assertLogs("mailsearch.gateway", "WARNING") as logs):
+            source = self.indexer.register(folder)
+            row = await_source(self.store, source, {"ready", "error"})
+        self.assertEqual((row["state"], row["issue"], row["embedding_done"]), ("ready", None, 144))
+        self.assertEqual(sizes, [24, *([12] * 10), 24])
+        self.assertIn("next_batch=12): Ollama HTTP 500", logs.output[0])
+
+    def test_rejected_passage_is_shortened_once_then_skipped_without_counting_as_vector(self):
+        folder = self.mail / "poison"
+        folder.mkdir()
+        needle = "PoisonNeedleMaybe"
+        original = needle + "  " + "long payload " * 60
+        (folder / "00.txt").write_text(original)
+        for idx in range(1, 24):
+            (folder / f"{idx:02}.txt").write_text(f"Embeddable and searchable inspection material number {idx}.")
+        rejected = []
+
+        def embed(texts, timeout):
+            poison = next((text for text in texts if needle in text), None)
+            if poison:
+                rejected.append((len(texts), len(poison)))
+                raise LocalModelHTTPError(400)
+            return [[1., .05, .12] for _ in texts]
+
+        with (patch.object(self.ai, "embed", side_effect=embed),
+              self.assertLogs("mailsearch.runtime", "WARNING") as logs):
+            source = self.indexer.register(folder)
+            row = await_source(self.store, source, {"ready", "error"})
+        self.assertEqual((row["state"], row["issue"], row["embedding_done"], row["embedding_total"]),
+                         ("ready", "embedding_partial", 24, 24))
+        self.assertEqual([size for size, _ in rejected], [24, 12, 6, 3, 1, 1])
+        self.assertGreater(rejected[-2][1], 500)
+        self.assertEqual(rejected[-1][1], 500)
+        self.assertEqual(len(logs.output), 1)
+        self.assertIn("reason=Ollama HTTP 400", logs.output[0])
+        self.assertNotIn(needle, logs.output[0])
+        with self.store.connection() as conn:
+            self.assertEqual(conn.execute("SELECT count(*) FROM embedding_skips").fetchone()[0], 1)
+            self.assertEqual(conn.execute("SELECT count(*) FROM searchable_vectors").fetchone()[0], 23)
+        hit = self.store.lexical(needle, {"source": source})[0]
+        self.assertEqual(hit["text"], original.strip())
+
+    def test_embedding_retries_temporary_disconnect_with_backoff(self):
+        folder = self.mail / "temporarily-offline"
+        folder.mkdir()
+        for idx in range(4):
+            (folder / f"{idx}.txt").write_text(f"Sample searchable document number {idx}.")
+        attempts = []
+
+        def embed(texts, timeout):
+            attempts.append((len(texts), time.monotonic()))
+            if len(attempts) == 1:
+                raise http.client.RemoteDisconnected("private diagnostic text")
+            return [[1., .05, .12] for _ in texts]
+
+        with (patch.object(self.ai, "embed", side_effect=embed),
+              patch("mailsearch.indexer.EMBEDDING_RETRY_DELAY", .05),
+              self.assertLogs("mailsearch.gateway", "WARNING") as logs):
+            source = self.indexer.register(folder)
+            row = await_source(self.store, source, {"ready", "error"})
+        self.assertEqual((row["state"], row["issue"], row["embedding_done"]), ("ready", None, 4))
+        self.assertEqual([size for size, _ in attempts], [4, 2, 2])
+        self.assertGreaterEqual(attempts[1][1] - attempts[0][1], .05)
+        self.assertIn("RemoteDisconnected", logs.output[0])
+        self.assertNotIn("private diagnostic text", logs.output[0])
+
+    def test_ollama_model_discovery_http_error_stops_without_skipping_passages(self):
+        folder = self.mail / "discovery-outage"
+        folder.mkdir()
+        (folder / "sample.txt").write_text("Model discovery failed before sending this document.")
+        with (patch.object(self.ai, "ensure_server"),
+              patch.object(self.ai, "ensure_model", side_effect=LocalModelHTTPError(500)) as probe,
+              patch.object(self.ai, "call") as call, self.assertLogs("mailsearch.gateway", "ERROR") as logs):
+            source = self.indexer.register(folder)
+            row = await_source(self.store, source, {"ready", "error"})
+        self.assertEqual((row["state"], row["issue"], row["embedding_done"], row["embedding_total"]),
+                         ("ready", "embedding_unavailable", 0, 1))
+        probe.assert_called_once()
+        call.assert_not_called()
+        self.assertIn("Ollama HTTP 500 (model discovery)", logs.output[0])
+        with self.store.connection() as conn:
+            self.assertIsNone(conn.execute("SELECT 1 FROM embedding_skips").fetchone())
+
+    def test_embedding_input_sanitizes_a_copy_and_enforces_the_character_limit(self):
+        row = {"id": 7, "embedding_key": b"digest", "name": "A\ud800\x00.txt", "location": "본문",
+               "text": "keep\x07  \n\t this\udfff then " + "길" * 2500}
+        original = row.copy()
+        digest, document = embedding_input(row)
+        self.assertEqual(len(digest), 32)
+        self.assertEqual(len(document), 2400)
+        self.assertTrue(document.startswith("[A.txt | 본문]\nkeep this then "))
+        document.encode("utf-8")
+        self.assertEqual(row, original)
 
     def test_gateway_defaults_to_64_and_accepts_128_with_half_size_retry(self):
         gateway = IntranetAI("test-key", {"answer": "", "embedding": "bge-m3", "rerank": ""})
