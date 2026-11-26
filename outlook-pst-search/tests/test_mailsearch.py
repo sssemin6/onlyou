@@ -2878,6 +2878,65 @@ class Integration(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertIn({"item": "invalid.pst", "code": "pst_invalid"}, result["sources"][0]["problems"])
 
+    def test_source_status_breaks_down_current_revision_omissions_and_partial_reasons(self):
+        with self.store.connection() as conn:
+            source = conn.execute(
+                "INSERT INTO sources(path,kind,active,pending,omitted,partial) VALUES(?,'eml_dir',1,2,29,9)",
+                (str(self.mail),),
+            ).lastrowid
+            conn.executemany("INSERT INTO problems VALUES(?,?,?,?)", [
+                (source, 1, "retired.pst", "pst_in_use"),
+                (source, 1, "retired.eml", "parse"),
+                *[(source, 2, f"folder/{idx:02}.pst", "pst_in_use") for idx in range(23)],
+                (source, 2, "denied.pst", "pst_access_denied"),
+                (source, 2, "not-a-doc.exe", "미지원 형식"),
+                (source, 2, "lost.eml", "parse"),
+                (source, 2, "changed-and-missing.eml", "mail_original_changed"),
+                (source, 2, "still-searchable.eml", "mail_original_changed"),
+                (source, 2, "broken.xlsx", "추출 실패 또는 암호화"),
+            ])
+            mail = dict(folder="/", subject="Indexed mail", sender="", recipient="", sent="", message_id="",
+                        reply_ids="", body="Searchable mail body.", attachments=[
+                            (name, None) for name in ("one.pdf", "two.pdf", "changed.pdf", "partial.pdf", "empty.pdf", "ignored.exe")
+                        ])
+            mail_id = self.store.add_mail(conn, source, 2, "still-searchable.eml", mail)
+            for name, state in (("one.pdf", "추출 실패 또는 암호화"), ("two.pdf", "추출 실패 또는 암호화"),
+                                ("changed.pdf", "원본 변경"), ("partial.pdf", "일부 색인 · OCR 1/2쪽"),
+                                ("empty.pdf", "일부 색인 · OCR 0/1쪽")):
+                attachment, = conn.execute("SELECT id FROM attachments WHERE mail=? AND name=?", (mail_id, name)).fetchone()
+                conn.execute("UPDATE attachments SET status=? WHERE id=?", (state, attachment))
+                if name == "partial.pdf":
+                    self.store.add_passage(conn, mail_id, mail, attachment, name, "1페이지", 0, "Extracted partial text.")
+            for idx in range(7):
+                self.store.add_document(conn, source, 2, f"partial{idx}.pdf", {
+                    "name": f"partial{idx}.pdf", "folder": "/", "sent": "", "status": f"일부 색인 · OCR {idx}/7쪽",
+                    "sections": [("1페이지", f"Partial document {idx}.")],
+                })
+            self.store.add_document(conn, source, 2, "legacy.pdf", {
+                "name": "legacy.pdf", "folder": "/", "sent": "", "status": "텍스트 없음", "sections": [],
+            })
+
+        saved, = self.store.sources()
+        self.assertEqual((saved["omitted"], saved["partial"]), (29, 9))
+        self.assertEqual(saved["omitted_by_kind"], {"mail": 2, "attachment": 4, "document": 2, "pst": 24})
+        self.assertEqual(saved["partial_by_kind"], {"attachment": 1, "document": 7})
+        reasons = saved["omitted_reasons"]
+        self.assertEqual(len(reasons), 8)
+        self.assertEqual(reasons[:2], [
+            {"kind": "pst", "reason": "pst_in_use", "count": 23},
+            {"kind": "attachment", "reason": "추출 실패 또는 암호화", "count": 2},
+        ])
+        self.assertIn({"kind": "mail", "reason": "mail_original_changed", "count": 1}, reasons)
+        self.assertIn({"kind": "attachment", "reason": "원본 변경", "count": 1}, reasons)
+        self.assertEqual(len(saved["partial_reasons"]), 6)
+        self.assertIn({"kind": "attachment", "reason": "일부 색인 · OCR 1/2쪽", "count": 1}, saved["partial_reasons"])
+        self.assertEqual(saved["deferred_psts"], 23)
+        self.assertEqual(saved["deferred_pst_names"], [f"{idx:02}.pst" for idx in range(20)])
+        status, payload = self.call("/api/sources?scan=0")
+        self.assertEqual(status, 200)
+        for field in ("omitted_by_kind", "partial_by_kind", "omitted_reasons", "partial_reasons", "deferred_pst_names", "problems"):
+            self.assertEqual(payload["sources"][0][field], saved[field])
+
     def test_folder_scan_prunes_ignored_trees_and_counts_only_supported_failures(self):
         folder = self.mail / "scoped-scan"
         folder.mkdir()
