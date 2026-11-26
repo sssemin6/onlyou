@@ -123,6 +123,11 @@ CREATE TABLE IF NOT EXISTS embedding_refs (
 ) WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS embedding_ref_passage ON embedding_refs(passage);
 CREATE INDEX IF NOT EXISTS embedding_ref_value ON embedding_refs(model,digest);
+CREATE TABLE IF NOT EXISTS embedding_skips (
+    model TEXT NOT NULL, passage INTEGER NOT NULL REFERENCES passages(id) ON DELETE CASCADE,
+    PRIMARY KEY(model,passage)
+) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS embedding_skip_passage ON embedding_skips(passage);
 CREATE TRIGGER IF NOT EXISTS embedding_ref_remove AFTER DELETE ON embedding_refs BEGIN
     DELETE FROM embedding_values WHERE model=old.model AND digest=old.digest
       AND NOT EXISTS(SELECT 1 FROM embedding_refs r WHERE r.model=old.model AND r.digest=old.digest);
