@@ -29,7 +29,7 @@ from .answer import (ANSWER_CLAIM_LIMIT, ANSWER_EVIDENCE_LIMIT, ANSWER_TEXT_LIMI
                      answer_groups, answer_plan, combine_answer_evidence, dedupe_by_content, delivery_date_answer, evidence_for,
                      follow_up_evidence, follow_up_replies, follow_up_reply_sender,
                      map_citations, merge_rows, pcf_candidates, pcf_retrieval, pcf_word, public_row,
-                     report_unconfirmed_aspects, rewritten_evidence, supplemental_evidence, validate)
+                     report_unconfirmed_aspects, rewritten_evidence, source_text, supplemental_evidence, validate)
 from .api_settings import ApiSettings, write_api_settings
 from .embedding import (CA_FILE_ENV, GatewayTLSOptions, MODEL as BGE_MODEL, PATH as EMBEDDING_PATH,
                         gateway_origin, logger as gateway_logger)
@@ -797,6 +797,7 @@ class Handler(BaseHTTPRequestHandler):
                 token, review = self.server.reviews.create(
                     query, evidence, external.review_generation, pcf=pcf, internal_budget=internal_budget,
                     review_budget=budget, review_chars=chars, filters=filters, gap_aspects=gap_aspects,
+                    include_gap_aspects=external.intranet and not pcf,
                     max_excerpts=MAX_GATEWAY_EXCERPTS if external.intranet and not pcf else MAX_INTERNAL_EXCERPTS,
                 )
             by_passage = {row["passage"]: public_row(row) for row in evidence}
@@ -852,7 +853,7 @@ class Handler(BaseHTTPRequestHandler):
             )
             with server.store.measure("context"):
                 excerpts = pack_excerpts(question, evidence, budget, with_context=True,
-                                         chars=external.review_chars, max_excerpts=MAX_GATEWAY_EXCERPTS)
+                                         chars=external.review_chars, max_excerpts=MAX_GATEWAY_EXCERPTS, gap_aspects=aspects)
             if not excerpts:
                 result = report_unconfirmed_aspects({"status": "insufficient", "claims": []}, aspects)
                 return 200, {**result, "results": [], "provider": "intranet"}
@@ -1226,6 +1227,8 @@ class Handler(BaseHTTPRequestHandler):
             with store.measure("generation"):
                 if pcf:
                     result = external.answer(question, excerpts, instructions=PCF_INSTRUCTIONS, token_limit=2800, timeout=90)
+                elif external.intranet and gap_aspects:
+                    result = external.answer(question, excerpts, gap_aspects=gap_aspects)
                 else:
                     result = external.answer(question, excerpts)
         except (OSError, ValueError, RuntimeError, KeyError, IndexError, TypeError, http.client.HTTPException) as exc:
@@ -1234,10 +1237,11 @@ class Handler(BaseHTTPRequestHandler):
         visible = {row["passage"]: row for row in store.passages(ids, scope, windows=windows)}
         verified = [{**visible[item.passage], "text": item.text,
                      "start": visible[item.passage]["start"] + item.start,
-                     "reviewed_sender": (item.context or {}).get("sender", "")}
+                     "reviewed_context": item.context or {}}
                     for item in excerpts if item.passage in visible and item.original_in(visible[item.passage])]
         with store.measure("validation"):
-            checked = validate(result, verified, question, text_for=lambda row: row["text"], pcf=pcf)
+            text_for = source_text if not pcf and any(row["reviewed_context"] for row in verified) else lambda row: row["text"]
+            checked = validate(result, verified, question, text_for=text_for, pcf=pcf)
         checked = report_unconfirmed_aspects(checked, gap_aspects)
         return 200, {**checked, "results": [public_row(row) for row in verified], "provider": provider}
 
