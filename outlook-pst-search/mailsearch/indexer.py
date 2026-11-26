@@ -12,10 +12,13 @@ import subprocess
 import tempfile
 import threading
 import time
+from fnmatch import fnmatchcase
 from pathlib import Path
 
-from .embedding import GatewayRequestError, logger
-from .extract import CREATE_FLAGS, DOCUMENT_SUFFIXES, MAX_ATTACHMENT, extract_attachment, extract_document, parse_mail
+from .embedding import EmbeddingAPI, GatewayRequestError, logger
+from .extract import (CREATE_FLAGS, DOCUMENT_SUFFIXES, LEGACY_CONVERTER_MISSING, MAX_ATTACHMENT,
+                      PDF_EXTRACTOR_MISSING, UNSUPPORTED_FORMAT, extract_attachment, extract_document,
+                      office_binary, optional_reader, parse_mail)
 from .filesystem import local_path, source_path, stable_input
 from .outlook import DEFAULT_OUTLOOK, OutlookError, outlook_modules, outlook_store
 from .pcf import WORD_SUFFIXES
@@ -25,11 +28,19 @@ from .vector_index import prune_vector_files
 
 
 NO_MAIL = {"pst_no_mail", "eml_no_mail"}
-PST_DEFERRED = ("pst_in_use", "pst_changed")
+PST_DEFERRED = ("pst_in_use", "pst_changed", "pst_access_denied")
 PST_PROGRESS_INTERVAL = 5
 EMBEDDING_BATCH_SIZE = 24
+GATEWAY_EMBEDDING_BATCH_SIZE = 64
+MIN_EMBEDDING_BATCH_SIZE = 16
+MAX_EMBEDDING_BATCH_SIZE = 128
 EMBEDDING_BATCH_TIMEOUT = 60
 RETIRED_MAIL_BATCH_SIZE = 64
+IGNORED_DIRECTORIES = frozenset(name.casefold() for name in (
+    ".git", "node_modules", "__pycache__", "$RECYCLE.BIN", "System Volume Information", "AppData",
+    "Program Files", "Program Files (x86)", "Windows", "venv", ".venv",
+))
+EMBEDDING_PASSAGE = "p.location<>'파일명' AND length(p.text)>=15 AND embedding_text_eligible(p.text)"
 runtime_logger = logging.getLogger("mailsearch.runtime")
 
 
@@ -47,6 +58,59 @@ def embedding_input(row):
 
 def pst_access_error(exc):
     return isinstance(exc, PermissionError) or getattr(exc, "winerror", None) in {5, 32, 33, 65, 86, 1326}
+
+
+def pst_access_issue(exc):
+    return "pst_access_denied" if getattr(exc, "winerror", None) in {5, 65, 86, 1326} else "pst_in_use"
+
+
+def folder_files(root, suffixes, *, numbered=False, log_skipped=False):
+    ignore = root / ".mailsearchignore"
+    patterns = []
+    try:
+        with ignore.open(encoding="utf-8-sig") as config:
+            for line in config:
+                value = line.strip().replace("\\", "/").casefold()
+                if value and not value.startswith("#"):
+                    pattern = value.strip("/")
+                    if pattern:
+                        patterns.append((pattern, value.endswith("/"), "/" in pattern or value.startswith("/")))
+    except FileNotFoundError:
+        pass
+    except (OSError, UnicodeError):
+        runtime_logger.warning("Unable to read .mailsearchignore")
+
+    def ignored(relative, directory):
+        name = relative.name.casefold()
+        if directory and name in IGNORED_DIRECTORIES:
+            return True
+        path = relative.as_posix().casefold()
+        return any((not dirs_only or directory) and fnmatchcase(path if anchored else name, pattern)
+                   for pattern, dirs_only, anchored in patterns)
+
+    skipped = 0
+    for current, dirs, files in os.walk(root):
+        parent = Path(current)
+        dirs[:] = sorted(name for name in dirs
+                         if not ignored((parent / name).relative_to(root), True)
+                         and not (parent / name).is_symlink() and not (parent / name).is_junction())
+        for name in sorted(files):
+            path = parent / name
+            suffix = path.suffix.casefold()
+            if suffix not in suffixes and not (numbered and name.isascii() and name.isdecimal()):
+                skipped += suffix != ".pst" and name.casefold() != ".mailsearchignore"
+                continue
+            if ignored(path.relative_to(root), False) or path.is_symlink():
+                continue
+            try:
+                if not path.is_file():
+                    continue
+            except PermissionError:
+                # Let the importer record failures for supported files.
+                pass
+            yield path
+    if log_skipped and skipped:
+        runtime_logger.info("Folder scan skipped %d unsupported files", skipped)
 
 
 def folder_identity(signature):
@@ -80,9 +144,10 @@ class ImportIssue(Exception):
 
 class Indexer:
     def __init__(self, store, readpst="readpst", pdf="pdftotext", ai=None, *,
-                 embedding_batch_size=EMBEDDING_BATCH_SIZE, embedding_batch_timeout=EMBEDDING_BATCH_TIMEOUT):
+                 embedding_batch_size=None, embedding_batch_timeout=EMBEDDING_BATCH_TIMEOUT):
         self.store, self.readpst, self.pdf, self.ai = store, readpst, pdf, ai
-        if not 24 <= embedding_batch_size <= 64 or not 30 <= embedding_batch_timeout <= 60:
+        if ((embedding_batch_size is not None and not MIN_EMBEDDING_BATCH_SIZE <= embedding_batch_size <= MAX_EMBEDDING_BATCH_SIZE)
+                or not 30 <= embedding_batch_timeout <= 60):
             raise ValueError("embedding_batch_settings")
         self.embedding_batch_size = embedding_batch_size
         self.embedding_batch_timeout = embedding_batch_timeout
@@ -157,7 +222,7 @@ class Indexer:
         except OSError as exc:
             winerror = getattr(exc, "winerror", None)
             if winerror in {32, 33} and Path(path).suffix.casefold() == ".pst":
-                raise ImportIssue("pst_in_use") from exc
+                raise ImportIssue(pst_access_issue(exc)) from exc
             if isinstance(exc, PermissionError) or winerror in {65, 86, 1326}:
                 raise ImportIssue("source_access") from exc
             raise ImportIssue("source_path") from exc
@@ -199,7 +264,7 @@ class Indexer:
                     if action == "refresh" and row["state"] == "queued":
                         raise ImportIssue("source_busy")
                     issue = row["issue"]
-                    restart = issue in NO_MAIL | {"mail_parse_failed", "pst_in_use", "pst_changed"}
+                    restart = issue in NO_MAIL or issue == "mail_parse_failed" or issue in PST_DEFERRED
                     if action == "refresh" or restart or (issue == "changed" and row["kind"] != "eml_dir"):
                         self.discard_pending(conn, row)
                         conn.execute(
@@ -427,8 +492,7 @@ class Indexer:
         skipped = {}
         signatures = {}
         deferred = dict(already_deferred)
-        files = sorted(path for path in folder.rglob("*")
-                       if path.suffix.lower() == ".pst")
+        files = sorted(folder_files(folder, {".pst"}))
         for position, pst in enumerate(files, 1):
             self.check(event)
             item = pst.relative_to(folder).as_posix()
@@ -468,7 +532,7 @@ class Indexer:
             except OSError as exc:
                 if not pst_access_error(exc):
                     raise
-                deferred[item] = "pst_in_use"
+                deferred[item] = pst_access_issue(exc)
                 if label in known:
                     carried.append(label)
                     signatures[label] = known[label]
@@ -490,7 +554,7 @@ class Indexer:
             except OSError as exc:
                 if not pst_access_error(exc):
                     raise
-                deferred[item] = "pst_in_use"
+                deferred[item] = pst_access_issue(exc)
                 if label in known:
                     carried.append(label)
                     signatures[label] = known[label]
@@ -706,15 +770,9 @@ class Indexer:
         if root.is_file():
             yield root, root.name, "/"
             return
-        for current, dirs, files in os.walk(root):
-            dirs[:] = sorted(name for name in dirs if not (Path(current) / name).is_symlink())
-            for name in sorted(files):
-                path = Path(current) / name
-                suffix = path.suffix.lower()
-                is_mail = suffix == ".eml" or suffix in DOCUMENT_SUFFIXES or (numbered and name.isascii() and name.isdecimal())
-                if is_mail and not path.is_symlink() and path.is_file():
-                    relative = path.relative_to(root)
-                    yield path, relative.as_posix(), "/" + ("" if relative.parent == Path(".") else relative.parent.as_posix())
+        for path in folder_files(root, DOCUMENT_SUFFIXES | {".eml"}, numbered=numbered, log_skipped=not numbered):
+            relative = path.relative_to(root)
+            yield path, relative.as_posix(), "/" + ("" if relative.parent == Path(".") else relative.parent.as_posix())
 
     def process(self, row, event):
         source, version, previous = row["id"], row["pending"], row["active"]
@@ -736,7 +794,12 @@ class Indexer:
                 raise ImportIssue(str(exc)) from exc
             shutil.rmtree(stage, ignore_errors=True)
             return
-        signature = source_signature(path, kind)
+        try:
+            signature = source_signature(path, kind)
+        except OSError as exc:
+            if kind == "pst" and pst_access_error(exc):
+                raise ImportIssue(pst_access_issue(exc)) from exc
+            raise
         saved = row["signature"]
         if saved and kind == "eml_dir":
             saved = folder_identity(saved)
@@ -767,7 +830,7 @@ class Indexer:
             except OSError as exc:
                 if not pst_access_error(exc):
                     raise
-                raise ImportIssue("pst_in_use") from exc
+                raise ImportIssue(pst_access_issue(exc)) from exc
         else:
             root = path
             if path.is_dir():
@@ -775,7 +838,7 @@ class Indexer:
                 if row["done"]:
                     with self.store.connection() as conn:
                         already_deferred = dict(conn.execute(
-                            "SELECT item,code FROM problems WHERE source=? AND version=? AND code IN (?,?)",
+                            "SELECT item,code FROM problems WHERE source=? AND version=? AND code IN (?,?,?)",
                             (source, version, *PST_DEFERRED),
                         ).fetchall())
                 known = self.store.pst_files(source)
@@ -784,25 +847,11 @@ class Indexer:
                     path, stage, event, known, source, already_deferred, outdated)
                 with self.store.connection() as conn:
                     conn.execute("""DELETE FROM problems WHERE source=? AND version=?
-                                    AND code IN ('pst_in_use','pst_changed','pst_no_mail','pst_export','pst_invalid')""",
+                                    AND code IN ('pst_in_use','pst_access_denied','pst_changed','pst_no_mail','pst_export','pst_invalid')""",
                                  (source, version))
                     conn.executemany("INSERT INTO problems VALUES(?,?,?,?)",
                                      ((source, version, item, code) for item, code in (deferred | skipped_psts).items()))
-                    # The same folder may be scanned again after a restart. Rebuild
-                    # the count from the current PST scan and committed items.
-                    omitted_documents = conn.execute(
-                        "SELECT COUNT(*) FROM problems WHERE source=? AND version=? "
-                        "AND code NOT IN ('parse','pst_in_use','pst_changed','pst_no_mail','pst_export',"
-                        "'pst_invalid','mail_original_changed')", (source, version),
-                    ).fetchone()[0]
-                    omitted_attachments = conn.execute(
-                        "SELECT COUNT(*) FROM attachments a JOIN mails m ON m.id=a.mail "
-                        "WHERE m.source=? AND m.version=? AND m.kind='mail' AND a.status NOT IN ('대기','완료') "
-                        "AND NOT EXISTS(SELECT 1 FROM passages p WHERE p.attachment=a.id AND p.location<>'파일명')",
-                        (source, version),
-                    ).fetchone()[0]
-                    omitted = len(skipped_psts) + len(deferred) + omitted_documents + omitted_attachments
-                    conn.execute("UPDATE sources SET omitted=? WHERE id=?", (omitted, source))
+                    self.update_extraction_counts(conn, source, version)
         self.check(event)
         self.state(source, "headers")
         self.index_headers(root, source, version, event, numbered=is_pst, extras=extras,
@@ -810,14 +859,14 @@ class Indexer:
         self.check(event)
         progress = self.store.source(source)
         if not progress["done"] and deferred and not progress["failed"]:
-            raise ImportIssue("pst_in_use" if "pst_in_use" in deferred.values() else "pst_changed")
+            raise ImportIssue(next(code for code in PST_DEFERRED if code in deferred.values()))
         if not progress["done"] and progress["omitted"] and not is_pst:
             with self.store.connection() as conn:
                 missing_document = conn.execute(
                     """SELECT 1 FROM problems WHERE source=? AND version=? AND code NOT IN
-                       ('parse','pst_in_use','pst_changed','pst_no_mail','pst_export','pst_invalid','mail_original_changed')
+                       ('parse','pst_in_use','pst_access_denied','pst_changed','pst_no_mail','pst_export','pst_invalid','mail_original_changed',?)
                        LIMIT 1""",
-                    (source, version),
+                    (source, version, UNSUPPORTED_FORMAT),
                 ).fetchone()
             if missing_document:
                 raise ImportIssue("document_extract_failed")
@@ -934,6 +983,7 @@ class Indexer:
             signature = outlook.store_id
             with self.store.connection() as conn:
                 old = self.store.mail_identities(conn, source, previous) if row["active_signature"] == signature else {}
+                retry_mails = {attachment["mail"] for attachment in self.retryable_extracts(conn, source, previous)}
                 if row["signature"] and row["signature"] != signature:
                     conn.execute("DELETE FROM mails WHERE source=? AND version=?", (source, version))
                 pending = self.store.mail_identities(conn, source, version)
@@ -950,7 +1000,8 @@ class Indexer:
             self.check(event)
             retained = {entry: old[entry]["id"] for entry, folder in folders.items()
                         if entry in old and old[entry]["folder"] == folder
-                        and old[entry]["fingerprint"].startswith(MAIL_INDEX_PREFIXES)}
+                        and old[entry]["fingerprint"].startswith(MAIL_INDEX_PREFIXES)
+                        and old[entry]["id"] not in retry_mails}
             pending_ids = {entry for entry, item in pending.items()
                            if entry not in retained and folders.get(entry) == item["folder"]}
             with self.store.connection() as conn:
@@ -987,11 +1038,11 @@ class Indexer:
 
             with self.store.connection() as conn:
                 omitted, partial = conn.execute(
-                    """SELECT COALESCE(SUM(a.status NOT IN ('완료','대기') AND NOT EXISTS(
+                    """SELECT COALESCE(SUM(a.status NOT IN ('완료','대기',?) AND NOT EXISTS(
                                SELECT 1 FROM passages p WHERE p.attachment=a.id AND p.location<>'파일명')),0),
                               COALESCE(SUM(a.status LIKE '일부 색인%'),0)
                        FROM mails m JOIN attachments a ON a.mail=m.id WHERE m.source=?
-                       AND (m.version=? OR m.id IN (SELECT id FROM outlook_retained))""", (source, version),
+                       AND (m.version=? OR m.id IN (SELECT id FROM outlook_retained))""", (UNSUPPORTED_FORMAT, source, version),
                 ).fetchone()
                 conn.execute("UPDATE sources SET omitted=?,partial=? WHERE id=? AND pending=?",
                              (omitted, partial, source, version))
@@ -1025,8 +1076,10 @@ class Indexer:
                 return status, locations, key
             return status, locations, None
 
-        entries = conn.execute("SELECT id FROM attachments WHERE mail=? ORDER BY id", (mail_id,)).fetchall()
+        entries = conn.execute("SELECT id,status FROM attachments WHERE mail=? ORDER BY id", (mail_id,)).fetchall()
         for entry, (name, part) in zip(entries, mail["attachments"], strict=True):
+            if entry["status"] == UNSUPPORTED_FORMAT:
+                continue
             self.check(event)
             content_key = None
             try:
@@ -1047,7 +1100,7 @@ class Indexer:
         outdated = self.store.outdated_pst_labels(row["id"], row["active"], known)
         changed = []
         try:
-            files = sorted(item for item in path.rglob("*") if item.suffix.lower() == ".pst")
+            files = sorted(folder_files(path, {".pst"}))
         except OSError:
             return []
         for pst in files:
@@ -1170,6 +1223,8 @@ class Indexer:
             last = 0
             extracted = []
             new_extracts = {}
+            conn.executemany("UPDATE attachments SET status='대기' WHERE id=?",
+                             ((row["id"],) for row in self.retryable_extracts(conn, source, version)))
             total, done = conn.execute(
                 """SELECT COUNT(*),COALESCE(SUM(a.status<>'대기'),0)
                    FROM mails m JOIN attachments a ON a.mail=m.id WHERE m.source=? AND m.version=? AND m.kind='mail'""",
@@ -1207,11 +1262,6 @@ class Indexer:
                                                      attachment["name"], locations, content_key)
                         conn.execute("UPDATE attachments SET status=?,content_key=? WHERE id=?",
                                      (status, content_key, attachment["id"]))
-                    omitted = sum(not locations for _, _, _, locations, _ in extracted)
-                    partial = sum(bool(locations) and status.startswith("일부 색인")
-                                  for _, _, status, locations, _ in extracted)
-                    conn.execute("UPDATE sources SET omitted=omitted+?,partial=partial+? WHERE id=?",
-                                 (omitted, partial, source))
                     done += len(extracted)
                     conn.execute("UPDATE sources SET index_done=? WHERE id=? AND pending=?", (done, source, version))
                 extracted.clear()
@@ -1261,11 +1311,53 @@ class Indexer:
                 last = batch[-1]["id"]
             if extracted:
                 save_extracted()
+            self.update_extraction_counts(conn, source, version)
+
+    @staticmethod
+    def update_extraction_counts(conn, source, version):
+        omitted, partial = conn.execute(
+            """SELECT COALESCE(SUM(m.kind='mail' AND a.status NOT IN ('완료','대기',?) AND NOT EXISTS(
+                   SELECT 1 FROM passages p WHERE p.attachment=a.id AND p.location<>'파일명')),0),
+                      COALESCE(SUM(a.status LIKE '일부 색인%' AND (m.kind<>'mail' OR EXISTS(
+                   SELECT 1 FROM passages p WHERE p.attachment=a.id AND p.location<>'파일명'))),0)
+               FROM mails m JOIN attachments a ON a.mail=m.id WHERE m.source=? AND m.version=?""",
+            (UNSUPPORTED_FORMAT, source, version),
+        ).fetchone()
+        missing_files = conn.execute(
+            "SELECT COUNT(*) FROM problems WHERE source=? AND version=? AND code NOT IN ('parse','mail_original_changed',?)",
+            (source, version, UNSUPPORTED_FORMAT),
+        ).fetchone()[0]
+        conn.execute("UPDATE sources SET omitted=?,partial=? WHERE id=? AND pending=?",
+                     (missing_files + omitted, partial, source, version))
+
+    def retryable_extracts(self, conn, source, version):
+        if version is None:
+            return []
+        candidates = conn.execute(
+            """SELECT a.id,a.mail,a.name,a.status FROM mails m JOIN attachments a ON a.mail=m.id
+               WHERE m.source=? AND m.version=? AND m.kind='mail' AND (
+                    a.status IN (?,?) OR (a.status=? AND lower(substr(a.name,-4)) IN ('.xls','.doc')))""",
+            (source, version, PDF_EXTRACTOR_MISSING, LEGACY_CONVERTER_MISSING, UNSUPPORTED_FORMAT),
+        ).fetchall()
+        if not candidates:
+            return []
+        readers = set()
+        if any(row["status"] == PDF_EXTRACTOR_MISSING for row in candidates):
+            if (self.pdf and shutil.which(self.pdf)) or optional_reader("pypdf", "pymupdf", "fitz"):
+                readers.add(".pdf")
+        if any(row["status"] != PDF_EXTRACTOR_MISSING for row in candidates):
+            if office_binary():
+                readers.update((".doc", ".xls"))
+            elif optional_reader("xlrd"):
+                readers.add(".xls")
+        return [row for row in candidates if Path(row["name"]).suffix.casefold() in readers]
 
     def index_embeddings(self, source, version, event, *, retain=False):
         backend_key = self.ai.embedding_index
         model, legacy_model = contextual_model_keys(backend_key)
-        batch_size = self.embedding_batch_size
+        provider = self.ai.embedding_api
+        gateway = isinstance(provider, EmbeddingAPI) and bool(provider.index_key)
+        batch_size = self.embedding_batch_size or (GATEWAY_EMBEDDING_BATCH_SIZE if gateway else EMBEDDING_BATCH_SIZE)
         timeout = self.embedding_batch_timeout
         scope = "(m.version=? OR m.id IN (SELECT id FROM outlook_retained))" if retain else "m.version=?"
         self.check(event)
@@ -1282,7 +1374,7 @@ class Indexer:
                    FROM mails m JOIN passages p ON p.mail=m.id
                    LEFT JOIN vectors v ON v.passage=p.id AND v.model=?
                    LEFT JOIN embedding_refs r ON r.passage=p.id AND r.model=?
-                   WHERE m.source=? AND {scope}""", (model, model, source, version),
+                   WHERE m.source=? AND {scope} AND {EMBEDDING_PASSAGE}""", (model, model, source, version),
             ).fetchone()
             conn.execute("""UPDATE sources SET state='embeddings',index_stage='embeddings',embedding_done=?,
                             embedding_total=?,embedding_model_key=?
@@ -1296,6 +1388,7 @@ class Indexer:
                     f"""SELECT p.id,p.text,m.subject,m.sender,m.sent,p.location,a.name,p.embedding_key
                        FROM passages p CROSS JOIN mails m ON m.id=p.mail
                        LEFT JOIN attachments a ON a.id=p.attachment WHERE m.source=? AND {scope} AND p.id>?
+                       AND {EMBEDDING_PASSAGE}
                        AND NOT EXISTS(SELECT 1 FROM vectors v WHERE v.passage=p.id AND v.model=?)
                        AND NOT EXISTS(SELECT 1 FROM embedding_refs r WHERE r.passage=p.id AND r.model=?)
                        ORDER BY p.id LIMIT ?""", (source, version, last, model, model, batch_size)
@@ -1328,7 +1421,7 @@ class Indexer:
                 shared.update(zip(inputs, encoded))
             except (OSError, ValueError, RuntimeError, KeyError, TypeError, http.client.HTTPException) as exc:
                 winerror = getattr(exc, "winerror", None)
-                backend = "gateway" if self.ai.embedding_api and self.ai.embedding_api.index_key else "Ollama"
+                backend = "gateway" if gateway else "Ollama"
                 retryable = isinstance(exc, TimeoutError) or (
                     isinstance(exc, GatewayRequestError) and exc.status in {408, 413, 504})
                 if retryable and len(inputs) > 1:
