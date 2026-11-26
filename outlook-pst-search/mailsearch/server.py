@@ -786,7 +786,7 @@ class Handler(BaseHTTPRequestHandler):
             evidence, _ = pcf_retrieval(store, ai, query, filters, context)
             evidence = [row for row in evidence if not pcf_word(row)]
         elif route == "/api/external/preview":
-            evidence, filters, gap_aspects = self.retrieve_external_evidence(
+            evidence, filters, gap_aspects, _ = self.retrieve_external_evidence(
                 query, context, filters, external, budget, internal_budget,
             )
         else:
@@ -811,26 +811,41 @@ class Handler(BaseHTTPRequestHandler):
             return
         self.send_json(200, {"results": [public_row(row) for row in evidence]})
 
-    def retrieve_external_evidence(self, question, context, filters, external, budget, internal_budget):
+    def retrieve_external_evidence(self, question, context, filters, external, budget, internal_budget, *, turns=()):
         store, ai = self.server.store, self.server.ai
         if internal_budget:
             filters = {**filters, "regular_only": True}
         search_text, filters = question_scope(question, filters)
         limit = MAX_GATEWAY_EXCERPTS if external.intranet else MAX_INTERNAL_EXCERPTS
+        with store.measure("context"):
+            follow_up, anchors = follow_up_evidence(store, question, filters, turns)
+            reply_sender = follow_up_reply_sender(question) if turns and filters.get("tab") != "document" else ""
+            if reply_sender:
+                replies = follow_up_replies(store, anchors, filters, reply_sender)
+                return replies, filters, (), follow_up if replies else ""
         options = {"limit": limit if budget else 9, "expand": bool(budget),
-                   "max_evidence": 32 if budget else None, "intent": question}
+                   "max_evidence": 32 if budget else None, "intent": question, "local_context": follow_up}
         rewrite = rewritten_evidence(store, ai, question, filters, context, **options)
         query_count = 1
         if rewrite:
-            evidence, mode, filters, query_count = rewrite
+            evidence, mode, rewritten_filters, query_count = rewrite
+            if anchors and rewritten_filters != filters:
+                with store.measure("context"):
+                    follow_up, anchors = follow_up_evidence(store, question, rewritten_filters, turns)
+            filters = rewritten_filters
         else:
             evidence, mode = evidence_for(store, ai, search_text, filters, context, **options)
+        if anchors:
+            with store.measure("context"):
+                related = store.related(list(dict.fromkeys(row["id"] for row in anchors if row["kind"] == "mail")),
+                                        filters, hops=3, question=question)
+                evidence = combine_answer_evidence([related, evidence], anchors, limit=limit)
         evidence, _, aspects, _ = supplemental_evidence(
-            store, ai, question, filters, context, evidence, mode, query_count,
+            store, ai, question, filters, f"{follow_up} {context}".strip()[:450], evidence, mode, query_count,
             ceiling=32 if budget else 9, expand=bool(budget),
             review_slots=None if budget else MAX_EXCERPTS, allow_intranet_evidence=external.intranet,
         )
-        return evidence, filters, aspects
+        return evidence, filters, aspects, follow_up
 
     def intranet_answer(self, payload):
         question, context, filters = self.question_input(payload)
@@ -838,6 +853,9 @@ class Handler(BaseHTTPRequestHandler):
             return 400, {"error": "question_required"}
         if filters.get("tab") == "pcf":
             return 400, {"error": "pcf_review_required"}
+        conversation = payload.get("conversation", "")
+        if not isinstance(conversation, str) or (conversation and not CONVERSATION_ID.fullmatch(conversation)):
+            raise ValueError("conversation")
         server = self.server
         if not server.outbound.acquire(blocking=False):
             return 409, {"error": "external_busy"}
@@ -848,17 +866,27 @@ class Handler(BaseHTTPRequestHandler):
             budget = external.internal_budget
             if not budget:
                 return 400, {"error": "intranet_budget"}
-            evidence, scope, aspects = self.retrieve_external_evidence(
-                question, context, filters, external, budget, budget,
+            sessions = server.answer_sessions
+            session_id, handle, turns = sessions.begin(conversation)
+            evidence, scope, aspects, follow_up = self.retrieve_external_evidence(
+                question, context, filters, external, budget, budget, turns=turns,
             )
+            previous = next((turn[0] for turn in reversed(turns) if turn[2]), "") if follow_up else ""
+            model_question = f"{question}\n이전 질문: {previous[:250]}" if previous else question
             with server.store.measure("context"):
-                excerpts = pack_excerpts(question, evidence, budget, with_context=True,
+                excerpts = pack_excerpts(model_question, evidence, budget, with_context=True,
                                          chars=external.review_chars, max_excerpts=MAX_GATEWAY_EXCERPTS, gap_aspects=aspects)
             if not excerpts:
                 result = report_unconfirmed_aspects({"status": "insufficient", "claims": []}, aspects)
-                return 200, {**result, "results": [], "provider": "intranet"}
-            return self.generate_external_answer(external, question, excerpts, scope, gap_aspects=aspects,
-                                                 provider="intranet")
+                result.update(results=[], provider="intranet")
+            else:
+                status, result = self.generate_external_answer(
+                    external, question, excerpts, scope, gap_aspects=aspects, provider="intranet", model_question=model_question,
+                )
+                if status != 200:
+                    return status, result
+            sessions.record(session_id, handle, question, result)
+            return 200, {**result, "conversation": session_id}
         finally:
             server.outbound.release()
 
@@ -1216,7 +1244,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_json(status, reply)
 
     def generate_external_answer(self, external, question, excerpts, scope, *, pcf=False, gap_aspects=(),
-                                 provider="external"):
+                                 provider="external", model_question=None):
         store = self.server.store
         ids = [item.passage for item in excerpts]
         windows = {item.passage for item in excerpts if item.window_start is not None}
@@ -1225,12 +1253,13 @@ class Handler(BaseHTTPRequestHandler):
             return 409, {"error": "external_source_changed"}
         try:
             with store.measure("generation"):
+                prompt = model_question or question
                 if pcf:
-                    result = external.answer(question, excerpts, instructions=PCF_INSTRUCTIONS, token_limit=2800, timeout=90)
+                    result = external.answer(prompt, excerpts, instructions=PCF_INSTRUCTIONS, token_limit=2800, timeout=90)
                 elif external.intranet and gap_aspects:
-                    result = external.answer(question, excerpts, gap_aspects=gap_aspects)
+                    result = external.answer(prompt, excerpts, gap_aspects=gap_aspects)
                 else:
-                    result = external.answer(question, excerpts)
+                    result = external.answer(prompt, excerpts)
         except (OSError, ValueError, RuntimeError, KeyError, IndexError, TypeError, http.client.HTTPException) as exc:
             return 200, {"status": "external_unavailable", "claims": [], "results": [], "provider": provider,
                          "reason": type(exc).__name__}
