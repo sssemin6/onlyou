@@ -245,7 +245,7 @@ async function streamAnswer(payload, signal, progress, route = "/api/answer") {
         const type = lines.find((line) => line.startsWith("event:"))?.slice(6).trim();
         if (type === "complete" || event.stage === "done") return event;
         if (type === "error") throw new Error(issueNames[event.error] || "답변을 완료하지 못했습니다.");
-        progress(event);
+        progress(event, type);
       }
     }
   } finally {
@@ -936,8 +936,130 @@ function showResults(rows, title, emptyMessage = "이 범위에서 일치하는 
   result.replaceChildren(content);
 }
 
+function appendMarkdownInline(container, text, sources) {
+  const inline = /\*\*([^*]+)\*\*|`([^`]+)`|\[(\d+)\]/g;
+  let cursor = 0;
+  for (const match of text.matchAll(inline)) {
+    container.append(text.slice(cursor, match.index));
+    cursor = match.index + match[0].length;
+    if (match[1]) {
+      const strong = node("strong");
+      appendMarkdownInline(strong, match[1], sources);
+      container.append(strong);
+    } else if (match[2]) {
+      container.append(node("code", match[2]));
+    } else {
+      const source = sources.get(Number(match[3]));
+      if (!source) {
+        container.append(match[0]);
+        continue;
+      }
+      const cite = node("button", match[0], "cite");
+      cite.type = "button";
+      cite.title = source.quote;
+      cite.setAttribute("aria-label", "근거 " + source.index + " · " + source.subject);
+      cite.addEventListener("click", () => openEvidence(source.passage, source.quote, source.window));
+      container.append(cite);
+    }
+  }
+  container.append(text.slice(cursor));
+}
+
+function renderAnswerMarkdown(markdown, sources) {
+  const body = node("div", "", "answer-markdown");
+  const lines = markdown.split(/\r?\n/);
+  const refs = new Map(sources.map((source) => [source.index, source]));
+  const heading = /^(#{2,3})\s+(.+)$/;
+  const list = /^\s*(?:(\d+)\.|-)\s+(.+)$/;
+  const cells = (line) => line.trim().replace(/^\||\|$/g, "").split("|").map((value) => value.trim());
+  const tableStart = (i) => {
+    if (!lines[i]?.includes("|") || !lines[i + 1]?.includes("|")) return false;
+    const header = cells(lines[i]);
+    const separators = cells(lines[i + 1]);
+    return header.length === separators.length && separators.every((cell) => /^:?-{3,}:?$/.test(cell));
+  };
+  const appendInline = (container, text) => appendMarkdownInline(container, text, refs);
+  for (let i = 0; i < lines.length;) {
+    const line = lines[i].trim();
+    if (!line) {
+      i++;
+      continue;
+    }
+    const title = heading.exec(line);
+    if (title) {
+      const subheading = node(title[1].length === 2 ? "h3" : "h4");
+      appendInline(subheading, title[2]);
+      body.append(subheading);
+      i++;
+    } else if (tableStart(i)) {
+      const wrap = node("div", "", "answer-table-wrap");
+      wrap.tabIndex = 0;
+      wrap.setAttribute("role", "region");
+      wrap.setAttribute("aria-label", "답변 표");
+      const table = node("table");
+      const thead = node("thead");
+      const tbody = node("tbody");
+      const headers = cells(line);
+      const addRow = (parent, values, tag) => {
+        const row = node("tr");
+        for (let column = 0; column < headers.length; column++) {
+          const cell = node(tag);
+          if (tag === "th") cell.scope = "col";
+          appendInline(cell, values[column] || "");
+          row.append(cell);
+        }
+        parent.append(row);
+      };
+      addRow(thead, headers, "th");
+      i += 2;
+      while (lines[i]?.includes("|") && lines[i].trim()) addRow(tbody, cells(lines[i++]), "td");
+      table.append(thead, tbody);
+      wrap.append(table);
+      body.append(wrap);
+    } else if (list.test(line)) {
+      const first = list.exec(line);
+      const ordered = Boolean(first[1]);
+      const items = node(ordered ? "ol" : "ul");
+      if (ordered) items.setAttribute("start", first[1]);
+      let match;
+      while ((match = list.exec(lines[i] || "")) && Boolean(match[1]) === ordered) {
+        const item = node("li");
+        appendInline(item, match[2]);
+        items.append(item);
+        i++;
+      }
+      body.append(items);
+    } else {
+      const paragraph = node("p");
+      const parts = [line];
+      i++;
+      while (lines[i]?.trim() && !heading.test(lines[i].trim()) && !list.test(lines[i]) && !tableStart(i)) {
+        parts.push(lines[i++].trim());
+      }
+      appendInline(paragraph, parts.join("\n"));
+      body.append(paragraph);
+    }
+  }
+  return body;
+}
+
 function showAnswer(data) {
   const box = element("answer");
+  if (data.format === "markdown") {
+    const status = {
+      ambiguous: "근거에 서로 다른 내용이 있습니다. 각 원문을 확인해 주세요.",
+      partial: "일부 항목을 확인하지 못했습니다.",
+      external_unavailable: "사내 AI 답변을 완료하지 못했습니다.",
+    }[data.status];
+    box.replaceChildren(node("h2", "AI 답변"));
+    if (status) box.append(node("p", status, "answer-status"));
+    box.append(renderAnswerMarkdown(data.markdown, data.sources));
+    for (const unknown of data.unknowns || []) {
+      box.append(node("p", "해당 범위에서 미확인 · " + unknown, "answer-status"));
+    }
+    box.hidden = false;
+    return;
+  }
   const statuses = {
     answered: data.provider === "intranet" ? "원문 근거로 찾은 답변" : "선택한 근거로 찾은 답변",
     partial: "일부 근거만 확인했습니다",
@@ -997,6 +1119,47 @@ function clearSearch() {
   element("answer").hidden = true;
   element("result-section").hidden = true;
   notice("");
+}
+
+async function intranetAnswer(payload, active) {
+  const box = element("answer");
+  const stop = element("cancel-answer");
+  let draft = null;
+  let text = "";
+  let frame = null;
+  stop.hidden = false;
+  try {
+    const data = await streamAnswer({ ...payload, context: "", conversation: answerConversation }, active.signal,
+      (event, type) => {
+        if (active.signal.aborted) return;
+        if (type === "stage" && event.message) notice(event.message);
+        if (type !== "delta" || typeof event.text !== "string") return;
+        if (!draft) {
+          draft = node("div", "", "answer-draft");
+          box.replaceChildren(node("h2", "AI 답변"), node("p", "작성 중 · 출처 확인 전", "answer-status"), draft);
+          box.hidden = false;
+        }
+        text += event.text;
+        if (frame === null) {
+          frame = requestAnimationFrame(() => {
+            frame = null;
+            draft.textContent = text;
+          });
+        }
+      }, "/api/intranet/answer");
+    if (active.signal.aborted) return;
+    answerConversation = data.conversation || "";
+    showAnswer(data);
+    if (data.status !== "external_unavailable") showResults(data.results, "사용한 근거");
+    rememberQuestion(data, payload.query);
+    notice("");
+  } catch (error) {
+    if (request === active && draft) box.hidden = true;
+    throw error;
+  } finally {
+    if (frame !== null) cancelAnimationFrame(frame);
+    if (request === active) stop.hidden = true;
+  }
 }
 
 async function localAnswer(payload, active) {
@@ -1153,14 +1316,7 @@ form.addEventListener("submit", async (event) => {
   notice(ask ? "답변에 쓸 근거를 찾고 있습니다." : mode === "hybrid" ? "의미 검색 중입니다." : "검색 중입니다.");
   try {
     if (ask && !pcf && intranetAnswerAvailable) {
-      const data = await streamAnswer({ ...payload, context: "", conversation: answerConversation }, active.signal,
-        (event) => { if (!active.signal.aborted && event.message) notice(event.message); }, "/api/intranet/answer");
-      if (active.signal.aborted) return;
-      answerConversation = data.conversation || "";
-      showAnswer(data);
-      if (data.status !== "external_unavailable") showResults(data.results, "사용한 근거");
-      rememberQuestion(data, query);
-      notice("");
+      await intranetAnswer(payload, active);
     } else if (ask && !pcf && localAnswerAvailable && !externalAnswerAvailable) {
       await localAnswer(payload, active);
     } else if (ask) {
