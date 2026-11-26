@@ -1699,6 +1699,7 @@ def conflicting_decisions(question, rows):
 
 
 MARKDOWN_CITATION = re.compile(r"\[(\d+)\]", re.ASCII)
+MARKDOWN_CITATION_GROUP = re.compile(r"\[[ \t]*([0-9]+(?:[ \t]*,[ \t]*[0-9]+)+)[ \t]*\]")
 MARKDOWN_UNKNOWN = re.compile(
     r"확인\s*(?:되지\s*않|할\s*수\s*없|이\s*어렵|불가)|찾지\s*못|근거\s*부족|(?:근거|자료|정보)(?:가|는)?\s*없",
     re.I,
@@ -1727,6 +1728,9 @@ def validate_markdown_answer(markdown, excerpts, *, question="", rows=(), gap_as
         }
         return f"[{number}]"
 
+    markdown = MARKDOWN_CITATION_GROUP.sub(
+        lambda match: "".join(f"[{number.strip()}]" for number in match[1].split(",")), markdown,
+    )
     cleaned = MARKDOWN_CITATION.sub(citation, markdown).strip()
     prose = re.sub(r"^\s*#{1,6}\s+.*$", "", MARKDOWN_CITATION.sub("", cleaned), flags=re.M)
     sentences = [line for line in re.split(r"\n+|(?<=[.!?。])\s+", prose) if re.search(r"[^\W_]", line)]
