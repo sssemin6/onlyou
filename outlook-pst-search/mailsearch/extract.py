@@ -1,6 +1,5 @@
 """Extract searchable text and preserve attachment locations."""
 import hashlib
-import hashlib
 import io
 import os
 import re
@@ -14,6 +13,7 @@ from email import policy
 from email.parser import BytesParser
 from email.utils import parsedate_to_datetime
 from html.parser import HTMLParser
+from importlib import import_module
 from pathlib import Path, PurePosixPath
 from xml.etree import ElementTree as ET
 
@@ -27,7 +27,11 @@ MAX_LOCATIONS = 800
 CREATE_FLAGS = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 DOCUMENT_SUFFIXES = {".txt", ".pdf", ".docx", ".xlsx", ".doc", ".xls"}
 LEGACY_SUFFIXES = {".doc": ".docx", ".xls": ".xlsx"}
-OCR_PAGE_MIN_TEXT = 30   # pdftotext pages shorter than this are scan candidates
+PDF_EXTRACTOR_MISSING = "PDF 추출기 미설치"
+LEGACY_CONVERTER_MISSING = "변환기 미설치(구형 Office)"
+UNSUPPORTED_FORMAT = "미지원 형식"
+EXTRACTION_FAILED = "추출 실패 또는 암호화"
+OCR_PAGE_MIN_TEXT = 30   # Pages shorter than this are scan candidates.
 OCR_MIN_RESULT = 20      # shorter OCR output is dropped as low confidence
 OCR_PAGE_TIMEOUT = 30    # seconds per page for rendering and reading
 
@@ -194,7 +198,7 @@ def convert_legacy(source, suffix, temporary, *, content=None):
     """Convert a legacy Office file to its OOXML form without running the original."""
     binary = office_binary()
     if not binary:
-        return None, "변환기 미설치(구형 Office)"
+        return None, LEGACY_CONVERTER_MISSING
     with tempfile.TemporaryDirectory(dir=temporary, prefix="convert-") as directory:
         target = Path(directory) / ("input" + suffix)
         if content is None:
@@ -289,45 +293,141 @@ def pdf_pages(input_pdf, pages, check):
     return locations, status
 
 
-TEXT_EXTRACTION_SUFFIXES = {".txt", ".pdf", ".docx", ".xlsx"}
+def optional_reader(*names):
+    for name in names:
+        try:
+            return import_module(name)
+        except (ImportError, OSError):
+            continue
+    return None
+
+
+def python_pdf_text(content, check):
+    pypdf = optional_reader("pypdf")
+    if pypdf is not None:
+        try:
+            reader = pypdf.PdfReader(io.BytesIO(content))
+            if reader.is_encrypted:
+                raise ValueError("pdf_encrypted")
+            count = len(reader.pages)
+        except pypdf.errors.PyPdfError as exc:
+            raise ValueError("pdf_read") from exc
+
+        def read_page(index):
+            try:
+                return reader.pages[index].extract_text()
+            except pypdf.errors.PyPdfError as exc:
+                raise ValueError("pdf_read") from exc
+
+        return collect_pdf_text(count, read_page, check)
+
+    pymupdf = optional_reader("pymupdf", "fitz")
+    if pymupdf is None:
+        return None
+    with pymupdf.open(stream=content, filetype="pdf") as reader:
+        if reader.needs_pass:
+            raise ValueError("pdf_encrypted")
+        return collect_pdf_text(len(reader), lambda index: reader[index].get_text(), check)
+
+
+def collect_pdf_text(count, read_page, check):
+    pages = []
+    remaining = MAX_TEXT * 4
+    limited = count > MAX_LOCATIONS
+    for index in range(min(count, MAX_LOCATIONS)):
+        if not remaining:
+            return pages, True
+        check()
+        page = read_page(index) or ""
+        if len(page) > remaining:
+            pages.append(page[:remaining])
+            return pages, True
+        pages.append(page)
+        remaining -= len(page)
+    return pages, limited
+
+
+def extract_pdf(content, temporary, pdf_command, check):
+    binary = shutil.which(pdf_command) if pdf_command else None
+    with tempfile.TemporaryDirectory(dir=temporary, prefix="pdf-") as directory:
+        input_pdf = Path(directory) / "attachment.pdf"
+        input_pdf.write_bytes(content)
+        extracted = None
+        native_timeout = False
+        if binary:
+            output_txt = input_pdf.with_suffix(".txt")
+            try:
+                subprocess.run(
+                    [binary, "-enc", "UTF-8", "-l", str(MAX_LOCATIONS), str(input_pdf), str(output_txt)],
+                    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    timeout=45, check=True, creationflags=CREATE_FLAGS,
+                )
+            except OSError:
+                pass
+            except subprocess.TimeoutExpired:
+                native_timeout = True
+            else:
+                with output_txt.open("rb") as output:
+                    buffer = output.read(MAX_TEXT * 4 + 1)
+                pages = buffer[:MAX_TEXT * 4].decode("utf-8", errors="replace").split("\f")
+                if pages and not pages[-1]:
+                    pages.pop()
+                extracted = pages, len(buffer) > MAX_TEXT * 4 or len(pages) >= MAX_LOCATIONS
+        if extracted is None:
+            extracted = python_pdf_text(content, check)
+        if extracted is None:
+            return [], EXTRACTION_FAILED if native_timeout else PDF_EXTRACTOR_MISSING, False
+        pages, limited = extracted
+        locations, status = pdf_pages(input_pdf, pages, check)
+        return locations, status, limited
+
+
+def xls_text(content, xlrd, check):
+    try:
+        with xlrd.open_workbook(file_contents=content, on_demand=True) as book:
+            for sheet in map(book.sheet_by_index, range(book.nsheets)):
+                for index in range(sheet.nrows):
+                    check()
+                    cells = [(xlrd.cellname(index, col), str(value)) for col, value in enumerate(sheet.row_values(index))
+                             if value != ""]
+                    if cells:
+                        yield (f"{sheet.name}!{cells[0][0]}~{cells[-1][0]}",
+                               " | ".join(f"{ref} {value}" for ref, value in cells))
+    except xlrd.biffh.XLRDError as exc:
+        raise ValueError("xls_read") from exc
 
 
 def extract_bytes(content, suffix, temporary, pdf_command, *, check=lambda: None, structure=None):
     """(status, [(location, text)]) for document bytes; never raises."""
-    if suffix not in TEXT_EXTRACTION_SUFFIXES:
-        return "미지원 형식", []
+    if suffix not in DOCUMENT_SUFFIXES:
+        return UNSUPPORTED_FORMAT, []
     if not content:
         return "텍스트 없음", []
     if len(content) > MAX_ATTACHMENT:
         return "용량 초과", []
     try:
         ocr_status = None
+        limited = False
+        if suffix in LEGACY_SUFFIXES:
+            converted, failure = convert_legacy(None, suffix, temporary, content=content)
+            if failure:
+                xlrd = optional_reader("xlrd") if suffix == ".xls" and failure == LEGACY_CONVERTER_MISSING else None
+                if xlrd is None:
+                    return failure, []
+            else:
+                if len(converted) > MAX_ATTACHMENT:
+                    return "용량 초과", []
+                content, suffix = converted, LEGACY_SUFFIXES[suffix]
         if suffix == ".txt":
             locations = [("본문", decode(content))]
         elif suffix == ".pdf":
-            binary = shutil.which(pdf_command)
-            if not binary:
-                return "PDF 추출기 미설치", []
-            with tempfile.TemporaryDirectory(dir=temporary, prefix="pdf-") as directory:
-                input_pdf = Path(directory) / "attachment.pdf"
-                output_txt = Path(directory) / "attachment.txt"
-                input_pdf.write_bytes(content)
-                subprocess.run(
-                    [binary, "-enc", "UTF-8", "-l", "800", str(input_pdf), str(output_txt)],
-                    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                    timeout=45, check=True, creationflags=CREATE_FLAGS,
-                )
-                with output_txt.open("rb") as output:
-                    buffer = output.read(MAX_TEXT * 4 + 1)
-                pages = buffer[:MAX_TEXT * 4].decode("utf-8", errors="replace").split("\f")
-                if pages and not pages[-1]:
-                    pages.pop()
-                locations, ocr_status = pdf_pages(input_pdf, pages, check)
+            locations, ocr_status, limited = extract_pdf(content, temporary, pdf_command, check)
+        elif suffix == ".xls":
+            locations = xls_text(content, xlrd, check)
         else:
             locations = office_text(content, suffix, structure=structure, check=check)
         result = []
         remaining = MAX_TEXT
-        limited = suffix == ".pdf" and (len(buffer) > MAX_TEXT * 4 or len(pages) >= 800)
         for location, raw_text in locations:
             text = clean(raw_text)
             if not text:
@@ -341,9 +441,9 @@ def extract_bytes(content, suffix, temporary, pdf_command, *, check=lambda: None
         if not result and not (structure and structure.get("comments")):
             return ocr_status or "텍스트 없음", result
         return ("일부 색인" if limited else ocr_status or "완료"), result
-    except (ValueError, OSError, KeyError, IndexError, RuntimeError, ET.ParseError,
+    except (ValueError, OSError, KeyError, IndexError, RuntimeError, OverflowError, ET.ParseError,
             zipfile.BadZipFile, subprocess.SubprocessError):
-        return "추출 실패 또는 암호화", []
+        return EXTRACTION_FAILED, []
 
 
 def extract_document(path, temporary, pdf_command, *, check=lambda: None, structure=None):
@@ -360,11 +460,6 @@ def extract_document(path, temporary, pdf_command, *, check=lambda: None, struct
             structure.update(schema_version=1, parser_version="pcf-word-v1",
                              source_version=hashlib.sha256(content).hexdigest(),
                              converter="LibreOffice" if suffix == ".doc" else None)
-        if suffix in LEGACY_SUFFIXES:
-            content, failure = convert_legacy(path, suffix, temporary, content=content)
-            if content is None:
-                return failure, []
-            suffix = LEGACY_SUFFIXES[suffix]
     except OSError:
         return "추출 실패 또는 암호화", []
     status, locations = extract_bytes(content, suffix, temporary, check=check, pdf_command=pdf_command,
@@ -386,8 +481,8 @@ def extract_document(path, temporary, pdf_command, *, check=lambda: None, struct
 
 def extract_attachment(name, part, temporary, pdf_command, *, check=lambda: None, cache=None):
     suffix = Path(name).suffix.lower()
-    if suffix not in TEXT_EXTRACTION_SUFFIXES:
-        return "미지원 형식", []
+    if suffix not in DOCUMENT_SUFFIXES:
+        return UNSUPPORTED_FORMAT, []
     payload = part.get_payload(decode=True)
     if cache is None or not payload or len(payload) > MAX_ATTACHMENT:
         return extract_bytes(payload, suffix, temporary, pdf_command, check=check)
