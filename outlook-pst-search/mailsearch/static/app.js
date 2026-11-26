@@ -205,13 +205,13 @@ function showAnswerControls() {
   element("local-conversation").hidden = activeTab === "pcf" || !(conversationAvailable || answerConversation);
 }
 
-async function streamAnswer(payload, signal, progress) {
+async function streamAnswer(payload, signal, progress, route = "/api/answer") {
   if (!globalThis.ReadableStream?.prototype.getReader || !globalThis.TextDecoder) {
-    return call("/api/answer", payload, signal);
+    return call(route, payload, signal);
   }
   let response;
   try {
-    response = await fetch("/api/answer/stream", {
+    response = await fetch(route + "/stream", {
       method: "POST", headers: { "X-Mail-Session": token, "Content-Type": "application/json" },
       body: JSON.stringify(payload), signal, cache: "no-store",
     });
@@ -219,7 +219,7 @@ async function streamAnswer(payload, signal, progress) {
     if (error instanceof TypeError) throw new Error(issueNames.app_disconnected);
     throw error;
   }
-  if ([404, 405].includes(response.status)) return call("/api/answer", payload, signal);
+  if ([404, 405].includes(response.status)) return call(route, payload, signal);
   if (!response.ok) {
     const data = await response.json();
     throw new Error(issueNames[data.error] || issueNames.app_disconnected);
@@ -242,7 +242,9 @@ async function streamAnswer(payload, signal, progress) {
         const data = lines.filter((line) => line.startsWith("data:")).map((line) => line.slice(5).replace(/^ /, ""));
         if (!data.length) continue;
         const event = JSON.parse(data.join("\n"));
-        if (event.stage === "done") return event;
+        const type = lines.find((line) => line.startsWith("event:"))?.slice(6).trim();
+        if (type === "complete" || event.stage === "done") return event;
+        if (type === "error") throw new Error(issueNames[event.error] || "답변을 완료하지 못했습니다.");
         progress(event);
       }
     }
@@ -1151,7 +1153,8 @@ form.addEventListener("submit", async (event) => {
   notice(ask ? "답변에 쓸 근거를 찾고 있습니다." : mode === "hybrid" ? "의미 검색 중입니다." : "검색 중입니다.");
   try {
     if (ask && !pcf && intranetAnswerAvailable) {
-      const data = await call("/api/intranet/answer", { ...payload, context: "", conversation: answerConversation }, active.signal);
+      const data = await streamAnswer({ ...payload, context: "", conversation: answerConversation }, active.signal,
+        (event) => { if (!active.signal.aborted && event.message) notice(event.message); }, "/api/intranet/answer");
       if (active.signal.aborted) return;
       answerConversation = data.conversation || "";
       showAnswer(data);
