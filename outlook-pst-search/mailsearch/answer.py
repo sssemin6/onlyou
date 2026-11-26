@@ -1214,23 +1214,22 @@ def rewritten_evidence(store, ai, question, filters, context, *, workers=None, o
             futures.append(embedding_future)
         plan = wait_for_search(plan_future, check)
         scoped = rewritten_scope(filters, plan.filters) if plan else filters
-        # A narrowed scope needs its own FTS top-K, not just the surviving broad hits.
-        warm = None
-        if scoped == filters:
-            warm = (full_query, filters, wait_for_search(lexical_future, check))
-        else:
-            lexical_future.cancel()
         embedding_failed = embedding_future is not None and not wait_for_search(embedding_future, check)
         queries = (original, *(plan.sub_queries if plan else ()))
         distinct = {}
         for query in queries:
             distinct.setdefault(normalized(compact_space(query)), query)
-        evidence, mode = evidence_for(
-            store, ai, question, scoped, context, sub_queries=tuple(distinct.values()),
-            keywords=plan.keywords if plan else (), warm_lexical=warm,
-            embedding_failed=embedding_failed, **options,
-        )
-        return evidence, mode, scoped, len(plan.sub_queries) if plan else 1
+        for scope in ((scoped, filters) if scoped != filters else (filters,)):
+            # A narrowed scope needs its own FTS top-K. Reuse the broad hits only
+            # when searching under the original filters.
+            warm = (full_query, filters, wait_for_search(lexical_future, check)) if scope == filters else None
+            evidence, mode = evidence_for(
+                store, ai, question, scope, context, sub_queries=tuple(distinct.values()),
+                keywords=plan.keywords if plan else (), warm_lexical=warm,
+                embedding_failed=embedding_failed, **options,
+            )
+            if evidence or scope == filters:
+                return evidence, mode, scope, len(plan.sub_queries) if plan else 1
     finally:
         for future in futures:
             future.cancel()
