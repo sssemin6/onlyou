@@ -203,6 +203,11 @@ Return only JSON: {"sufficient":false,"missing_aspects":["short aspect label"],"
 If evidence is sufficient, return true and empty arrays. Otherwise propose one or two targeted retrieval queries.
 Preserve part numbers as written. Do not include filters, external actions, quoted passages or answers.
 """
+GAP_TARGET_INSTRUCTIONS = """If a visible mail thread is incomplete, optionally return expand_mails:
+an array of up to two passage or mail_id numbers from the supplied evidence. If an attachment is needed,
+optionally return read_attachments: an array of up to two filename fragments. Only select relevant files
+from the visible mails. Either field may be used without follow_up_queries.
+"""
 GAP_FACETS = {
     "prototype": re.compile(r"시제품|시제작|prototype", re.I),
     "production": re.compile(r"양산|production", re.I),
@@ -222,21 +227,28 @@ def gap_facets(text):
 class EvidenceGap:
     aspects: tuple[str, ...]
     queries: tuple[str, ...]
+    expand_mails: tuple[int, ...] = ()
+    read_attachments: tuple[str, ...] = ()
 
 
-def parse_evidence_gap(raw, question):
+def parse_evidence_gap(raw, question, *, expand_targets=False):
     if not isinstance(raw, dict) or raw.get("sufficient") is not False:
         return None
     queries = raw.get("follow_up_queries")
-    if not isinstance(queries, list):
-        return None
-    plan = parse_rewrite({"sub_queries": queries[:2]}, question)
-    if not plan:
+    plan = parse_rewrite({"sub_queries": queries[:2]}, question) if isinstance(queries, list) else None
+    mails = raw.get("expand_mails") if expand_targets else None
+    names = raw.get("read_attachments") if expand_targets else None
+    mail_ids = tuple(dict.fromkeys(n for n in mails[:2] if type(n) is int and 0 < n < 2**63)
+                     ) if isinstance(mails, list) else ()
+    filenames = tuple(dict.fromkeys(name.strip() for name in names[:2]
+                                    if isinstance(name, str) and 0 < len(name.strip()) <= 160)
+                     ) if isinstance(names, list) else ()
+    if not (plan or mail_ids or filenames):
         return None
     labels = raw.get("missing_aspects")
     aspects = tuple(dict.fromkeys(compact_space(label)[:80] for label in labels[:3]
                                   if isinstance(label, str) and label.strip())) if isinstance(labels, list) else ()
-    return EvidenceGap(aspects, plan.sub_queries)
+    return EvidenceGap(aspects, plan.sub_queries if plan else (), mail_ids, filenames)
 
 
 def wait_for_search(future, check=None, *, deadline=None):
@@ -626,11 +638,12 @@ class LocalAI:
         except TimeoutError:
             return None
 
-    def diagnose_evidence_gap(self, question, evidence, *, timeout=2.5, allow_intranet_evidence=True):
+    def diagnose_evidence_gap(self, question, evidence, *, timeout=2.5, allow_intranet_evidence=True, expand_targets=False):
         if not self.retrieval_model_available:
             return None
         data = {"question": question}
         local_model, gateway = self.rewrite_model, self.embedding_api
+        instructions = GAP_INSTRUCTIONS
         if local_model or (allow_intranet_evidence and self.trusted_gateway(gateway)
                            and gateway.rewrite_model):
             data["evidence"] = [
@@ -638,7 +651,12 @@ class LocalAI:
                     if row.get(key)},
                  "excerpt": row["text"][:350]} for row in evidence[:8]
             ]
+            if expand_targets:
+                instructions += GAP_TARGET_INSTRUCTIONS
+                for item, row in zip(data["evidence"], evidence[:8], strict=True):
+                    item.update(passage=row["passage"], mail_id=row["id"], attachments=row.get("attachment_names", ()))
         else:
+            expand_targets = False
             tally = {name: 0 for name in GAP_FACETS}
             for row in evidence:
                 facets = gap_facets(row.get("subject", "") + " " + row["text"])
@@ -646,10 +664,10 @@ class LocalAI:
                     for name in facets:
                         tally[name] += 1
             data["coverage"] = tally
-        raw = self.retrieval_completion(GAP_INSTRUCTIONS, json.dumps(data, ensure_ascii=False),
+        raw = self.retrieval_completion(instructions, json.dumps(data, ensure_ascii=False),
                                         "diagnose_evidence_gap", token_limit=GAP_TOKEN_LIMIT, timeout=timeout,
                                         backend=(local_model, gateway), num_ctx=8192)
-        return parse_evidence_gap(raw, question)
+        return parse_evidence_gap(raw, question, expand_targets=expand_targets)
 
     def answer(self, question, evidence, context, *, groups=(), check=None, gap_aspects=()):
         if check:
@@ -926,8 +944,14 @@ class AnswerSessions:
         claims = result["claims"]
         if result["status"] not in {"answered", "partial", "ambiguous", "insufficient"}:
             return
-        ids = tuple(dict.fromkeys(ref["passage"] for claim in claims for ref in claim["citations"]))
-        turn = (question, tuple(claim["text"] for claim in claims), ids)
+        facts = tuple(claim["text"] for claim in claims)
+        if result.get("format") == "markdown":
+            ids = tuple(dict.fromkeys(ref["passage"] for ref in result["sources"]))
+            summary = result["markdown"][:1200]
+        else:
+            ids = tuple(dict.fromkeys(ref["passage"] for claim in claims for ref in claim["citations"]))
+            summary = "\n".join(facts)[:1200]
+        turn = (question, facts, ids, summary)
         with self.lock:
             now = time.monotonic()
             self.expire(now)
@@ -946,7 +970,7 @@ class AnswerSessions:
 def follow_up_evidence(store, question, filters, turns):
     if not turns or not FOLLOW_UP.search(question):
         return "", []
-    previous, _, ids = next((turn for turn in reversed(turns) if turn[2]), ("", (), ()))
+    previous, _, ids = next((turn[:3] for turn in reversed(turns) if turn[2]), ("", (), ()))
     ids = ids[:12]
     found = {row["passage"]: row for row in store.passages(ids, filters)}
     anchors = [found[passage] for passage in ids if passage in found][:6]
@@ -1354,12 +1378,13 @@ def evidence_for(store, ai, question, filters, context, semantic=True, limit=9, 
 
 def supplemental_evidence(store, ai, question, filters, context, evidence, mode, query_count, *,
                           ceiling=ANSWER_EVIDENCE_LIMIT, expand=True, check=None, review_slots=None,
-                          allow_intranet_evidence=True, worker_check=None, allow_rerank=True):
+                          allow_intranet_evidence=True, worker_check=None, allow_rerank=True, expand_targets=False):
     """Run at most one supplemental retrieval under the current scope and budget."""
     unchanged = evidence, mode, (), False
     complex_question = bool(query_count > 1 or SYNTHESIS_QUESTION.search(question) or COMPARISON_QUESTION.search(question))
+    target_question = expand_targets and bool(re.search(r"첨부|견적서|사양서|회신|메일 이력|attachment|thread|pdf|엑셀", question, re.I))
     if (os.environ.get("MAILSEARCH_AGENTIC_RETRY", "").strip() == "0" or filters.get("tab") == "pcf"
-            or not ai.retrieval_model_available or not (complex_question or DECISION_QUESTION.search(question))):
+            or not ai.retrieval_model_available or not (complex_question or DECISION_QUESTION.search(question) or target_question)):
         return unchanged
     profile = store.search_profile
     # Reserve time for the existing generation and validation path.
@@ -1381,6 +1406,8 @@ def supplemental_evidence(store, ai, question, filters, context, evidence, mode,
         return unchanged
     deadline = time.monotonic() + remaining
     gap_options = {} if allow_intranet_evidence else {"allow_intranet_evidence": False}
+    if expand_targets:
+        gap_options["expand_targets"] = True
 
     def search(stop):
         def time_check():
@@ -1393,6 +1420,10 @@ def supplemental_evidence(store, ai, question, filters, context, evidence, mode,
         with store.search_session(profile):
             windows = {row["passage"] for row in evidence if row.get("window")}
             visible = store.passages([row["passage"] for row in evidence[:8]], filters, windows=windows)
+            mail_ids = list(dict.fromkeys(row["id"] for row in visible if row.get("kind") == "mail")) if expand_targets else []
+            if mail_ids:
+                names = store.evidence_attachment_names(mail_ids)
+                visible = [{**row, "attachment_names": names.get(row["id"], ())} for row in visible]
             remaining = stop - time.monotonic()
             if remaining < .25:
                 return None
@@ -1401,17 +1432,33 @@ def supplemental_evidence(store, ai, question, filters, context, evidence, mode,
             if not gap:
                 return None
             time_check()
+            rows, next_mode = [], mode
+            if expand_targets:
+                seeds = list(dict.fromkeys(
+                    row["id"] for target in gap.expand_mails for row in visible
+                    if row.get("kind") == "mail" and target in (row["passage"], row["id"])
+                ))[:2]
+                if seeds:
+                    rows.extend(store.related(seeds, filters, hops=3, question=question))
+                    time_check()
+                if gap.read_attachments:
+                    attachment_mails = list(dict.fromkeys([*mail_ids, *(row["id"] for row in rows)]))
+                    rows[:0] = store.attachment_evidence(attachment_mails, gap.read_attachments, filters, question)
+                    time_check()
             # Local diagnostics can include mail text in the generated search terms.
-            semantic = trusted or not (ai.rewrite_model and getattr(gateway, "index_key", ""))
-            rows, next_mode = evidence_for(
-                store, ai, question, filters, context, sub_queries=gap.queries, limit=9,
-                semantic=semantic, expand=expand, max_evidence=12, check=time_check, allow_rerank=False,
-                embedding_timeout=min(QUERY_EMBEDDING_TIMEOUT, stop - time.monotonic()),
-            )
+            if gap.queries:
+                semantic = trusted or not (ai.rewrite_model and getattr(gateway, "index_key", ""))
+                found, next_mode = evidence_for(
+                    store, ai, question, filters, context, sub_queries=gap.queries, limit=9,
+                    semantic=semantic, expand=expand, max_evidence=12, check=time_check, allow_rerank=False,
+                    embedding_timeout=min(QUERY_EMBEDDING_TIMEOUT, stop - time.monotonic()),
+                )
+                rows.extend(found)
+            ids = list(dict.fromkeys(row["passage"] for row in rows))
             windows = {row["passage"] for row in rows if row.get("window")}
-            live = {row["passage"]: row for row in store.passages([row["passage"] for row in rows], filters, windows=windows)}
+            live = {row["passage"]: row for row in store.passages(ids, filters, windows=windows)}
             time_check()
-            return [live[row["passage"]] for row in rows if row["passage"] in live], next_mode, gap.aspects
+            return [live[pid] for pid in ids if pid in live], next_mode, gap.aspects
 
     with store.measure("followup"):
         if check:
@@ -1649,6 +1696,50 @@ def conflicting_decisions(question, rows):
             {"text": line, "citations": [{**public_row(row), "quote": line}]} for row, line in alternatives
         ]}
     return None
+
+
+MARKDOWN_CITATION = re.compile(r"\[(\d+)\]", re.ASCII)
+MARKDOWN_UNKNOWN = re.compile(
+    r"확인\s*(?:되지\s*않|할\s*수\s*없|이\s*어렵|불가)|찾지\s*못|근거\s*부족|(?:근거|자료|정보)(?:가|는)?\s*없",
+    re.I,
+)
+
+
+def validate_markdown_answer(markdown, excerpts, *, question="", rows=(), gap_aspects=()):
+    """Validate inline source numbers against the current excerpts and return source metadata."""
+    by_number = {number: item for number, item in enumerate(excerpts, 1)}
+    by_passage = {row["passage"]: row for row in rows}
+    sources = {}
+    max_digits = len(str(len(by_number)))
+
+    def citation(match):
+        raw = match[1]
+        number = int(raw) if len(raw) <= max_digits else 0
+        item = by_number.get(number)
+        if item is None:
+            return ""
+        metadata = by_passage.get(item.passage, item.context or {})
+        sources[number] = {
+            "index": number, "passage": item.passage, "mail_id": metadata.get("id", item.mail),
+            "subject": metadata.get("subject", ""), "sender": metadata.get("sender", ""),
+            "sent": metadata.get("sent", ""), "quote": item.text[:QUOTE_LIMIT].strip(),
+            "window": item.window_start is not None,
+        }
+        return f"[{number}]"
+
+    cleaned = MARKDOWN_CITATION.sub(citation, markdown).strip()
+    prose = re.sub(r"^\s*#{1,6}\s+.*$", "", MARKDOWN_CITATION.sub("", cleaned), flags=re.M)
+    sentences = [line for line in re.split(r"\n+|(?<=[.!?。])\s+", prose) if re.search(r"[^\W_]", line)]
+    result = {"status": "answered", "format": "markdown", "markdown": cleaned, "sources": list(sources.values()), "claims": []}
+    if not sources or not sentences or all(MARKDOWN_UNKNOWN.search(line) for line in sentences):
+        result.update(status="insufficient", markdown="제공된 자료에서 확인되지 않습니다.", sources=[])
+    elif conflicting_decisions(question, rows):
+        result["status"] = "ambiguous"
+    elif gap_aspects:
+        result["status"] = "partial"
+    if gap_aspects:
+        result["unknowns"] = list(gap_aspects)
+    return result
 
 
 def supports_claim(text, quotes, rows, *, pcf=False, metadata=False):
