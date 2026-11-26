@@ -343,6 +343,9 @@ function sourceIndexStatuses(source, embeddingEnabled) {
   } else if (source.embedding_model_current === false) {
     semantic = { mark: "—", status: state === "ready" ? "현재 모델의 의미 색인 미완료 · 갱신 필요"
       : "현재 모델의 의미 색인 대기", detail: embeddingProgress ? "이전 모델 · " + embeddingProgress.text : "" };
+  } else if (issue === "embedding_partial") {
+    semantic = { mark: "△", status: "처리 완료 · 일부 구간 제외", progress: embeddingProgress,
+      detail: "제외된 구간은 키워드로 검색할 수 있습니다." };
   } else if (embeddingIssue || (failed && stage === "embeddings")) {
     semantic = { mark: "X", status: "임베딩 실패", progress: embeddingProgress, detail: issueNames[issue] || issue };
   } else if (running && state === "embeddings" && stage !== "finalizing") {
