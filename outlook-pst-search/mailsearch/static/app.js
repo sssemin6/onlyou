@@ -22,6 +22,7 @@ const TAB_FILTERS = {
 };
 const ALL_FILTERS = ["source", ...new Set(Object.values(TAB_FILTERS).flat())];
 const dateFormat = new Intl.DateTimeFormat("ko-KR", { dateStyle: "medium", timeStyle: "short" });
+const shortSourceDate = new Intl.DateTimeFormat("en-US", { month: "numeric", day: "numeric" });
 const indexStages = {
   extracting: "원본 확인·PST 읽기", headers: "메일·문서 색인", attachments: "첨부파일 본문 추출",
   embeddings: "임베딩 생성", finalizing: "색인 저장·전환",
@@ -29,6 +30,24 @@ const indexStages = {
 const workingIndexStates = new Set(["extracting", "headers", "attachments", "embeddings"]);
 const indexingNumber = new Intl.NumberFormat("ko-KR");
 const indexingPercent = new Intl.NumberFormat("ko-KR", { maximumFractionDigits: 2 });
+const issueKinds = { mail: "메일", attachment: "첨부", document: "문서", pst: "PST" };
+const issueReasons = {
+  "추출 실패 또는 암호화": "암호화·DRM 또는 손상 파일",
+  "텍스트 없음": "텍스트 없음 (스캔 PDF·이미지 문서)",
+  "변환기 미설치(구형 Office)": "구형 Office(.doc/.xls) 변환기 필요",
+  "PDF 추출기 미설치": "PDF 추출기 필요",
+  "용량 초과": "첨부 용량 초과 (25MB 이상)",
+  pst_in_use: "Outlook에서 열려 있어 보류됨",
+  pst_access_denied: "읽기 권한 없음",
+  pst_changed: "색인 중 PST가 변경됨",
+  pst_no_mail: "PST에서 메일을 찾지 못함",
+  pst_export: "PST 읽기 실패",
+  pst_invalid: "PST 형식을 확인할 수 없음",
+  mail_original_changed: "색인 중 메일 원본이 변경됨",
+  "원본 변경": "색인 중 원본이 변경됨",
+};
+const sourcePopovers = new Map();
+let activeSourcePopover = null;
 const issueNames = {
   readpst_missing: "PST 추출 도구(readpst)를 설치하거나 실행 경로를 지정하세요.",
   pst_in_use: "Outlook 등에서 사용 중인 PST입니다. Outlook 종료 후 갱신하거나 Outlook 연결로 등록하세요.",
@@ -314,17 +333,25 @@ function sourceIndexStatuses(source, embeddingEnabled) {
   const stage = source.index_stage || (running ? state : embeddingProgress ? "embeddings" :
     /^pst_|^readpst_/.test(issue || "") ? "extracting" :
     ["mail_parse_failed", "document_extract_failed"].includes(issue) ? "headers" : "");
-  const stageName = indexStages[stage] || "일반 색인";
+  const stageName = indexStages[stage] || "기본 검색";
   const generalComplete = state === "ready" || stage === "embeddings";
-  const gaps = source.failed || source.omitted || source.partial;
+  const omittedKinds = Object.keys(source.omitted_by_kind ?? {});
+  const partialKinds = Object.keys(source.partial_by_kind ?? {});
+  const hasOmissions = source.failed || source.omitted || omittedKinds.length;
+  const onlyMissingAttachments = !source.failed && omittedKinds.length === 1 && omittedKinds[0] === "attachment";
+  const partial = source.partial || partialKinds.length;
   const ordinaryProgress = stage === "headers" || stage === "attachments"
     ? sourceProgress(source.index_done, source.index_total, "건") : null;
   let general;
 
   if (failed && stage !== "embeddings") {
-    general = { mark: "X", status: stageName + " 실패", progress: ordinaryProgress, detail: issueNames[issue] || issue };
+    const held = issue === "pst_in_use" && source.deferred_psts > 0;
+    general = { mark: "X", status: held ? "열려 있는 PST 대기 중" : stageName + " 실패",
+      progress: ordinaryProgress, detail: held ? "" : issueNames[issue] || issue };
   } else if (generalComplete) {
-    general = gaps ? { mark: "X", status: "처리 종료 · 일부 자료 미완료" } : { mark: "O", status: "완료 · 100%" };
+    const status = hasOmissions ? (onlyMissingAttachments ? "준비됨 · 일부 첨부 제외" : "준비됨 · 일부 자료 제외")
+      : partial ? "준비됨 · 일부 내용만 색인" : "준비 완료";
+    general = { mark: hasOmissions || partial ? "△" : "O", status };
   } else if (running && stage === "finalizing") {
     general = finalizationStatus(source.finalization);
   } else if (running) {
@@ -352,14 +379,14 @@ function sourceIndexStatuses(source, embeddingEnabled) {
     semantic = { mark: "△", status: "임베딩 생성 진행 중", progress: embeddingProgress, showBar: true,
       detail: embeddingProgress ? "" : "전체 구간 집계 중" };
   } else if (embeddingProgress && embeddingProgress.done === embeddingProgress.total && !stopped) {
-    semantic = { mark: "O", status: "완료", progress: embeddingProgress };
+    semantic = { mark: "O", status: "준비 완료", progress: embeddingProgress };
   } else if (running && stage === "finalizing" && embeddingProgress) {
     semantic = { mark: "△", status: "저장된 임베딩 반영 중", progress: embeddingProgress };
   } else if (source.embedding_total === 0 && state === "ready") {
     semantic = { mark: "—", status: "대상 구간 없음" };
   } else {
     const status = state === "ready" ? "미완료 · 갱신 필요" :
-      failed ? "일반 색인 실패로 대기" : stopped || "일반 색인 후 시작";
+      failed ? "기본 검색 준비 실패로 대기" : stopped || "기본 검색 준비 후 시작";
     semantic = { mark: "—", status, progress: embeddingProgress };
   }
   return [general, semantic];
@@ -385,6 +412,201 @@ function sourceIndexRow(title, status) {
   return row;
 }
 
+function reasonText(reason, kind) {
+  if (reason === "용량 초과" && kind === "document") return "문서 용량 초과 (25MB 이상)";
+  return issueReasons[reason] || issueNames[reason] || reason;
+}
+
+function sourceIssueBadge(source, category) {
+  const partial = category === "partial";
+  const label = partial ? "일부 색인" : "누락";
+  const counts = source[category + "_by_kind"] ?? {};
+  const kinds = Object.keys(issueKinds).filter((kind) => counts[kind] > 0);
+  const total = kinds.reduce((sum, kind) => sum + counts[kind], 0) || source[category] || 0;
+  if (!total) return null;
+  const single = kinds[0];
+  const onlyHeldPst = single === "pst" && source.deferred_psts === total;
+  const title = (kinds.length === 1 ? issueKinds[single] + " " : "") + (onlyHeldPst ? "보류" : label);
+  const summary = kinds.length > 1
+    ? " (" + kinds.map((kind) => issueKinds[kind] + " " + indexingNumber.format(counts[kind])).join(" · ") + ")" : "";
+  const root = node("div", "", "source-stat");
+  const badge = node("div", "", "source-badge");
+  const badgeLabel = node("span", title + " " + indexingNumber.format(total) + "건" + summary);
+  const button = node("button", "", "source-info-button");
+  const key = "source-info-" + source.id + "-" + category;
+  badgeLabel.id = key + "-label";
+  button.type = "button";
+  button.dataset.action = key;
+  button.setAttribute("aria-label", "상세 사유 보기");
+  button.setAttribute("aria-describedby", badgeLabel.id);
+  button.setAttribute("aria-expanded", "false");
+  button.setAttribute("aria-controls", key);
+  const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  svg.setAttribute("viewBox", "0 0 24 24");
+  svg.setAttribute("fill", "none");
+  svg.setAttribute("aria-hidden", "true");
+  const icon = document.createElementNS(svg.namespaceURI, "path");
+  icon.setAttribute("d", "M22 12a10 10 0 1 1-20 0 10 10 0 0 1 20 0ZM12 11v6m0-10h.01");
+  svg.append(icon);
+  button.append(svg);
+  badge.append(badgeLabel, button);
+
+  const panel = node("div", "", "source-popover");
+  panel.id = key;
+  panel.hidden = true;
+  panel.tabIndex = 0;
+  panel.setAttribute("role", "region");
+  panel.setAttribute("aria-label", title + " 상세 사유");
+  const reasons = source[category + "_reasons"] ?? [];
+  const list = node("ul", "", "source-reasons");
+  let listed = 0;
+  for (const {kind, reason, count} of reasons) {
+    const item = node("li", "", "source-reason");
+    item.append(node("strong", issueKinds[kind] || kind, "source-reason-kind"),
+      node("span", reasonText(reason, kind)),
+      node("span", "— " + indexingNumber.format(count) + "건", "source-reason-count"));
+    list.append(item);
+    listed += count;
+  }
+  if (listed) panel.append(list);
+  else panel.append(node("p", "기록된 상세 사유가 없습니다."));
+  if (listed && listed < total) panel.append(node("p", "그 외 " + indexingNumber.format(total - listed) + "건"));
+  if (!partial && kinds.length === 1 && single === "attachment" && !source.failed && source.state === "ready") {
+    panel.append(node("p", "메일 본문은 모두 정상 색인되었으며, 위 첨부파일만 제외되었습니다.", "source-popover-note"));
+  }
+  root.append(badge, panel);
+
+  const popover = {
+    key, root, pinned: false,
+    open(pin = this.pinned) {
+      if (activeSourcePopover !== this) activeSourcePopover?.close();
+      activeSourcePopover = this;
+      this.pinned = pin;
+      panel.hidden = false;
+      const bounds = root.getBoundingClientRect();
+      const below = window.innerHeight - bounds.bottom;
+      root.classList.toggle("opens-up", below < panel.offsetHeight && bounds.top > below);
+      button.setAttribute("aria-expanded", "true");
+    },
+    close() {
+      this.pinned = false;
+      panel.hidden = true;
+      button.setAttribute("aria-expanded", "false");
+      if (activeSourcePopover === this) activeSourcePopover = null;
+    },
+  };
+  sourcePopovers.set(key, popover);
+  root.addEventListener("pointerenter", (event) => {
+    if (event.pointerType === "mouse") popover.open();
+  });
+  root.addEventListener("pointerleave", () => {
+    if (!popover.pinned && !root.contains(document.activeElement)) popover.close();
+  });
+  root.addEventListener("focusin", () => popover.open());
+  root.addEventListener("focusout", (event) => {
+    if (!root.contains(event.relatedTarget)) popover.close();
+  });
+  root.addEventListener("keydown", (event) => {
+    if (event.key === "Escape" && !panel.hidden) {
+      event.stopPropagation();
+      button.focus({ preventScroll: true });
+      popover.close();
+    }
+  });
+  button.addEventListener("click", () => {
+    if (popover.pinned) popover.close();
+    else popover.open(true);
+  });
+  return root;
+}
+
+document.addEventListener("pointerdown", (event) => {
+  if (activeSourcePopover && !activeSourcePopover.root.contains(event.target)) activeSourcePopover.close();
+});
+
+function deferredPstGroup(source, open) {
+  const total = source.deferred_psts;
+  const names = source.deferred_pst_names ?? [];
+  const group = node("section", "", "source-pst-group");
+  group.append(node("h4", "Outlook에서 열려 있는 PST " + indexingNumber.format(total) + "개 대기 중"),
+    node("p", "Outlook을 닫고 ‘다시 색인’을 누르거나, ‘Outlook 연결’로 등록하면 바로 읽을 수 있어요."));
+  const chips = (items) => {
+    const list = node("ul", "", "source-pst-chips");
+    for (const name of items) list.append(node("li", name));
+    return list;
+  };
+  if (names.length) group.append(chips(names.slice(0, 5)));
+  if (total > 5) {
+    const more = node("details");
+    more.id = "source-deferred-" + source.id;
+    more.open = open;
+    const summary = node("summary", "외 " + indexingNumber.format(total - 5) + "개 더보기");
+    summary.dataset.action = more.id;
+    more.append(summary);
+    if (names.length > 5) more.append(chips(names.slice(5)));
+    if (total > names.length) more.append(node("p", "목록에는 처음 " + indexingNumber.format(names.length) + "개까지 표시됩니다."));
+    group.append(more);
+  }
+  return group;
+}
+
+function sourceIgnoreButton(source, folder) {
+  const button = node("button", "이 폴더 제외 후 갱신", "text-button");
+  button.type = "button";
+  button.title = folder;
+  button.dataset.action = "ignore-" + source.id + "-" + folder;
+  button.addEventListener("click", async () => {
+    button.disabled = true;
+    try {
+      await call("/api/sources/" + source.id + "/ignore", { pattern: folder + "/" });
+      clearSearch();
+      notice(folder + " 폴더를 제외하고 보관함을 갱신합니다.");
+      await showSources();
+    } catch (error) {
+      notice(error.message);
+    } finally {
+      button.disabled = false;
+    }
+  });
+  return button;
+}
+
+function appendSourceIssues(entry, source, expandedPsts) {
+  const issues = node("div", "", "source-stats");
+  const unclassified = Math.max(0, source.failed - (source.omitted_by_kind?.mail || 0));
+  if (unclassified) issues.append(node("span", "실패 " + indexingNumber.format(unclassified) + "건", "source-badge"));
+  for (const category of ["omitted", "partial"]) {
+    const badge = sourceIssueBadge(source, category);
+    if (badge) issues.append(badge);
+  }
+  if (issues.childElementCount) entry.append(issues);
+
+  const group = source.deferred_psts ? deferredPstGroup(source, expandedPsts.has("source-deferred-" + source.id)) : null;
+  const problems = node("ul", "", "source-issues");
+  const offered = new Set();
+  const canExclude = source.kind === "eml_dir" && !workingIndexStates.has(source.state) &&
+    !["queued", "removing", "remove_failed"].includes(source.state);
+  for (const problem of source.problems || []) {
+    const held = problem.code === "pst_in_use" && group;
+    const folder = problem.item.includes("/") ? problem.item.split("/")[0] : "";
+    const line = held ? null : node("li", problem.item + " · " + reasonText(problem.code, "document"));
+    if (line) problems.append(line);
+    if (canExclude && folder && !offered.has(folder)) {
+      offered.add(folder);
+      const button = sourceIgnoreButton(source, folder);
+      if (held) {
+        const action = node("p", "", "source-pst-action");
+        action.append(node("span", folder), button);
+        group.append(action);
+      } else {
+        line.append(" ", button);
+      }
+    }
+  }
+  if (group) entry.append(group);
+  if (problems.childElementCount) entry.append(problems);
+}
+
 async function showSources() {
   const version = ++sourceRequest;
   const data = await call("/api/sources?scan=0", undefined, AbortSignal.timeout(10000)).catch((error) => {
@@ -401,6 +623,10 @@ async function showSources() {
   if (next === sourceSnapshot) return;
   sourceSnapshot = next;
   const focusedAction = sourcesList.contains(document.activeElement) ? document.activeElement.dataset.action : "";
+  const pinnedPopover = activeSourcePopover?.pinned ? activeSourcePopover.key : null;
+  activeSourcePopover?.close();
+  sourcePopovers.clear();
+  const expandedPsts = new Set([...sourcesList.querySelectorAll("details[open]")].map((item) => item.id));
   sourcesList.replaceChildren();
   if (!data.sources.length) {
     sourcesList.append(node("p", "등록된 자료가 없습니다.", "source-empty"));
@@ -426,7 +652,7 @@ async function showSources() {
     } else {
       const [general, semantic] = sourceIndexStatuses(source, Boolean(data.embedding));
       const stages = node("div", "", "index-stages");
-      const generalRow = sourceIndexRow("일반 색인", general);
+      const generalRow = sourceIndexRow("기본 검색(키워드)", general);
       if (pstRead) {
         const position = source.kind === "eml_dir" ? "PST " + pstRead.position + " / " + pstRead.total + " · " : "";
         generalRow.append(node("p", position + pstRead.item));
@@ -436,54 +662,17 @@ async function showSources() {
           generalRow.append(node("p", "최근 " + elapsedTime(pstRead.idle) + " 동안 새 추출 파일이 확인되지 않았습니다."));
         }
       }
-      stages.append(generalRow, sourceIndexRow("의미 색인 (임베딩)", semantic));
-      entry.append(stages, node("p", "이번 색인 · " + kindCountLine(source)));
-    }
-    if (source.failed || source.omitted || source.partial) {
-      const issues = node("ul", "", "source-issues");
-      const counts = [[source.failed, "실패"], [source.omitted, "누락"], [source.partial, "일부 색인"]]
-        .filter(([value]) => value > 0).map(([value, label]) => label + " " + indexingNumber.format(value) + "건");
-      entry.append(node("p", "X " + counts.join(" · "), "issue"));
-      if (source.deferred_psts) {
-        entry.append(node("p", "X 사용 중이라 보류된 PST " + indexingNumber.format(source.deferred_psts) + "개", "issue"));
-      }
-      const offeredFolders = new Set();
-      for (const problem of source.problems || []) {
-        const reason = issueNames[problem.code] || problem.code;
-        const line = node("li", problem.item + " · " + reason);
-        const slash = problem.item.indexOf("/");
-        if (slash > 0 && source.kind === "eml_dir" &&
-            !workingIndexStates.has(source.state) && !["queued", "removing", "remove_failed"].includes(source.state)) {
-          const folder = problem.item.slice(0, slash);
-          if (!offeredFolders.has(folder)) {
-            offeredFolders.add(folder);
-            const button = node("button", "이 폴더 제외 후 갱신", "text-button");
-            button.type = "button";
-            button.title = folder;
-            button.dataset.action = "ignore-" + source.id + "-" + folder;
-            button.addEventListener("click", async () => {
-              button.disabled = true;
-              try {
-                await call("/api/sources/" + source.id + "/ignore", { pattern: folder + "/" });
-                clearSearch();
-                notice(folder + " 폴더를 제외하고 보관함을 갱신합니다.");
-                await showSources();
-              } catch (error) {
-                notice(error.message);
-              } finally {
-                button.disabled = false;
-              }
-            });
-            line.append(" ", button);
-          }
-        }
-        issues.append(line);
-      }
-      if (issues.childElementCount) entry.append(issues);
+      stages.append(generalRow, sourceIndexRow("AI 의미 검색", semantic));
+      entry.append(stages, node("p", kindCountLine(source)));
+      appendSourceIssues(entry, source, expandedPsts);
     }
     if (source.updated) {
       const existing = source.active !== null && source.pending !== null;
-      entry.append(node("p", (existing ? "검색은 이전 색인 사용 중 · " : "검색용 색인 기준 · ") + formatDate(source.updated)));
+      const date = new Date(source.updated);
+      const short = Number.isNaN(date.getTime()) ? "날짜 미상" : shortSourceDate.format(date);
+      const updated = node("p", existing ? "현재 " + short + " 기준 색인으로 검색 중" : short + " 기준 색인");
+      updated.title = formatDate(source.updated);
+      entry.append(updated);
     }
     const actions = node("div", "", "source-actions");
     const choices = ["queued", "extracting", "headers", "attachments", "embeddings"].includes(source.state)
@@ -497,6 +686,7 @@ async function showSources() {
       const button = node("button", label, "text-button");
       button.type = "button";
       button.dataset.action = action + "-" + source.id;
+      if (action === "refresh") button.title = "새로 추가·변경된 파일만 반영합니다. 기존 완료된 AI 임베딩은 유지됩니다.";
       button.addEventListener("click", async () => {
         if (action === "remove" && !confirm(name + "의 색인과 임시 추출물을 삭제할까요?")) return;
         button.disabled = true;
@@ -520,6 +710,8 @@ async function showSources() {
       const check = node("button", "변경 확인", "text-button");
       const info = node("p", "", "issue");
       check.type = "button";
+      check.title = "실제 색인 없이 추가·수정된 파일이 있는지만 빠르게 확인합니다.";
+      check.dataset.action = "check-" + source.id;
       check.addEventListener("click", async () => {
         check.disabled = true;
         info.textContent = "폴더를 확인하는 중입니다.";
@@ -546,10 +738,11 @@ async function showSources() {
   }
   showFilterCount();
   if (focusedAction) {
-    const replacement = [...sourcesList.querySelectorAll("button")]
-      .find((button) => button.dataset.action === focusedAction);
+    const replacement = [...sourcesList.querySelectorAll("[data-action]")]
+      .find((target) => target.dataset.action === focusedAction);
     (replacement || addOpen).focus({ preventScroll: true });
   }
+  if (pinnedPopover) sourcePopovers.get(pinnedPopover)?.open(true);
   const modelStatus = element("model-status");
   localAnswerAvailable = Boolean(data.model);
   externalAnswerAvailable = Boolean(data.external);
