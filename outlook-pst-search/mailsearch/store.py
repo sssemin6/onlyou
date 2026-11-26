@@ -70,6 +70,8 @@ CREATE TABLE IF NOT EXISTS attachments (
     name TEXT NOT NULL, status TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS attachment_mail_status ON attachments(mail,status);
+CREATE INDEX IF NOT EXISTS attachment_extraction_issues ON attachments(mail,status)
+    WHERE status NOT IN ('완료','대기','미지원 형식');
 CREATE TABLE IF NOT EXISTS passages (
     id INTEGER PRIMARY KEY AUTOINCREMENT, mail INTEGER NOT NULL REFERENCES mails(id) ON DELETE CASCADE,
     attachment INTEGER REFERENCES attachments(id) ON DELETE CASCADE, location TEXT NOT NULL,
@@ -1071,8 +1073,45 @@ class Store:
         with self.connection() as conn:
             return conn.execute("SELECT * FROM sources WHERE id=?", (source,)).fetchone()
 
+    @staticmethod
+    def source_extraction_issues(conn):
+        # Poll over problem rows and the sparse attachment index, including only
+        # the revision being shown on each card.
+        return conn.execute(
+            """WITH failed_files AS (
+                   SELECT p.source,p.code reason,
+                          CASE
+                              WHEN p.code IN ('parse','mail_original_changed') THEN 'mail'
+                              WHEN p.code IN ('pst_in_use','pst_access_denied','pst_changed','pst_no_mail',
+                                              'pst_export','pst_invalid') THEN 'pst'
+                              ELSE 'document'
+                          END kind
+                   FROM problems p JOIN sources s ON s.id=p.source AND p.version=coalesce(s.pending,s.active)
+                   WHERE p.code<>? AND (p.code<>'mail_original_changed' OR NOT EXISTS (
+                       SELECT 1 FROM mails m WHERE m.source=p.source AND m.version=p.version AND m.item=p.item))
+               ), extracted AS (
+                   SELECT m.source,a.status reason,
+                          CASE WHEN m.kind='mail' THEN 'attachment' ELSE 'document' END kind,
+                          EXISTS(SELECT 1 FROM passages p WHERE p.attachment=a.id AND p.location<>'파일명') has_text
+                   FROM attachments a
+                   CROSS JOIN mails m ON m.id=a.mail
+                   JOIN sources s ON s.id=m.source AND m.version=coalesce(s.pending,s.active)
+                   WHERE a.status NOT IN ('완료','대기','미지원 형식')
+               ), issues AS (
+                   SELECT source,kind,reason,0 partial FROM failed_files
+                   UNION ALL
+                   SELECT source,kind,reason,has_text partial FROM extracted
+                   WHERE NOT has_text OR reason LIKE '일부 색인%'
+               )
+               SELECT source,kind,reason,partial,count(*) count FROM issues
+               GROUP BY source,kind,reason,partial ORDER BY count DESC,kind,reason""",
+            (UNSUPPORTED_FORMAT,),
+        )
+
     def sources(self):
         with self.connection() as conn:
+            if not conn.in_transaction:
+                conn.execute("BEGIN")
             # Per-kind item counts feed the sidebar's mail/document/PCF sections.
             counts = defaultdict(lambda: defaultdict(int))
             revision_counts = defaultdict(dict)
@@ -1083,6 +1122,13 @@ class Store:
             ):
                 counts[row["source"]][row["kind"]] += row["n"]
                 revision_counts[row["source"], row["version"]][row["kind"]] = row["n"]
+            issue_counts = defaultdict(lambda: defaultdict(int))
+            issue_reasons = defaultdict(list)
+            for source, kind, reason, partial, count in self.source_extraction_issues(conn):
+                issue_counts[source, partial][kind] += count
+                reasons = issue_reasons[source, partial]
+                if len(reasons) < (6 if partial else 8):
+                    reasons.append({"kind": kind, "reason": reason, "count": count})
             sources = []
             for row in conn.execute("SELECT * FROM sources ORDER BY id"):
                 version = row["pending"] or row["active"]
@@ -1091,9 +1137,20 @@ class Store:
                     (row["id"], version, UNSUPPORTED_FORMAT)).fetchall()
                 deferred_psts = conn.execute("""SELECT COUNT(*) FROM problems WHERE source=? AND version=?
                     AND code='pst_in_use'""", (row["id"], version)).fetchone()[0]
+                deferred_names = [
+                    item.rsplit("/", 1)[-1] for item, in conn.execute(
+                        """SELECT item FROM problems WHERE source=? AND version=? AND code='pst_in_use'
+                           ORDER BY item LIMIT 20""", (row["id"], version),
+                    )
+                ] if deferred_psts else []
                 sources.append({**dict(row), "counts": counts.get(row["id"], {}),
                                 "index_counts": revision_counts.get((row["id"], version), {}),
-                                "deferred_psts": deferred_psts, "problems": [dict(problem) for problem in problems]})
+                                "omitted_by_kind": issue_counts[row["id"], 0],
+                                "partial_by_kind": issue_counts[row["id"], 1],
+                                "omitted_reasons": issue_reasons[row["id"], 0],
+                                "partial_reasons": issue_reasons[row["id"], 1],
+                                "deferred_psts": deferred_psts, "deferred_pst_names": deferred_names,
+                                "problems": [dict(problem) for problem in problems]})
             return sources
 
     def allowed_sources(self, source=None, *, sources=None):
