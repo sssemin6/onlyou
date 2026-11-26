@@ -119,10 +119,11 @@ const issueNames = {
   index_unavailable: "색인 DB에 접근하지 못했습니다. 잠시 후 다시 시도하세요.",
 };
 let previousQuestion = "";
-let localConversation = "";
+let answerConversation = "";
 let localAnswerAvailable = false;
 let externalAnswerAvailable = false;
 let intranetAnswerAvailable = false;
+let semanticSources = [];
 let request;
 let pendingReview;
 let sourceSnapshot = "";
@@ -200,11 +201,8 @@ async function call(route, data, signal) {
 }
 
 function showAnswerControls() {
-  const enabled = localAnswerAvailable && activeTab !== "pcf";
-  element("local-conversation").hidden = !enabled;
-  element("submit-local-answer").hidden = !enabled;
-  element("submit-ask-label").textContent = intranetAnswerAvailable && activeTab !== "pcf"
-    ? "사내 AI 답변" : "AI 근거 찾기";
+  const conversationAvailable = intranetAnswerAvailable || (localAnswerAvailable && !externalAnswerAvailable);
+  element("local-conversation").hidden = activeTab === "pcf" || !(conversationAvailable || answerConversation);
 }
 
 async function streamAnswer(payload, signal, progress) {
@@ -747,6 +745,8 @@ async function showSources() {
   localAnswerAvailable = Boolean(data.model);
   externalAnswerAvailable = Boolean(data.external);
   intranetAnswerAvailable = Boolean(data.intranet_answer);
+  semanticSources = data.embedding ? data.sources.filter((source) =>
+    source.embedding_model_current && source.embedding_done > 0 && (source.active || source.pending)) : [];
   showAnswerControls();
   modelStatus.parentElement.dataset.configured = Boolean(data.embedding);
   if (data.embedding_endpoint) {
@@ -1001,7 +1001,7 @@ async function localAnswer(payload, active) {
   const stop = element("cancel-answer");
   stop.hidden = false;
   try {
-    const data = await streamAnswer({ ...payload, context: "", session_id: localConversation }, active.signal, (event) => {
+    const data = await streamAnswer({ ...payload, context: "", session_id: answerConversation }, active.signal, (event) => {
       if (active.signal.aborted) return;
       const labels = {
         planning: "질문을 분석하고 있습니다.",
@@ -1012,7 +1012,7 @@ async function localAnswer(payload, active) {
       if (labels[event.stage]) notice(labels[event.stage]);
     });
     if (active.signal.aborted) return;
-    localConversation = data.session_id || "";
+    answerConversation = data.session_id || "";
     showAnswer(data);
     showResults(data.results, "근거 후보");
     notice("");
@@ -1028,8 +1028,9 @@ element("cancel-answer").addEventListener("click", () => {
 });
 
 element("reset-conversation").addEventListener("click", async () => {
-  const old = localConversation;
-  localConversation = "";
+  const old = answerConversation;
+  answerConversation = "";
+  showAnswerControls();
   clearSearch();
   setQuestionContext("");
   element("query").focus();
@@ -1115,14 +1116,28 @@ async function previewAnswer(route, payload, active, pcf) {
 }
 
 element("query").addEventListener("input", clearSearch);
+const quickSearch = element("search-quick");
+const keywordSearch = element("search-keyword");
+for (const [option, other] of [[quickSearch, keywordSearch], [keywordSearch, quickSearch]]) {
+  option.addEventListener("change", () => {
+    if (option.checked) other.checked = false;
+  });
+}
+
+function searchMode(filters) {
+  if (quickSearch.checked && !filters.body) return "quick";
+  const semanticReady = semanticSources.some((source) =>
+    (!filters.source || String(source.id) === filters.source) &&
+    (activeTab === "all" || source.counts?.[activeTab] > 0));
+  return semanticReady && !keywordSearch.checked && !quickSearch.checked ? "hybrid" : "keyword";
+}
+
 form.addEventListener("submit", async (event) => {
   event.preventDefault();
   clearSearch();
   const active = request = new AbortController();
   const query = element("query").value.trim();
-  const intent = event.submitter?.value;
-  const ask = intent === "ask" || intent === "local-answer";
-  const mode = intent === "semantic" ? "hybrid" : intent === "body" ? "keyword" : "quick";
+  const ask = event.submitter?.value === "ask";
   const pcf = activeTab === "pcf";
   if (ask && !query) {
     element("query").focus();
@@ -1131,27 +1146,29 @@ form.addEventListener("submit", async (event) => {
   }
   const filters = Object.fromEntries(["source", ...TAB_FILTERS[activeTab]].map((id) => [id, element(id).value]));
   filters.tab = activeTab;
+  const mode = searchMode(filters);
   const payload = { query, filters, context: ask ? previousQuestion : "" };
   notice(ask ? "답변에 쓸 근거를 찾고 있습니다." : mode === "hybrid" ? "의미 검색 중입니다." : "검색 중입니다.");
   try {
-    if (!pcf && (intent === "local-answer" || (ask && localAnswerAvailable && !externalAnswerAvailable))) {
-      await localAnswer(payload, active);
-    } else if (ask && !pcf && intranetAnswerAvailable) {
-      const data = await call("/api/intranet/answer", payload, active.signal);
+    if (ask && !pcf && intranetAnswerAvailable) {
+      const data = await call("/api/intranet/answer", { ...payload, context: "", conversation: answerConversation }, active.signal);
       if (active.signal.aborted) return;
+      answerConversation = data.conversation || "";
       showAnswer(data);
       if (data.status !== "external_unavailable") showResults(data.results, "사용한 근거");
       rememberQuestion(data, query);
       notice("");
+    } else if (ask && !pcf && localAnswerAvailable && !externalAnswerAvailable) {
+      await localAnswer(payload, active);
     } else if (ask) {
       await previewAnswer(pcf ? "/api/pcf/preview" : "/api/external/preview", payload, active, pcf);
     } else {
-      const data = await call("/api/search", { ...payload, mode, defer_access: true, full_text: intent === "body",
+      const data = await call("/api/search", { ...payload, mode, defer_access: true, full_text: mode === "keyword",
         rerank: mode === "hybrid" && element("search-rerank").checked }, active.signal);
       if (active.signal.aborted) return;
       const quick = data.mode === "quick" && query;
       const title = quick ? "빠른 검색 결과" : query ? "검색 결과" : recentTitle();
-      const emptyMessage = quick ? "제목·발신자·수신자·파일명에 일치하는 자료가 없습니다. 본문 검색으로 찾아보세요." : undefined;
+      const emptyMessage = quick ? "일치하는 자료가 없습니다. 빠른 검색을 끄면 전체 본문과 첨부파일을 찾습니다." : undefined;
       showResults(data.results, title, data.access_ticket ? "원본 접근을 확인하는 중입니다." : emptyMessage);
       if (data.access_ticket) {
         notice("원본 접근을 확인하는 중입니다.");
