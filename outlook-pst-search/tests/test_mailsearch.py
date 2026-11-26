@@ -7,6 +7,7 @@ import logging
 import os
 import shutil
 import sqlite3
+import subprocess
 import ssl
 import sys
 import tempfile
@@ -34,7 +35,7 @@ from mailsearch.external import ExternalAI, Excerpt, Reviews, pack_excerpts, pcf
 from mailsearch.extract import convert_legacy, extract_attachment, extract_bytes
 from mailsearch.filesystem import DRIVE_REMOTE, is_unc_share, local_path, source_path
 from mailsearch.intranet import CHAT_PATH, RERANK_PATH, IntranetAI, LOCAL_EMBEDDING
-from mailsearch.indexer import ImportIssue, Indexer
+from mailsearch.indexer import ImportIssue, Indexer, folder_files
 from mailsearch.ollama_setup import (InstallCommandError, install_ollama, package_progress,
                                     pull_model, run_install_command, winget_binary)
 from mailsearch.outlook import OutlookError, OutlookStore
@@ -42,6 +43,7 @@ from mailsearch.search_profile import SearchProfile
 from mailsearch.server import (App, INSTANCE_FILE, SessionLock, existing_origin, gateway_defaults,
                                gateway_diagnostics, main, publish_instance)
 from mailsearch.store import VECTOR_LOOKUP_SQL, Store, contextual_model_key, fingerprint, local_midnight_utc, mail_sections, merge_contiguous_passages, pack_vector, question_scope, read_signature, sections
+from mailsearch.windows_dependencies import main as prepare_windows_dependencies
 from tools.demo import generate
 
 
@@ -1505,6 +1507,48 @@ class Integration(unittest.TestCase):
         with patch.object(self.store, "vector_index", object()):
             self.assertEqual(self.store.vector_backend, "usearch(int8)")
 
+    def test_console_log_reports_progress_and_413_without_mail_query_or_key(self):
+        data = Path(self.workspace.name) / "console"
+        mail_body = "PRIVATE_MAIL_SAMPLE with enough text to embed."
+        query = "PRIVATE_SEARCH_SAMPLE"
+        secret = "PRIVATE_API_KEY_SAMPLE"
+        archive = Path(self.workspace.name) / "console-archive"
+        archive.mkdir()
+        for i in range(2):
+            (archive / f"{i}.eml").write_text(f"Subject: Test fixture {i}\n\n{mail_body}")
+        recorded = []
+
+        def embed(provider, values, timeout):
+            recorded.extend(values)
+            self.assertEqual(provider._key, secret)
+            if len(values) > 1:
+                raise GatewayRequestError(413)
+            return [[1., .05, .12]]
+
+        def work(app):
+            source = app.indexer.register(archive)
+            self.assertEqual(await_source(app.store, source, {"ready", "error"})["embedding_done"], 2)
+            app.store.lexical(query, {"source": source})
+            try:
+                raise ValueError(query + mail_body + secret)
+            except ValueError:
+                app.handle_error(None, None)
+
+        with (patch.dict(os.environ, {"LITELLM_API_KEY": secret}), patch.object(EmbeddingAPI, "embed", embed),
+              patch.object(App, "serve_forever", work), redirect_stdout(io.StringIO()) as stdout,
+              redirect_stderr(io.StringIO()) as stderr):
+            self.assertEqual(main(["--data", str(data), "--port", "0", "--no-browser", "--console-log"]), 0)
+        self.assertRegex(stdout.getvalue(), r"\[onlyou\] URL http://127\.0\.0\.1:\d+")
+        output = stderr.getvalue()
+        self.assertRegex(output, r"\d{4}-\d\d-\d\d .* INFO App starting")
+        self.assertIn("[색인] 메일·문서 2/2건", output)
+        self.assertIn("[임베딩] 100.0% (2/2구간)", output)
+        self.assertIn("next_batch=1): HTTP 413", output)
+        self.assertIn("Request handler failed (ValueError)", output)
+        self.assertTrue(any(mail_body in value for value in recorded))
+        for private in (mail_body, query, secret):
+            self.assertNotIn(private, output)
+
     def test_external_gap_labels_are_applied_after_reviewed_generation(self):
         source = self.import_mail()
         original = self.store.lexical("A-17", {"source": source})[:1]
@@ -2836,6 +2880,77 @@ class Integration(unittest.TestCase):
         self.assertTrue(any("skipped 3 unsupported files" in entry for entry in log.output), log.output)
         self.assertFalse(self.store.lexical("Excluded content", {"source": source}))
 
+    def test_software_detection_preserves_direct_mail_and_exempts_the_source_root(self):
+        folder = self.mail / "software-heuristic"
+        software = folder / "MSC.Software" / "Patran_x64"
+        child = software / "help"
+        protected = folder / "work"
+        for path in (child, protected, folder / "OneDriveTemp"):
+            path.mkdir(parents=True)
+        for path in (folder, software, protected):
+            (path / "binary.EXE").touch()
+            (path / "plugin.DLL").touch()
+            (path / "file.txt").touch()
+        (child / "manual.txt").touch()
+        (protected / "mail.PST").touch()
+        (folder / "OneDriveTemp" / "cache.txt").touch()
+        with self.assertLogs("mailsearch.runtime", "INFO") as logs:
+            paths = list(folder_files(folder, {".pst", ".txt"}, log_skipped=True))
+        self.assertEqual({path.relative_to(folder).as_posix() for path in paths},
+                         {"file.txt", "work/file.txt", "work/mail.PST"})
+        self.assertIn("Skipped software directory: 'MSC.Software/Patran_x64'", logs.output[0])
+
+    def test_ignore_endpoint_refreshes_writable_and_read_only_archives(self):
+        for writable in (True, False):
+            with self.subTest(writable=writable):
+                folder = self.mail / ("writable" if writable else "readonly")
+                (folder / "target[1]").mkdir(parents=True)
+                (folder / "target1").mkdir()
+                (folder / "target[1]" / "corrupt.xlsx").write_bytes(b"invalid workbook")
+                (folder / "target[1]" / "archive.pst").write_bytes(b"invalid PST")
+                (folder / "target[1]" / "manual.txt").write_text("Unique target archive document.")
+                (folder / "target1" / "keep.txt").write_text("Unrelated useful content to keep.")
+                ignore = folder / ".mailsearchignore"
+                ignore.write_text("# Original rules\n")
+                source = self.indexer.register(folder)
+                row = await_source(self.store, source, {"ready", "error"})
+                self.assertEqual((row["state"], row["done"], row["omitted"]), ("ready", 2, 2))
+                scope = {"source": source}
+                self.assertTrue(self.store.lexical("Unique target archive document", scope))
+                route = f"/api/sources/{source}/ignore"
+                self.assertEqual(self.call(route, {"pattern": "target[1]/"}, token=False)[0], 403)
+                self.assertEqual(self.call(route, {"pattern": "../target[1]/"})[0], 400)
+
+                from mailsearch.indexer import atomic_write
+
+                def write(target, content):
+                    if not writable and target == ignore:
+                        raise PermissionError("read-only share")
+                    return atomic_write(target, content)
+
+                with patch("mailsearch.indexer.atomic_write", side_effect=write):
+                    self.assertEqual(self.call(route, {"pattern": "target[1]/"})[0], 202)
+                    refreshed = await_source(self.store, source, {"ready", "error", "empty"})
+                self.assertEqual((refreshed["state"], refreshed["done"], refreshed["omitted"]), ("ready", 1, 0))
+                self.assertGreater(refreshed["active"], row["active"])
+                self.assertFalse(self.store.lexical("Unique target archive document", scope))
+                self.assertTrue(self.store.lexical("Unrelated useful content", scope))
+                self.assertEqual(self.indexer.pending_updates(refreshed), [])
+                self.assertFalse(self.store.pst_files(source))
+                deadline = time.monotonic() + 3
+                while self.indexer.has_work() and time.monotonic() < deadline:
+                    time.sleep(.01)
+                with self.store.connection() as conn:
+                    self.assertIsNone(conn.execute("SELECT 1 FROM mails WHERE source=? AND item LIKE 'target[1]/%'",
+                                                   (source,)).fetchone())
+                    self.assertIsNone(conn.execute("SELECT 1 FROM problems WHERE source=?", (source,)).fetchone())
+                if writable:
+                    self.assertIn("/target[[]1]/", ignore.read_text())
+                else:
+                    self.assertEqual(ignore.read_text(), "# Original rules\n")
+                    settings = json.loads((self.store.root / "source-ignores.json").read_text())
+                    self.assertEqual(settings[str(source)], ["/target[[]1]/"])
+
     def test_pst_lock_and_windows_permission_errors_are_distinct(self):
         folder = self.mail / "locks"
         folder.mkdir()
@@ -3085,6 +3200,36 @@ class Integration(unittest.TestCase):
         self.assertEqual(indexed["failed"], 0)
         self.assertEqual(hashlib.sha256(path.read_bytes()).digest(), original_digest)
         self.assertTrue(self.call("/api/search", {"query": "", "filters": {}})[1]["results"])
+
+
+class WindowsDependencies(unittest.TestCase):
+    def test_windows_dependency_setup_uses_same_python_and_prefers_offline_wheels(self):
+        with (tempfile.TemporaryDirectory() as wheels,
+              patch.dict(os.environ, {"MAILSEARCH_SKIP_PIP": "0", "MAILSEARCH_WHEEL_DIR": wheels}),
+              patch("mailsearch.windows_dependencies.import_module", side_effect=[object(), ImportError]),
+              patch("mailsearch.windows_dependencies.subprocess.run", side_effect=subprocess.TimeoutExpired("pip", 30)) as run,
+              redirect_stdout(io.StringIO()) as stdout, redirect_stderr(io.StringIO()) as stderr):
+            self.assertIsNone(prepare_windows_dependencies())
+            args = run.call_args.args[0]
+            self.assertEqual(args[:3], [sys.executable, "-m", "pip"])
+            self.assertIn("--no-index", args)
+            self.assertEqual(args[args.index("--find-links") + 1], str(Path(wheels).resolve()))
+            self.assertEqual(args[-1], "xlrd")
+            self.assertNotIn("pypdf", args)
+            self.assertEqual(run.call_args.kwargs["stderr"], subprocess.DEVNULL)
+            self.assertIn("설치 중 (xlrd)", stdout.getvalue())
+            self.assertIn("앱은 계속 시작합니다", stderr.getvalue())
+
+    def test_windows_dependency_setup_skips_pip_when_requested_or_imports_succeed(self):
+        with (patch("mailsearch.windows_dependencies.import_module") as probe,
+              patch("mailsearch.windows_dependencies.subprocess.run") as run):
+            with patch.dict(os.environ, {"MAILSEARCH_SKIP_PIP": "1"}):
+                prepare_windows_dependencies()
+                probe.assert_not_called()
+            with patch.dict(os.environ, {"MAILSEARCH_SKIP_PIP": "0"}):
+                prepare_windows_dependencies()
+                self.assertEqual([call.args[0] for call in probe.call_args_list], ["pypdf", "xlrd"])
+            run.assert_not_called()
 
 
 class SourcePaths(unittest.TestCase):
