@@ -70,6 +70,38 @@ class MarkdownTransportTests(unittest.TestCase):
         self.assertTrue(response.closed)
         self.conn.close.assert_called_once()
 
+    def test_sse_reads_shrink_socket_timeout_under_the_original_deadline(self):
+        body = (self.event("첫 답변") + self.event("다음 답변")).encode()
+        response = self.response(body, "text/event-stream")
+        socket = self.conn.sock
+        clock = [10.0]
+        readline = response.readline
+
+        def getresponse():
+            # http.client detaches the socket if the response will close the connection.
+            self.conn.sock = None
+            return response
+
+        def read_line(limit):
+            line = readline(limit)
+            clock[0] = next(read_times)
+            return line
+
+        read_times = iter((10.6, 10.98, 11.01))
+        self.conn.getresponse.side_effect = getresponse
+        with (patch("mailsearch.embedding.monotonic", side_effect=lambda: clock[0]),
+              patch.object(response, "readline", side_effect=read_line)):
+            stream = request_gateway_stream(self.client.gateway, self.client.path, {}, {}, timeout=1)
+            self.assertEqual(next(stream)["choices"][0]["delta"]["content"], "첫 답변")
+            with self.assertRaises(TimeoutError):
+                next(stream)
+        timeouts = [call.args[0] for call in socket.settimeout.call_args_list]
+        self.assertEqual(len(timeouts), 3)
+        for actual, expected in zip(timeouts, (1.0, 0.4, 0.05), strict=True):
+            self.assertAlmostEqual(actual, expected)
+        self.assertTrue(response.closed)
+        self.conn.close.assert_called_once()
+
     def test_bad_event_or_callback_cancellation_closes_without_retry(self):
         def stop(_text):
             raise InterruptedError("cancelled")
@@ -89,6 +121,13 @@ class MarkdownTransportTests(unittest.TestCase):
 
 
 class MarkdownSourcesTests(unittest.TestCase):
+    def test_grouped_source_numbers_are_split_validated_and_mapped(self):
+        excerpts = [Excerpt(number, 10 + number, f"원문 {number}", mail=20 + number) for number in (1, 2, 3)]
+        result = validate_markdown_answer("확정 [1, 2]. 비교 [1, 2, 3] 및 [3, 99, 2].", excerpts)
+        self.assertEqual(result["status"], "answered")
+        self.assertEqual(result["markdown"], "확정 [1][2]. 비교 [1][2][3] 및 [3][2].")
+        self.assertEqual([(item["index"], item["passage"]) for item in result["sources"]], [(1, 11), (2, 12), (3, 13)])
+
     def test_valid_inline_sources_keep_original_excerpt_and_drop_unknown_indices(self):
         excerpts = [Excerpt(1, 10, "승인 회신 원문", {"subject": "승인", "sender": "Lee", "sent": "2026-11-23"},
                             window_start=0, mail=20)]
