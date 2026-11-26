@@ -16,6 +16,7 @@ import time
 import unittest
 import zipfile
 import zlib
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext, redirect_stderr, redirect_stdout
 from datetime import date
 from unittest.mock import MagicMock, patch
@@ -1649,6 +1650,166 @@ class Integration(unittest.TestCase):
         self.assertEqual(evidence["attachments"][1]["status"], "미지원 형식")
         self.assertEqual(self.call("/api/search", {"query": "납품", "filters": {"after": "2027-01-01"}})[1]["results"], [])
         self.assertEqual(self.call("/api/search", {"query": 123})[0], 400)
+
+    def test_intranet_stream_reports_stages_before_validated_completion(self):
+        source = self.import_mail()
+        self.assertEqual(self.call("/api/intranet/settings", {"action": "apply", "key": "fixture-key", "selections": {
+            "answer": "answer-model-a", "embedding": "", "rerank": "bge-reranker-v2-m3",
+        }})[0], 200)
+        quote = "요청 주신 4월 25일 납품으로 최종 승인합니다."
+        route = "/api/intranet/answer/stream"
+        payload = {"query": "A-17 납품일", "filters": {"source": source}}
+        self.assertEqual(self.call(route, payload, token=False)[0], 403)
+        generating, release = threading.Event(), threading.Event()
+
+        def complete(_instructions, content, **_options):
+            generating.set()
+            self.assertTrue(release.wait(4))
+            row = next(row for row in json.loads(content)["evidence"] if quote in row["text"])
+            return {"status": "answered", "claims": [
+                {"text": "최종 승인 납품일은 4월 25일입니다.", "citations": [{"source": row["source"], "quote": quote}]},
+                {"text": "납품일은 7월 15일입니다.", "citations": [{"source": row["source"], "quote": quote}]},
+            ]}
+
+        def next_event(response, name):
+            self.assertEqual(response.readline(), f"event: {name}\n".encode())
+            data = json.loads(response.readline()[6:])
+            self.assertEqual(response.readline(), b"\n")
+            return data
+
+        conn = http.client.HTTPConnection("127.0.0.1", self.app.server_port, timeout=8)
+        with (patch.dict(os.environ, MAILSEARCH_QUERY_REWRITE="0", MAILSEARCH_AGENTIC_RETRY="0"),
+              patch.object(self.ai.embedding_api, "rerank", side_effect=lambda query, rows: list(range(len(rows)))) as rerank,
+              patch.object(self.app.external, "complete", side_effect=complete)):
+            try:
+                conn.request("POST", route, json.dumps(payload),
+                             {"X-Mail-Session": self.app.token, "Content-Type": "application/json"})
+                response = conn.getresponse()
+                self.assertEqual(response.status, 200)
+                self.assertEqual(response.getheader("Content-Type"), "text/event-stream; charset=utf-8")
+                stages = [next_event(response, "stage") for _ in range(3)]
+                self.assertEqual([event["stage"] for event in stages], ["retrieving", "reranking", "generating"])
+                self.assertGreater(stages[1]["candidates"], 1)
+                self.assertGreater(stages[2]["evidence"], 0)
+                self.assertTrue(generating.wait(1))
+                release.set()
+                result = next_event(response, "complete")
+                self.assertEqual(response.read(), b"")
+            finally:
+                release.set()
+                conn.close()
+        rerank.assert_called_once()
+        self.assertRegex(result["conversation"], r"^[\w-]{32}$")
+        self.assertEqual([claim["text"] for claim in result["claims"]], ["최종 승인 납품일은 4월 25일입니다."])
+        self.assertEqual(result["claims"][0]["citations"][0]["quote"], quote)
+
+    def test_intranet_concurrency_serializes_each_conversation_and_excludes_settings(self):
+        source = self.import_mail()
+        route = "/api/intranet/answer"
+        selections = {"answer": "answer-model-a", "embedding": "", "rerank": ""}
+        settings = {"action": "apply", "key": "fixture-key", "selections": selections}
+        self.assertEqual(self.call("/api/intranet/settings", settings)[0], 200)
+        first_started, two_started, release = threading.Event(), threading.Event(), threading.Event()
+        lock = threading.Lock()
+        seen = []
+        key = self.app.answer_sessions.begin("")[0]
+        other = self.app.answer_sessions.begin("")[0]
+        quote = "요청 주신 4월 25일 납품으로 최종 승인합니다."
+
+        def complete(_instructions, content, **_options):
+            data = json.loads(content)
+            question = data["question"]
+            with lock:
+                seen.append(question)
+                first_started.set()
+                if len(seen) == 2:
+                    two_started.set()
+            self.assertTrue(release.wait(4))
+            row = next(row for row in data["evidence"] if quote in row["text"])
+            return {"status": "answered", "claims": [
+                {"text": "최종 승인 납품일은 4월 25일입니다.", "citations": [{"source": row["source"], "quote": quote}]},
+            ]}
+
+        original = "A-17 납품일 첫 질문"
+        different_question = "A-17 납품일 다른 대화"
+        follow_up = "그중 A-17 최종 납품일은?"
+
+        def ask(query, conversation):
+            return self.call(route, {"query": query, "conversation": conversation, "filters": {"source": source}})
+
+        with (ThreadPoolExecutor(max_workers=3) as clients,
+              patch.dict(os.environ, MAILSEARCH_QUERY_REWRITE="0", MAILSEARCH_AGENTIC_RETRY="0"),
+              patch.object(self.app.external, "complete", side_effect=complete)):
+            first = clients.submit(ask, original, key)
+            try:
+                self.assertTrue(first_started.wait(2))
+                self.assertEqual(seen, [original])
+                second = clients.submit(ask, follow_up, key)
+                different = clients.submit(ask, different_question, other)
+                self.assertTrue(two_started.wait(2))
+                self.assertEqual(seen, [original, different_question])
+                self.assertEqual(self.call("/api/intranet/settings", {"action": "disconnect"})[0], 409)
+                self.assertFalse(second.done())
+            finally:
+                release.set()
+            for future in (first, second, different):
+                status, result = future.result(timeout=3)
+                self.assertEqual((status, result["status"]), (200, "answered"))
+        self.assertEqual(seen, [original, different_question, f"{follow_up}\n이전 질문: {original}"])
+
+        settings_started, finish_settings = threading.Event(), threading.Event()
+
+        def probe():
+            settings_started.set()
+            self.assertTrue(finish_settings.wait(4))
+            return {"answer": {"ok": True}}
+
+        with (ThreadPoolExecutor(max_workers=1) as clients, patch.object(IntranetAI, "test_models", side_effect=probe)):
+            writer = clients.submit(self.call, "/api/intranet/settings", {**settings, "action": "test"})
+            try:
+                self.assertTrue(settings_started.wait(2))
+                self.assertEqual(self.call(route, {"query": "설정 변경 중"})[0], 409)
+            finally:
+                finish_settings.set()
+            self.assertEqual(writer.result(timeout=3)[0], 200)
+
+    def test_disconnected_intranet_stream_stops_before_generation_and_releases_slot(self):
+        source = self.import_mail()
+        self.assertEqual(self.call("/api/intranet/settings", {"action": "apply", "key": "fixture-key", "selections": {
+            "answer": "answer-model-a", "embedding": "", "rerank": "",
+        }})[0], 200)
+        entered, release, finished = threading.Event(), threading.Event(), threading.Event()
+
+        def rewrite(_question):
+            entered.set()
+            self.assertTrue(release.wait(4))
+            finished.set()
+            return None
+
+        conn = http.client.HTTPConnection("127.0.0.1", self.app.server_port, timeout=8)
+        key = self.app.answer_sessions.begin("")[0]
+        with (patch.dict(os.environ, MAILSEARCH_QUERY_REWRITE="1", MAILSEARCH_AGENTIC_RETRY="0"),
+              patch.object(self.ai, "rewrite_query", side_effect=rewrite),
+              patch.object(self.app.external, "complete") as generate):
+            try:
+                conn.request("POST", "/api/intranet/answer/stream",
+                             json.dumps({"query": "A-17 납품일", "conversation": key, "filters": {"source": source}}),
+                             {"X-Mail-Session": self.app.token, "Content-Type": "application/json"})
+                response = conn.getresponse()
+                self.assertEqual(response.readline(), b"event: stage\n")
+                self.assertTrue(entered.wait(2))
+                response.close()
+                conn.close()
+                deadline = time.monotonic() + 2
+                while self.app.intranet_requests and time.monotonic() < deadline:
+                    time.sleep(.01)
+                self.assertEqual(self.app.intranet_requests, 0)
+                self.assertEqual(self.app.answer_sessions.begin(key)[2], ())
+                generate.assert_not_called()
+            finally:
+                release.set()
+                conn.close()
+            self.assertTrue(finished.wait(2))
 
     def test_already_running_reopens_only_the_matching_app(self):
         path = self.store.root / INSTANCE_FILE
@@ -4172,6 +4333,9 @@ class RAGStability(unittest.TestCase):
             with patch.dict(os.environ, {"MAILSEARCH_QUERY_REWRITE": "0"}):
                 self.assertIsNone(ai.rewrite_query(question))
             request.assert_not_called()
+            self.assertEqual(ai.rewrite_query(question), plan)
+            request.assert_not_called()
+            ai.configure_embedding("", gateway)
             request.side_effect = TimeoutError
             self.assertIsNone(rewritten_evidence(MagicMock(spec=Store), ai, question, {}, ""))
             request.assert_called_once()
