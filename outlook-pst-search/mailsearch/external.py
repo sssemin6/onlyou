@@ -11,7 +11,7 @@ from urllib.parse import urlsplit
 
 from .embedding import GatewayRequestError, gateway_origin, request_gateway_json
 from .store import normalized, query_words, topic_key
-from .answer import ANSWER_INSTRUCTIONS, MODEL_NAME, map_citations
+from .answer import ANSWER_INSTRUCTIONS, MODEL_NAME, PARTICIPANT_QUESTION, mail_context, map_citations, participant_domains
 
 DEFAULT_URL = "https://api.openai.com/v1/chat/completions"
 DEFAULT_MODEL = "gpt-4.1-mini"
@@ -27,7 +27,7 @@ MAX_RESPONSE = 128 * 1024
 HOST = re.compile(r"(?:[A-Za-z0-9-]+\.)*[A-Za-z0-9-]+", re.ASCII)
 PATH = re.compile(r"/(?:[A-Za-z0-9._~-]+/)*(?:chat/completions|messages)", re.ASCII)
 JSON_INSTRUCTIONS = """
-입력 JSON에는 question과 evidence가 있다. context가 있으면 제목·발신자·발송 시각·위치를 확인할 수 있다.
+입력 JSON에는 question과 evidence가 있다. context가 있으면 제목·발신자·수신자·발송 시각·첨부명·위치를 확인할 수 있다.
 응답은 아래 구조의 JSON 객체 하나여야 한다.
 {"status":"answered","claims":[{"text":"메일 근거를 확인한 한국어 문장","citations":[{"source":1,"quote":"자료에서 연속된 실제 인용"}]}]}
 각 문장에 인용 1~3개를 넣고 quote는 4~300자 사이로 유지한다. source는 evidence 항목의 source 번호다.
@@ -138,10 +138,23 @@ class ExternalAI:
     def answer_pcf(self, content):
         return self.complete(PCF_WORD_INSTRUCTIONS, compact_json(content), token_limit=2800, timeout=90)
 
-    def answer(self, question, excerpts, instructions=ANSWER_INSTRUCTIONS, token_limit=None, timeout=None):
-        messages = evidence_payload(question, excerpts)
+    def answer(self, question, excerpts, instructions=ANSWER_INSTRUCTIONS, token_limit=None, timeout=None, *, gap_aspects=()):
+        messages = evidence_payload(question, excerpts, gap_aspects=gap_aspects if self.intranet else ())
         if any(item.context for item in excerpts):
-            instructions += "\ncontext 필드는 원문 위치와 메일 정보다. 발신자가 인용된 타인의 발언을 했다고 추정하지 않는다."
+            instructions += ("\ncontext 필드는 원문 위치와 메일 정보다. 헤더 인용은 context 필드값을 그대로 복사한다. "
+                             "발신자가 인용된 타인의 발언을 했다고 추정하지 않는다.")
+            if PARTICIPANT_QUESTION.search(question):
+                domains = participant_domains((item.mail or item.passage, item.context or {}) for item in excerpts)
+                if domains:
+                    messages["participant_domains"] = domains
+                    budget = self.review_budget
+                    if budget and len(compact_json(messages).encode("utf-8")) > budget:
+                        del messages["participant_domains"]
+                    else:
+                        instructions += "\nparticipant_domains는 확인할 교신 상대 후보 요약이다. 인용은 해당 메일의 context 또는 text에서 가져온다."
+        if "check_aspects" in messages:
+            instructions += ("\ncheck_aspects는 검색 진단의 참고 자료다. 각 항목을 근거와 대조하고 확인할 수 없는 항목은 "
+                             "미확인으로 구분한다. 자료에 없는 사실은 단정하거나 claims에 넣지 않는다.")
 
         result = self.complete(instructions + JSON_INSTRUCTIONS, compact_json(messages),
                                token_limit=token_limit or (2800 if self.host == "api.openai.com" else 1500),
@@ -233,17 +246,21 @@ class Excerpt:
     context: dict | None = None
     start: int = 0
     window_start: int | None = None
+    mail: int | None = None
 
     def original_in(self, row):
         return ((self.window_start is None or row.get("window") and row["start"] == self.window_start)
                 and row["text"][self.start:self.start + len(self.text)] == self.text)
 
 
-def evidence_payload(question, excerpts):
-    return {"question": question, "evidence": [
+def evidence_payload(question, excerpts, *, gap_aspects=()):
+    payload = {"question": question, "evidence": [
         {"source": item.number, "text": item.text, **({"context": item.context} if item.context else {})}
         for item in excerpts
     ]}
+    if gap_aspects:
+        payload["check_aspects"] = gap_aspects
+    return payload
 
 
 # Prefer one original passage per dated decision before filling with more of the same event.
@@ -280,23 +297,26 @@ def prioritized_excerpts(rows, extended):
 
 
 def pack_excerpts(question, rows, budget=0, *, with_context=False, chars=0, limit=MAX_EXCERPT_LENGTH,
-                  max_excerpts=MAX_INTERNAL_EXCERPTS):
+                  max_excerpts=MAX_INTERNAL_EXCERPTS, gap_aspects=()):
     if not budget:
         return tuple(Excerpt(number, row["passage"], text[:limit], start=offset,
                              window_start=row["start"] if row.get("window") else None)
                      for number, (row, text, offset) in enumerate(prioritized_excerpts(rows, False)[:MAX_EXCERPTS], 1))
 
     items = []
+    if gap_aspects:
+        budget -= len(compact_json({"check_aspects": gap_aspects}).encode("utf-8"))
+    if with_context and PARTICIPANT_QUESTION.search(question):
+        budget -= min(256, max(0, budget // 10))
     candidates = prioritized_excerpts(rows, True)
     words = sorted(query_words(question, fuzzy=True), key=len, reverse=True)
     chars_used = 0
     for position, (row, text, offset) in enumerate(candidates):
         context = None
         if with_context:
-            context = {field: row[field][:240] for field in ("subject", "sender", "sent", "attachment", "location")
-                       if row.get(field)}
-            if context.get("attachment"):
-                context["attachment"] = re.split(r"[/\\]", row["attachment"])[-1][:240]
+            context = mail_context(row)
+            if row.get("location"):
+                context["location"] = row["location"][:240]
         focus = next((match.start() for word in words
                       if (match := re.search(re.escape(word), text, re.I))), 0)
         decision = next((match for pattern in EVENT_SIGNALS if (match := pattern.search(text))), None)
@@ -309,7 +329,7 @@ def pack_excerpts(question, rows, budget=0, *, with_context=False, chars=0, limi
         def make_excerpt(length):
             start = max(0, min(len(text) - length, focus - length // 3))
             return Excerpt(len(items) + 1, row["passage"], text[start:start + length], context, offset + start,
-                           row["start"] if row.get("window") else None)
+                           row["start"] if row.get("window") else None, row.get("id"))
 
         low, high = 1, room
         candidate = None
@@ -351,13 +371,14 @@ class Reviews:
 
     def create(self, question, rows, generation=None, limit=MAX_EXCERPT_LENGTH, *, pcf=False, case=None,
                internal_budget=0, review_budget=0, review_chars=0, filters=None, gap_aspects=(),
-               max_excerpts=MAX_INTERNAL_EXCERPTS):
+               max_excerpts=MAX_INTERNAL_EXCERPTS, include_gap_aspects=False):
         if case is not None:
             excerpts = tuple(Excerpt(n, row["passage"], row["text"]) for n, row in enumerate(rows, 1))
         else:
             review_budget = review_budget or internal_budget
             excerpts = pack_excerpts(question, rows, review_budget, with_context=bool(internal_budget),
-                                     chars=review_chars, limit=limit, max_excerpts=max_excerpts)
+                                     chars=review_chars, limit=limit, max_excerpts=max_excerpts,
+                                     gap_aspects=gap_aspects if include_gap_aspects else ())
         if not excerpts:
             return None, None
         token = secrets.token_urlsafe(24)
