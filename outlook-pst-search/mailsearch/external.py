@@ -204,7 +204,8 @@ class ExternalAI:
             headers = {"Authorization": f"Bearer {self._key}", "Content-Type": "application/json"}
         if self.gateway:
             try:
-                payload = request_gateway_json(self.gateway, self.path, options, headers, timeout=timeout, max_bytes=MAX_RESPONSE, tls=self.tls)
+                payload = request_gateway_json(self.gateway, self.path, options, headers, timeout=timeout,
+                                               max_bytes=MAX_RESPONSE, tls=self.tls, retry_stale=False)
             except GatewayRequestError as exc:
                 raise ExternalRequestError(exc.status) from exc
         else:
