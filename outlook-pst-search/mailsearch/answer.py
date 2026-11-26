@@ -26,6 +26,17 @@ from .store import normalized, pack_vector, prioritize_attachments, query_words,
 runtime_logger = logging.getLogger("mailsearch.runtime")
 MODEL_ERRORS = (OSError, ValueError, RuntimeError, KeyError, IndexError, TypeError, OverflowError, http.client.HTTPException)
 
+
+class LocalModelHTTPError(RuntimeError):
+    def __init__(self, status):
+        super().__init__("local_model_http")
+        self.status = status
+
+
+class LocalModelStartupError(OSError):
+    """The loopback model server could not be started."""
+
+
 QUOTE_LIMIT = 300
 ANSWER_CLAIM_LIMIT = 8
 ANSWER_TEXT_LIMIT = 720
@@ -305,7 +316,7 @@ class LocalAI:
             connection.request("POST" if body else "GET", path, body, {"Content-Type": "application/json"})
             response = connection.getresponse()
             if response.status != 200:
-                raise RuntimeError("local_model_http")
+                raise LocalModelHTTPError(response.status)
             yield response
         finally:
             connection.close()
@@ -323,39 +334,53 @@ class LocalAI:
             self._ensure_server()
 
     def _ensure_server(self):
+        startup_errors = (OSError, http.client.HTTPException, LocalModelHTTPError)
         try:
             self.ollama_models()
             return
-        except OSError:
+        except startup_errors:
             pass
         binary = ollama_binary()
         if not binary:
-            raise OSError("ollama_not_found")
-        if self.server is None or self.server.poll() is not None:
+            raise LocalModelStartupError("ollama_not_found")
+        # A failed health check allows us to replace only the process we own.
+        try:
+            self._stop_server()
             environment = dict(os.environ, OLLAMA_HOST=f"127.0.0.1:{self.port}")
             self.server = subprocess.Popen(
                 [binary, "serve"], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL, env=environment, creationflags=CREATE_FLAGS,
             )
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise LocalModelStartupError("ollama_not_started") from exc
         deadline = time.monotonic() + 30
         while time.monotonic() < deadline:
             try:
                 self.ollama_models()
                 return
-            except OSError:
+            except startup_errors as exc:
                 if self.server.poll() is not None:
-                    raise OSError("ollama_not_started")
+                    self.server = None
+                    raise LocalModelStartupError("ollama_not_started") from exc
                 time.sleep(.4)
-        raise OSError("ollama_not_started")
+        raise LocalModelStartupError("ollama_not_started")
 
     def shutdown(self):
         with self.server_lock:
-            if self.server is not None and self.server.poll() is None:
+            self._stop_server()
+
+    def _stop_server(self):
+        if self.server is not None and self.server.poll() is None:
+            try:
                 self.server.terminate()
-                try:
-                    self.server.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    self.server.kill()
+            except ProcessLookupError:
+                pass
+            try:
+                self.server.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self.server.kill()
+                self.server.wait(timeout=5)
+        self.server = None
 
     def ollama_models(self):
         data = self.call("/api/tags", timeout=2)
@@ -385,13 +410,18 @@ class LocalAI:
         return embed(texts, timeout)
 
     def embed_local(self, model, texts, timeout=8):
-        with self.embed_ready_lock:
-            ready = self.embed_ready.get(model)
-            if ready is None or time.monotonic() >= ready[1]:
-                self.ensure_server()
-                ready = self.ensure_model(model), time.monotonic() + 30
-                self.embed_ready = {model: ready}
+        ready = None
         try:
+            with self.embed_ready_lock:
+                ready = self.embed_ready.get(model)
+                if ready is None or time.monotonic() >= ready[1]:
+                    self.ensure_server()
+                    try:
+                        canonical = self.ensure_model(model)
+                    except LocalModelHTTPError as exc:
+                        raise LocalModelStartupError("local_model_http") from exc
+                    ready = canonical, time.monotonic() + 30
+                    self.embed_ready = {model: ready}
             values = self.call("/api/embed", {
                 "model": ready[0], "input": texts, "truncate": True, "keep_alive": -1,
             }, timeout)
@@ -400,6 +430,9 @@ class LocalAI:
             with self.embed_ready_lock:
                 if self.embed_ready.get(model) is ready:
                     self.embed_ready.pop(model, None)
+            with self.server_lock:
+                if self.server is not None and self.server.poll() is not None:
+                    self.server = None
             raise
 
     def prefetch_query_embeddings(self, store, queries, *, timeout=QUERY_EMBEDDING_TIMEOUT):
