@@ -17,6 +17,7 @@ from concurrent.futures import FIRST_COMPLETED, Future, wait
 from dataclasses import dataclass, field
 from threading import Lock, RLock, Thread, local
 from datetime import date, datetime, time as midnight, timedelta, timezone
+from email.utils import getaddresses
 from functools import lru_cache
 from itertools import tee, zip_longest
 from pathlib import Path
@@ -736,6 +737,10 @@ class Store:
             self.root.chmod(0o700)
         self.db = self.root / "mail.sqlite"
         self.local = local()
+        self.read_pool = []
+        self.read_pool_lock = Lock()
+        self.read_pool_closed = False
+        self.max_idle = 6
         self.vector_index = None
         self.memory_index = MemoryIndex()
         self.memory_load_lock = Lock()
@@ -905,12 +910,48 @@ class Store:
     @contextlib.contextmanager
     def search_session(self, profile=None, defer_access=False):
         previous = getattr(self.local, "search", None)
-        self.local.search = {"profile": profile, "defer": defer_access}
+        state = previous["read"] if previous else {"connection": None, "failed": False}
+        self.local.search = {"profile": profile, "defer": defer_access, "read": state}
         try:
-            with self.thread_connection():
-                yield
+            yield
+        except BaseException:
+            state["failed"] = True
+            raise
         finally:
             self.local.search = previous
+            if previous is None:
+                self.release_read_connection(state)
+
+    def borrow_read_connection(self):
+        with self.read_pool_lock:
+            if self.read_pool_closed:
+                raise sqlite3.ProgrammingError("Store is closed")
+            if self.read_pool:
+                return self.read_pool.pop()
+        return self.open_connection(read_only=True)
+
+    def release_read_connection(self, state):
+        conn = state["connection"]
+        if conn is None:
+            return
+        if not state["failed"]:
+            try:
+                conn.rollback()
+            except sqlite3.Error:
+                pass
+            else:
+                with self.read_pool_lock:
+                    if not self.read_pool_closed and len(self.read_pool) < self.max_idle:
+                        self.read_pool.append(conn)
+                        return
+        conn.close()
+
+    def close(self):
+        with self.read_pool_lock:
+            self.read_pool_closed = True
+            idle, self.read_pool = self.read_pool, []
+        for conn in idle:
+            conn.close()
 
     @property
     def search_profile(self):
@@ -980,10 +1021,11 @@ class Store:
             future.set_result(False)
         return future
 
-    def prefetch_access(self, keys, *, refresh):
+    def prefetch_access(self, keys, *, refresh, deadline=None):
         decisions = {key: None if refresh else self.cached_access(key) for key in keys}
         remaining = deque(key for key, decision in decisions.items() if decision is None)
-        deadline = time.monotonic() + ACCESS_CHECK_TIMEOUT
+        if deadline is None:
+            deadline = time.monotonic() + ACCESS_CHECK_TIMEOUT
         pending = {}
         while remaining or pending:
             while remaining and time.monotonic() < deadline:
@@ -1040,8 +1082,13 @@ class Store:
                     break
         return visible
 
-    def open_connection(self):
-        conn = sqlite3.connect(self.db, timeout=10)
+    def open_connection(self, *, read_only=False):
+        if read_only:
+            conn = sqlite3.connect(self.db.resolve().as_uri() + "?mode=ro", uri=True,
+                                   timeout=10, check_same_thread=False)
+            conn.execute("PRAGMA query_only=ON")
+        else:
+            conn = sqlite3.connect(self.db, timeout=10)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys=ON")
         conn.execute("PRAGMA secure_delete=ON")
@@ -1055,6 +1102,20 @@ class Store:
 
     @contextlib.contextmanager
     def connection(self):
+        search = getattr(self.local, "search", None)
+        if search is not None:
+            read = search["read"]
+            if read["connection"] is None:
+                read["connection"] = self.borrow_read_connection()
+            conn = read["connection"]
+            try:
+                yield conn
+            except sqlite3.Error:
+                if read["connection"] is conn:
+                    conn.close()
+                    read["connection"] = None
+                raise
+            return
         state = getattr(self.local, "connection_state", None)
         if state is None:
             conn = self.open_connection()
@@ -1404,6 +1465,76 @@ class Store:
     def save_pst_files(self, conn, source, signatures):
         conn.execute("DELETE FROM pst_files WHERE source=?", (source,))
         conn.executemany("INSERT INTO pst_files VALUES(?,?,?)", ((source, *item) for item in signatures.items()))
+
+    def suggest(self, prefix, filters, limit=8):
+        prefix = normalized(prefix.strip())[:450]
+        limit = min(8, max(0, limit))
+        if len(prefix) < 2 or not limit or "\x00" in prefix or not WORD.search(prefix):
+            return []
+
+        deadline = time.monotonic() + .028
+        sql_deadline = deadline - .008  # Leave time for bounded original-access checks.
+        match = re.compile(r"(?<!\w)" + re.escape(prefix))
+        where, params = self.scope(filters)
+        columns = "m.subject,m.sender,m.recipient,m.kind,m.source,m.item,s.path,s.kind source_kind"
+        escaped_prefix = prefix.replace('"', '""')
+        queries = (
+            (f"""SELECT {columns} FROM quick_terms JOIN mails m ON m.id=quick_terms.rowid {JOIN}
+                 WHERE quick_terms MATCH ? AND {where} ORDER BY quick_terms.rowid DESC LIMIT 96""",
+             [f'{{subject people}} : "{escaped_prefix}"*', *params]),
+            (f"""SELECT {columns} FROM mails m {JOIN} WHERE {where}
+                 ORDER BY m.sent DESC,m.id DESC LIMIT 96""", params),
+        )
+        candidates = []
+        seen_rows = set()
+        try:
+            with self.search_session(), self.connection() as conn:
+                conn.execute("PRAGMA busy_timeout=0")
+                conn.set_progress_handler(lambda: time.monotonic() >= sql_deadline, 256)
+                try:
+                    for statement, args in queries:
+                        if time.monotonic() >= sql_deadline:
+                            break
+                        for row in conn.execute(statement, args):
+                            if time.monotonic() >= sql_deadline:
+                                break
+                            key = row["source"], row["item"]
+                            if key in seen_rows:
+                                continue
+                            seen_rows.add(key)
+                            kind = "subject" if row["kind"] == "mail" else "document"
+                            labels = [(row["subject"], kind)]
+                            for key in ("sender", "recipient"):
+                                people = row[key][:4096]
+                                if "@" in people or "<" in people:
+                                    for name, address in getaddresses(people.replace("\n", ",").split(";")):
+                                        labels.extend(((name, "sender"), (address, "sender")))
+                                else:
+                                    labels.extend((name, "sender") for name in re.split(r"[,;\n]", people))
+                            matching = [(label, kind) for value, kind in labels
+                                        if (label := " ".join(value.split())[:450]) and match.search(normalized(label))]
+                            if matching:
+                                candidates.append((row, matching))
+                finally:
+                    conn.set_progress_handler(None, 0)
+                    conn.execute("PRAGMA busy_timeout=10000")
+        except sqlite3.OperationalError as exc:
+            if exc.sqlite_errorcode not in (sqlite3.SQLITE_INTERRUPT, sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED):
+                raise
+
+        access = [(self.access_keys(row), row["kind"]) for row, _ in candidates]
+        sources = self.prefetch_access((keys[0] for keys, _ in access), refresh=False, deadline=deadline)
+        documents = self.prefetch_access((keys[1] for keys, kind in access
+                                          if kind != "mail" and sources[keys[0]]), refresh=False, deadline=deadline)
+        results = {}
+        for (keys, kind), (_, labels) in zip(access, candidates, strict=True):
+            if not sources[keys[0]] or (kind != "mail" and not documents[keys[1]]):
+                continue
+            for label, category in labels:
+                results.setdefault(normalized(label), {"label": label, "query": label, "kind": category})
+                if len(results) == limit:
+                    return list(results.values())
+        return list(results.values())
 
     def quick_search(self, question, filters, limit=20):
         """Search one metadata row per message, then verify access to ranked results."""
