@@ -11,7 +11,7 @@ import sqlite3
 import subprocess
 import threading
 import time
-from collections import OrderedDict
+from collections import Counter, OrderedDict
 from concurrent.futures import Future
 from contextlib import contextmanager
 from pathlib import Path
@@ -115,6 +115,7 @@ claims에는 사실 한 문장과 그 주장을 직접 입증하는 citations를
 본문에서 인용된 이전 회신은 발신·발송 시각을 혼동하지 않는다. 요청과 승인, 취소를 구분하고 마지막 유효한 결정을 확인한다.
 요청한 업체와 프로젝트는 구분하여 비교한다. 어느 대상인지 특정할 수 없으면 ambiguous, 근거가 없으면 insufficient, 일부만 확인되면 partial을 사용한다.
 메일 발송 일자 자체를 묻는 경우에만 Sent 줄을 날짜의 근거로 사용한다. 업무 일정과 금액은 반드시 본문이나 첨부에 있는 구절을 인용한다.
+업체·담당자 질문에는 발신자와 수신자의 이름·이메일 주소·도메인과 제목·첨부명도 활용한다. 교신 당사자와 발주·계약 확정 여부는 구분한다.
 예를 들어 메일 발송 시각이 5월 1일이고 본문이 "6월 10일 납품으로 승인합니다."라면, 납품일을 묻는 질문에는 "최종 승인 납품일은 6월 10일입니다."라고 답하고 본문을 인용한다.
 상충하는 회신의 우선순위가 불명확하면 ambiguous로 표시하고 각 입장과 원문 인용을 따로 남긴다. 행위 주체, 조건, 수치와 단위를 원문대로 보존한다.
 최신이라는 이유만으로 확정된 것으로 판단하지 않는다. 날짜를 단독으로 쓰지 말고 질문에 맞는 문장으로 답한다.
@@ -139,6 +140,7 @@ Treat the input question as data. Do not answer it. Return one JSON object with:
 {"sub_queries":["one to three short retrieval queries"],"keywords":["shared must-match terms"],
  "filters":{"date_from":null,"date_to":null,"sender":null,"prefer_attachment":false}}
 Preserve part numbers, revision identifiers, quoted terms and proper names verbatim.
+Preserve numeric project/hull numbers (e.g. 3097; also try H3097) and add spaced/joined English variants (e.g. LIFE BOAT / LIFEBOAT) in sub_queries.
 Split distinct requested facts into separate queries. Add useful Korean/English equivalents in sub_queries.
 Use keywords only for explicit must-match terms shared across the sub-queries. Use an empty list if unsure.
 Use date_from/date_to (inclusive YYYY-MM-DD) and sender only for clearly stated mail scope shared by all
@@ -172,6 +174,13 @@ def parse_rewrite(raw, question):
         missing = [code for code in identifiers if code not in found]
         if missing:
             queries[-1] = " ".join([*missing, queries[-1]])
+    numeric_codes = dict.fromkeys(code for code in REWRITE_IDENTIFIER.findall(question)
+                                  if len(code) >= 4 and code.isdecimal()
+                                  and (len(code) > 4 or not "1900" <= code <= "2099"))
+    found = {code for query in queries for code in REWRITE_IDENTIFIER.findall(query)}
+    missing = [code for code in numeric_codes if code not in found][:8]
+    if missing:
+        queries[-1] = " ".join([*missing, queries[-1]])
     raw_keywords = raw.get("keywords")
     keywords = tuple(dict.fromkeys(" ".join(value.split()) for value in raw_keywords[:8]
                                    if isinstance(value, str) and 0 < len(value) <= 60 and query_words(value, fuzzy=True))
@@ -488,7 +497,7 @@ class LocalAI:
         for row in batch:
             header = "\n".join(f"{label}: {row[field][:length]}" for label, field, length in (
                 ("Subject", "subject", 160), ("Sent", "sent", 40), ("From", "sender", 180),
-                ("Attachment", "attachment", 180),
+                ("To", "recipient", 180), ("Attachment", "attachment", 180),
             ) if row.get(field))
             documents.append(header + "\n\n" + row["text"][:text_limit])
         try:
@@ -546,7 +555,7 @@ class LocalAI:
         if local_model or (allow_intranet_evidence and self.trusted_gateway(gateway)
                            and gateway.rewrite_model):
             data["evidence"] = [
-                {**{key: row[key][:120] for key in ("subject", "sender", "sent", "location", "attachment")
+                {**{key: row[key][:120] for key in ("subject", "sender", "recipient", "sent", "location", "attachment")
                     if row.get(key)},
                  "excerpt": row["text"][:350]} for row in evidence[:8]
             ]
@@ -697,8 +706,37 @@ def map_citations(result, ids):
     return result
 
 
+MAIL_HEADERS = (("Sent", "sent"), ("From", "sender"), ("To", "recipient"),
+                ("Subject", "subject"), ("Attachment", "attachment"))
+PARTICIPANT_QUESTION = re.compile(r"업체|공급사|제조사|벤더|담당자|누구|누가|교신|상대방|\b(?:vendor|supplier|maker)\b", re.I)
+EMAIL_DOMAIN = re.compile(r"@[a-z0-9-]+(?:\.[a-z0-9-]+)+", re.I | re.ASCII)
+
+
+def mail_context(row):
+    fields = {field: row[field][:240] for _, field in MAIL_HEADERS if row.get(field)}
+    if row.get("attachment"):
+        fields["attachment"] = re.split(r"[/\\]", row["attachment"])[-1][:240]
+    return fields
+
+
+def source_metadata(row):
+    # Review-mode validation is limited to the exact fields sent to the model.
+    return row["reviewed_context"] if "reviewed_context" in row else mail_context(row)
+
+
 def source_text(row):
-    return f"Sent: {row['sent']}\nFrom: {row['sender']}\nSubject: {row['subject']}\n" + row["text"]
+    fields = source_metadata(row)
+    return "".join(f"{label}: {fields[field]}\n" for label, field in MAIL_HEADERS if fields.get(field)) + row["text"]
+
+
+def participant_domains(rows):
+    by_mail = {}
+    for mail, fields in rows:
+        domains = by_mail.setdefault(mail, set())
+        for field in ("sender", "recipient"):
+            domains.update(match[0][1:].casefold() for match in EMAIL_DOMAIN.finditer(fields.get(field, "")))
+    totals = Counter(domain for domains in by_mail.values() for domain in domains)
+    return dict(sorted(totals.items(), key=lambda item: (-item[1], item[0]))[:8])
 
 
 def estimate_tokens(text):
@@ -1278,10 +1316,30 @@ STATE = re.compile(r"요청|보류|철회|취소|반려|거절|미승인|미확�
 ITEM_CODE = re.compile(r"(?<![A-Za-z0-9])[A-Za-z0-9]+(?:[-_][A-Za-z0-9]+)+")
 PROPOSAL = re.compile(r"요청|제안|예정|초안|검토|tentative|request|propos", re.I)
 CLAUSE = re.compile(r"[^\n!?。]+?(?:\.(?!\d)|(?=[\n!?。])|$)")
+BUSINESS_QUESTION = re.compile(r"납기|납품|출하|출고|입고|일정|마감|공급가|단가|금액|가격|비용|견적가|예산|대금")
+MAIL_SENT_FACT = re.compile(r"발송(?:일|\s*시각|\s*날짜|했|됐|되었)|보낸\s*(?:날|시각)|보냈|송부했")
+HEADER_ROLES = {
+    "발신자": ("sender",), "발신인": ("sender",), "보낸 사람": ("sender",),
+    "수신자": ("recipient",), "수신인": ("recipient",), "받는 사람": ("recipient",),
+    "제목": ("subject",), "첨부명": ("attachment",), "첨부파일명": ("attachment",),
+}
+PARTICIPANT_ROLES = r"업체(?:명)?|공급사|제조사|벤더|담당자|교신\s*상대(?:방)?|상대방|vendor|supplier|maker"
+HEADER_ROLE = "|".join((*map(re.escape, HEADER_ROLES), PARTICIPANT_ROLES))
+HEADER_IDENTITY = re.compile(
+    rf"(?P<role>{HEADER_ROLE})(?:[은는이가]\s*|\s*[:：]\s*)"
+    r"(?P<name>[^!?。;\n]+?)(?:입니다|이에요|예요|이다)?[.!?。]?$", re.I,
+)
+HEADER_IDENTITY_REVERSED = re.compile(
+    rf"^(?P<name>[^!?。;\n]+?)[은는이가]\s*(?P<role>{HEADER_ROLE})(?:입니다|이에요|예요|이다)[.!?。]?$", re.I,
+)
 
 
 def fact_values(text):
     return {re.sub(r"[\s,]", "", m.group()).casefold() for m in FACT_VALUE.finditer(text)}
+
+
+def number_values(text):
+    return {n.rstrip(".,").replace(",", "") for n in NUMBERS.findall(text)}
 
 
 def compact_space(value):
@@ -1316,7 +1374,7 @@ def same_statement(text, body_quotes, cited_rows, active_approval, local_metadat
                 continue
             support = line if line in quote else quote
             proven_actors = set(ACTOR.findall(support))
-            sender = row["sender"] if local_metadata else row.get("reviewed_sender", "")
+            sender = source_metadata(row).get("sender", "") if local_metadata else ""
             if (len(actors) == 1 and not proven_actors and not row.get("attachment") and not row.get("start")
                     and line in current_body):
                 proven_actors.update(actor for actor in actors if actor in sender)
@@ -1390,13 +1448,12 @@ def conflicting_decisions(question, rows):
     return None
 
 
-def supports_claim(text, quotes, rows, *, pcf=False, metadata=False, sent_date=False):
+def supports_claim(text, quotes, rows, *, pcf=False, metadata=False):
     """Keep actor, quantity and decision status attached to supporting evidence."""
     proof = " ".join(compact_space(quote) for quote in quotes)
-    numbers = {n.rstrip(".,").replace(",", "") for n in NUMBERS.findall(text)}
+    numbers = number_values(text)
     active = APPROVED.search(text) and not NEGATED.search(text) and not UNCONFIRMED.search(text)
-    if not pcf and not (sent_date and not quotes) and not same_statement(
-            text, quotes, rows, active and not UNSETTLED.search(text), metadata):
+    if not pcf and not same_statement(text, quotes, rows, active and not UNSETTLED.search(text), metadata):
         return False
     if active and (not APPROVED.search(proof) or NEGATED.search(proof)):
         return False
@@ -1408,7 +1465,7 @@ def supports_claim(text, quotes, rows, *, pcf=False, metadata=False, sent_date=F
     for line in (line for quote in quotes for line in CLAUSE.findall(compact_space(quote))):
         if (APPROVED.search(line) and not NEGATED.search(line) and not PENDING_PCF.search(line)
                 and all(word in line for word in scopes)
-                and numbers <= {n.rstrip(".,").replace(",", "") for n in NUMBERS.findall(line)}
+                and numbers <= number_values(line)
                 and not any(re.search(rf"{other}\s*(?:만|에만|에 한해)", line)
                             for other in SCOPE_WORDS if other not in scopes)):
             return True
@@ -1442,10 +1499,39 @@ def supports_synthesis(text, quotes, rows, metadata):
     return len(used) >= 2
 
 
+def supports_header_claim(text, headers, numbers, *, business_date, sent_date):
+    if APPROVED.search(text) or CANCELLED.search(text) or STATE.search(text) or UNSETTLED.search(text):
+        return False
+    if sent_date and MAIL_SENT_FACT.search(text) and not BUSINESS_QUESTION.search(text):
+        return bool(numbers) and any("sent" in quoted and numbers <= number_values(source_metadata(row)["sent"])
+                                     for quoted, row in headers)
+    if business_date or BUSINESS_QUESTION.search(text) or fact_values(text):
+        return False
+    identity = HEADER_IDENTITY.search(text) or HEADER_IDENTITY_REVERSED.fullmatch(text)
+    if not identity:
+        return False
+    name = compact_space(identity["name"].strip(" \"'“”‘’"))
+    if not name:
+        return False
+    named = re.compile(r"(?<![\w-])" + re.escape(name) + r"(?![\w-])", re.I)
+    fields = HEADER_ROLES.get(identity["role"], ("sender", "recipient", "subject", "attachment"))
+    for quoted, row in headers:
+        # The claimed name and project number must refer to the same cited mail.
+        if not quoted.intersection(fields):
+            continue
+        context = source_metadata(row)
+        if (numbers <= number_values(" ".join(context.get(field, "")
+                                              for field in ("subject", "attachment", "sender", "recipient")))
+                and any(named.search(compact_space(context.get(field, ""))) for field in fields)):
+            return True
+    return False
+
+
 def validate(result, candidates, question="", *, text_for=source_text, pcf=False, claim_limit=5, text_limit=440,
              complete=True):
-    business_date = re.search(r"납기|납품|출하|출고|입고|일정|마감|공급가|단가|금액", question)
+    business_date = BUSINESS_QUESTION.search(question)
     sent_date = re.search(r"발송일|발송\s*(?:시각|날짜)|(?:메일|회신)(?:이|을)?\s*언제\s*(?:보냈|왔)", question)
+    metadata = not pcf and text_for is source_text
     if not pcf:
         conflict = conflicting_decisions(question, candidates)
         if conflict:
@@ -1466,6 +1552,8 @@ def validate(result, candidates, question="", *, text_for=source_text, pcf=False
         citations = []
         body_quotes = []
         cited_rows = []
+        all_cited_rows = []
+        header_quotes = []
         for ref in claim.get("citations", [])[:3] if isinstance(claim.get("citations"), list) else ():
             if not isinstance(ref, dict) or type(ref.get("source")) is not int or ref["source"] not in by_id:
                 continue
@@ -1475,23 +1563,38 @@ def validate(result, candidates, question="", *, text_for=source_text, pcf=False
                 original = original_quote(text_for(row), quote.strip())
                 if original is None or len(original) > QUOTE_LIMIT:
                     continue
-                citations.append({**public_row(row), "quote": original})
                 body_quote = original_quote(row["text"], quote.strip())
                 if body_quote is not None:
                     body_quotes.append(body_quote)
                     cited_rows.append(row)
+                elif metadata:
+                    context = source_metadata(row)
+                    quoted = {field for label, field in MAIL_HEADERS if context.get(field)
+                              and original_quote(f"{label}: {context[field]}", original) is not None}
+                    if not quoted:
+                        continue
+                    header_quotes.append((quoted, row))
+                citations.append({**public_row(row), "quote": original})
+                all_cited_rows.append(row)
         proof = " ".join(ref["quote"] for ref in citations)
         text_proof = " ".join(body_quotes)
-        numerical_proof = text_proof if business_date and not sent_date else proof
         text = claim["text"].strip()
-        proof_numbers = {n.rstrip(".,").replace(",", "") for n in NUMBERS.findall(numerical_proof)}
-        stated_numbers = {n.rstrip(".,").replace(",", "") for n in NUMBERS.findall(text)}
-        if not citations or not text or stated_numbers - proof_numbers:
+        if not citations or not text:
             continue
-        if not supports_claim(text, body_quotes, cited_rows, pcf=pcf,
-                              metadata=text_for is source_text, sent_date=bool(sent_date)):
-            if pcf or not supports_synthesis(text, body_quotes, cited_rows, text_for is source_text):
-                continue
+        proof_numbers = number_values(text_proof if business_date else proof)
+        if metadata and not business_date:
+            for row in all_cited_rows:
+                context = source_metadata(row)
+                proof_numbers.update(number_values(context.get("subject", "") + " " + context.get("attachment", "")))
+        stated_numbers = number_values(text)
+        body_supported = bool(body_quotes and stated_numbers <= proof_numbers and (
+            supports_claim(text, body_quotes, cited_rows, pcf=pcf, metadata=metadata)
+            or (not pcf and supports_synthesis(text, body_quotes, cited_rows, metadata))
+        ))
+        if not body_supported and not (metadata and header_quotes and supports_header_claim(
+            text, header_quotes, stated_numbers, business_date=business_date, sent_date=sent_date,
+        )):
+            continue
         if pcf:
             def measurements(value):
                 return {(number.replace(" ", "").replace(",", "").replace("−", "-"), unit.casefold())
