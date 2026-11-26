@@ -29,7 +29,7 @@ from mailsearch.answer import (QUERY_EMBEDDING_TIMEOUT, QUERY_REWRITE_TIMEOUT, A
                                answer_groups, answer_plan, combine_answer_evidence, dedupe_by_content, delivery_date_answer,
                                evidence_for, latest_thread_decisions, needs_recency_boost, parse_evidence_gap, parse_rewrite,
                                reciprocal_rank, report_unconfirmed_aspects, rewritten_evidence,
-                               supplemental_evidence, validate)
+                               source_text, supplemental_evidence, validate)
 from mailsearch.embedding import EmbeddingAPI, GatewayRequestError, tls_context, warn_unverified
 from mailsearch.external import ExternalAI, Excerpt, Reviews, pack_excerpts, pcf_batches
 from mailsearch.extract import convert_legacy, extract_attachment, extract_bytes
@@ -1440,6 +1440,92 @@ class Integration(unittest.TestCase):
             self.assertEqual(self.call("/api/external/send", {"review": stale["review"], "excerpts": [1]})[1]["error"],
                              "external_source_changed")
             https.assert_not_called()
+
+    def test_intranet_vendor_answer_uses_cc_and_hull_subject_without_body_vendor(self):
+        archive = Path(self.workspace.name) / "lifeboat.eml"
+        vendor = "sales@vendor-boat.com"
+        subject = "H3097 LIFEBOAT drawing"
+        message = EmailMessage()
+        message["Subject"] = subject
+        message["From"] = "Desk <desk@yard.example>"
+        message["To"] = "Engineering <drawing@yard.example>"
+        message["Cc"] = f"Boat sales <{vendor}>"
+        message["Date"] = "Tue, 24 Nov 2026 01:30:00 +0000"
+        message.set_content("Please check the attached drawing and reply with comments.")
+        archive.write_bytes(message.as_bytes())
+        source = self.indexer.register(archive)
+        self.assertEqual(await_source(self.store, source, {"ready", "error"})["state"], "ready")
+        selections = {"answer": "answer-model-a", "embedding": "", "rerank": ""}
+        self.assertEqual(self.call("/api/intranet/settings", {"action": "apply", "key": "fixture-key",
+                                                               "selections": selections})[0], 200)
+        question = "3097 LIFE BOAT 업체는?"
+        payload = {"query": question, "filters": {"source": source, "tab": "mail"}}
+        claim = "3097호선 LIFE BOAT 업체는 vendor-boat입니다"
+        sent_payloads = []
+        quote = vendor
+
+        def complete(instructions, content, *, token_limit, timeout):
+            data = json.loads(content)
+            sent_payloads.append(data)
+            item = next(item for item in data["evidence"] if item["context"]["subject"] == subject)
+            self.assertIn(vendor, item["context"]["recipient"])
+            self.assertNotIn("vendor-boat", item["text"])
+            self.assertEqual(data["participant_domains"], {"vendor-boat.com": 1, "yard.example": 1})
+            self.assertIn("교신 상대 후보", instructions)
+            if data.get("check_aspects"):
+                self.assertIn("미확인으로 구분", instructions)
+            return {"status": "answered", "claims": [
+                {"text": claim, "citations": [{"source": item["source"], "quote": quote}]},
+            ]}
+
+        gateway = self.ai.embedding_api
+        with (patch.dict(os.environ, MAILSEARCH_AGENTIC_RETRY="0", MAILSEARCH_QUERY_REWRITE="1"),
+              patch.object(gateway, "rewrite_query", return_value={
+                  "sub_queries": ["H3097 LIFEBOAT", "LIFE BOAT drawing"], "keywords": [], "filters": {},
+              }),
+              patch.object(self.app.external, "complete", side_effect=complete)):
+            for quote in (vendor, subject):
+                status, result = self.call("/api/intranet/answer", payload)
+                self.assertEqual((status, result["status"], result["provider"]), (200, "answered", "intranet"))
+                self.assertEqual(result["claims"][0]["text"], claim)
+                self.assertEqual(result["claims"][0]["citations"][0]["quote"], quote)
+            aspects = ("계약 체결 여부",)
+            with patch("mailsearch.server.supplemental_evidence", side_effect=lambda store, ai, question, filters,
+                       context, evidence, mode, query_count, **options: (evidence, mode, aspects, True)):
+                status, result = self.call("/api/intranet/answer", payload)
+            self.assertEqual((status, result["status"], result["unknowns"]), (200, "partial", list(aspects)))
+        self.assertEqual(sent_payloads[-1]["check_aspects"], list(aspects))
+
+    def test_metadata_quotes_do_not_establish_delivery_price_or_uncited_vendor(self):
+        row = {"id": 1, "passage": 2, "source": 1, "path": "sample.eml", "updated": None, "folder": "/",
+               "sent": "2026-04-09", "sender": "Desk <desk@yard.example>", "recipient": "Sales <sales@vendor-boat.com>",
+               "subject": "H3097 LIFEBOAT, 300만원", "attachment": None, "location": "본문", "text": "Drawing attached."}
+        self.assertIn("To: Sales <sales@vendor-boat.com>", source_text(row))
+
+        def result(text, quote, question, **options):
+            return validate({"status": "answered", "claims": [
+                {"text": text, "citations": [{"source": 2, "quote": quote}]},
+            ]}, [row], question, **options)["status"]
+
+        sent = "Sent: 2026-04-09"
+        self.assertEqual(result("발송일은 2026-04-09입니다", sent, "이 메일 발송일은?"), "answered")
+        self.assertEqual(result("납기일은 2026-04-09입니다", sent, "3097 납기일은?"), "insufficient")
+        self.assertEqual(result("금액은 300만원입니다", row["subject"], "3097 금액은?"), "insufficient")
+        self.assertEqual(result("3097호선 업체는 unknown-vendor입니다", row["subject"], "3097 업체는?"), "insufficient")
+        self.assertEqual(result("3098호선 업체는 vendor-boat입니다", row["recipient"], "3098 업체는?"), "insufficient")
+        self.assertEqual(result("3097호선 업체는 vendor-boat입니다", row["recipient"], "3097 업체는?",
+                                text_for=lambda item: item["text"]), "insufficient")
+        row["reviewed_context"] = {"subject": row["subject"], "recipient": "Sales"}
+        self.assertEqual(result("3097호선 업체는 vendor-boat입니다", row["subject"], "3097 업체는?"), "insufficient")
+
+    def test_query_rewrite_keeps_a_standalone_hull_number_but_does_not_force_year_into_queries(self):
+        raw = {"sub_queries": ["H3097 LIFEBOAT", "LIFE BOAT supplier"],
+               "filters": {"date_from": "2025-01-01", "date_to": "2025-12-31"}}
+        plan = parse_rewrite(raw, "2025년 3097 LIFE BOAT 업체는?")
+        self.assertEqual(plan.sub_queries, ("H3097 LIFEBOAT", "3097 LIFE BOAT supplier"))
+        self.assertEqual(plan.filters, raw["filters"])
+        for year in (1900, 2025, 2099):
+            self.assertEqual(parse_rewrite(raw, f"{year}년 업체는?").sub_queries, tuple(raw["sub_queries"]))
 
     def test_fast_and_attachment_search(self):
         source = self.import_mail()
@@ -3938,11 +4024,13 @@ class RAGStability(unittest.TestCase):
         client = self.gateway(rerank="bge-reranker-v2-m3")
         ai = LocalAI("", embedding_api=client)
         rows = [{"subject": "Private email subject", "text": "Private email body"} for _ in range(80)]
+        rows[0]["recipient"] = "contact@vendor.example"
         with (patch.object(client, "request", side_effect=TimeoutError("Private failure details")) as request,
               self.assertLogs("mailsearch.runtime", "WARNING") as logs):
             self.assertIs(ai.rerank_candidates("Private query", rows, limit=80), rows)
         path, payload, timeout = request.call_args.args
         self.assertEqual((path, payload["top_n"], len(payload["documents"]), timeout), (RERANK_PATH, 80, 80, 15))
+        self.assertIn("To: contact@vendor.example\n", payload["documents"][0])
         self.assertEqual([record.getMessage() for record in logs.records], ["Rerank skipped (docs=80, error=TimeoutError)"])
 
     def test_gateway_only_rewrite_uses_small_budget_and_falls_back_on_timeout(self):
