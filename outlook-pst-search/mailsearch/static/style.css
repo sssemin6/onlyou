@@ -315,6 +315,7 @@ main { grid-area: 1 / 2; min-width: 0; }
 .search-label { display: block; margin-bottom: 7px; font-size: .84rem; font-weight: 800; }
 .search-line { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; gap: 10px; align-items: start; }
 .query-box {
+  position: relative;
   display: flex;
   align-items: center;
   gap: 9px;
@@ -329,6 +330,34 @@ main { grid-area: 1 / 2; min-width: 0; }
 .query-box svg { color: var(--accent-dark); }
 .query-box input { flex: 1; width: 100%; min-width: 0; min-height: 42px; padding: 4px 0; border: 0; outline: 0; background: transparent; }
 .query-box input::placeholder { color: var(--muted); opacity: 1; }
+.search-suggestions {
+  position: absolute;
+  z-index: 4;
+  inset: calc(100% + 5px) -1px auto;
+  max-height: min(22rem, 45vh);
+  overflow-y: auto;
+  margin: 0;
+  padding: 4px;
+  list-style: none;
+  border: var(--edge);
+  border-radius: 8px;
+  background: var(--paper);
+  box-shadow: var(--shadow);
+}
+.search-suggestions li {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 10px;
+  padding: 7px 10px;
+  border-radius: 5px;
+  cursor: pointer;
+}
+.search-suggestions li:hover,
+.search-suggestions li[aria-selected="true"] { background: var(--peach); }
+.suggestion-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.suggestion-kind { flex-shrink: 0; color: var(--muted); font-size: .76rem; }
+
 kbd {
   display: grid;
   place-items: center;
