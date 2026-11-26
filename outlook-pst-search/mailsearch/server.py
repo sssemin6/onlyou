@@ -176,6 +176,9 @@ class App(ThreadingHTTPServer):
             if self.store.vector_index:
                 self.store.vector_index.close()
 
+    def handle_error(self, _request, _client_address):
+        runtime_logger.error("Request handler failed (%s)", type(sys.exc_info()[1]).__name__)
+
     def watch_page(self, stopped):
         last_busy = 0.0
         while not stopped.wait(3):
@@ -557,6 +560,9 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(202, {"source": source})
             elif route == "/api/source-action":
                 self.server.indexer.command(int(payload["source"]), payload["action"])
+                self.send_json(202, {})
+            elif match := re.fullmatch(r"/api/sources/([0-9]{1,16})/ignore", route):
+                self.server.indexer.ignore_folder(int(match[1]), payload["pattern"])
                 self.send_json(202, {})
             elif route == "/api/search-access":
                 self.verify_search(payload["ticket"])
@@ -1495,6 +1501,31 @@ def gateway_diagnostics(root):
     return file_diagnostics(root / "api-connection.log", gateway_logger)
 
 
+@contextmanager
+def console_diagnostics(enabled):
+    if not enabled:
+        yield
+        return
+    handler = logging.StreamHandler(sys.stderr)
+    handler.setLevel(logging.INFO)
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    loggers = (runtime_logger, gateway_logger)
+    names = {logger.name for logger in loggers}
+    # Installer subprocess diagnostics are kept in their existing log only.
+    handler.addFilter(lambda record: record.name in names)
+    levels = [logger.level for logger in loggers]
+    for logger in loggers:
+        logger.setLevel(logging.INFO)
+        logger.addHandler(handler)
+    try:
+        yield
+    finally:
+        for logger, level in zip(loggers, levels, strict=True):
+            logger.removeHandler(handler)
+            logger.setLevel(level)
+        handler.close()
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Outlook PST mail search on this PC")
     default_data = Path(os.environ.get("LOCALAPPDATA", Path.home())) / ("OutlookMailSearch" if os.name == "nt" else ".outlook-mail-search")
@@ -1515,6 +1546,8 @@ def main(argv=None):
                         default=os.environ.get("MAILSEARCH_ANSWER_NUM_CTX", str(DEFAULT_ANSWER_NUM_CTX)),
                         help="Local answer context tokens, capped by the installed model (2048–32768)")
     parser.add_argument("--no-browser", action="store_true")
+    parser.add_argument("--console-log", action=argparse.BooleanOptionalAction, default=False,
+                        help="Print indexing progress and diagnostics to stderr")
     parser.add_argument("--vector-index", choices=("sqlite", "usearch"),
                         default=os.environ.get("MAILSEARCH_VECTOR_INDEX", "sqlite"))
     args = parser.parse_args(argv)
@@ -1554,7 +1587,8 @@ def main(argv=None):
         ai = LocalAI(args.model, args.embedding_model, args.ollama_port, embedding_api=embedding_api,
                      answer_num_ctx=args.answer_num_ctx)
         stage = "세션 잠금 파일 열기"
-        with SessionLock(root), gateway_diagnostics(root), file_diagnostics(root / "app-runtime.log", runtime_logger):
+        with (SessionLock(root), gateway_diagnostics(root), file_diagnostics(root / "app-runtime.log", runtime_logger),
+              console_diagnostics(args.console_log)):
             runtime_logger.setLevel(logging.INFO)
             runtime_logger.info("App starting (pid=%d)", os.getpid())
             try:
@@ -1581,7 +1615,7 @@ def main(argv=None):
                     stopped = threading.Event()
                     try:
                         indexer.wake()
-                        print(app.origin, flush=True)
+                        print(f"[onlyou] URL {app.origin}" if args.console_log else app.origin, flush=True)
                         if not args.no_browser:
                             webbrowser.open(app.origin)
                             threading.Thread(target=app.watch_page, args=(stopped,), daemon=True).start()
