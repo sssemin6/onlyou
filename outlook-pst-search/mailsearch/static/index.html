@@ -76,14 +76,11 @@
             <input id="query" type="search" maxlength="450" placeholder="예: A-17 납품일은 최종 언제로 정해졌지?" aria-keyshortcuts="/">
             <kbd aria-hidden="true">/</kbd>
           </div>
-          <button id="submit-search" class="button primary" name="intent" value="search" type="submit" title="제목, 발신자, 수신자, 파일명으로 검색">빠른 검색</button>
-          <button id="submit-body" class="button" name="intent" value="body" type="submit">본문 검색</button>
-          <button id="submit-semantic" class="button" name="intent" value="semantic" type="submit" title="키워드와 의미를 함께 검색">의미 검색</button>
-          <button id="submit-ask" class="button ai-button" name="intent" value="ask" type="submit" title="Ctrl+Enter">
+          <button id="submit-search" class="button primary" name="intent" value="search" type="submit" title="본문과 첨부파일을 검색합니다.">검색</button>
+          <button id="submit-ask" class="button ai-button" name="intent" value="ask" type="submit" title="Ctrl+Enter" aria-keyshortcuts="Control+Enter Meta+Enter">
             <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M12 3c.7 4.4 3.6 7.3 8 8-4.4.7-7.3 3.6-8 8-.7-4.4-3.6-7.3-8-8 4.4-.7 7.3-3.6 8-8Zm7 13v5m-2.5-2.5h5"/></svg>
-            <span id="submit-ask-label">AI 근거 찾기</span>
+            AI 답변
           </button>
-          <button id="submit-local-answer" class="button ai-button" name="intent" value="local-answer" type="submit" hidden>로컬 AI 답변</button>
         </div>
         <div class="context" id="local-conversation" hidden>
           <button type="button" id="reset-conversation" class="text-button">새 대화 시작</button>
@@ -92,7 +89,7 @@
         <details class="filters" id="filter-panel">
           <summary>
             <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M4 7h16M4 12h16M4 17h16"/><circle cx="9" cy="7" r="2"/><circle cx="16" cy="12" r="2"/><circle cx="10" cy="17" r="2"/></svg>
-            검색 범위 <span id="filter-count" class="filter-count" hidden></span>
+            검색 범위 및 옵션 <span id="filter-count" class="filter-count" hidden></span>
             <svg class="chevron" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="m7 10 5 5 5-5"/></svg>
           </summary>
           <div class="filter-body">
@@ -112,7 +109,11 @@
               <label data-show="pcf">도면명<input id="drawing" maxlength="200"></label>
               <p id="pcf-scope-help" class="filter-hint" hidden>PCF 문서에서 읽은 항목값과 일치하는 자료를 찾습니다.</p>
             </div>
-            <label class="settings-checkbox"><input id="search-rerank" type="checkbox"> 의미 검색 결과 재정렬</label>
+            <div class="search-options">
+              <label class="settings-checkbox" title="제목과 메일 본문 앞부분을 빠르게 검색합니다."><input id="search-quick" type="checkbox"> 빠른 검색</label>
+              <label class="settings-checkbox" title="전체 본문과 첨부파일을 키워드로 검색합니다."><input id="search-keyword" type="checkbox"> 키워드만 검색</label>
+              <label class="settings-checkbox"><input id="search-rerank" type="checkbox"> 의미 검색 결과 재정렬</label>
+            </div>
             <button id="clear-filters" type="button" class="text-button" hidden>검색 범위 초기화</button>
           </div>
         </details>
