@@ -57,6 +57,7 @@ FILES = {
 }
 MAX_REQUEST = 16 * 1024
 PAGE_IDLE_SECONDS = 12
+INTRANET_ANSWER_LIMIT = 4
 
 
 class SessionBusy(Exception):
@@ -142,6 +143,7 @@ class App(ThreadingHTTPServer):
         super().__init__(("127.0.0.1", port), Handler)
         self.store, self.indexer, self.ai = store, indexer, ai
         self.search_workers = ThreadPoolExecutor(max_workers=2, thread_name_prefix="semantic-search")
+        self.retrieval_workers = ThreadPoolExecutor(max_workers=4, thread_name_prefix="answer-retrieval")
         self.search_tickets = SearchTickets()
         self.answer_sessions = AnswerSessions()
         self.ollama_setup = OllamaSetup(ai)
@@ -161,6 +163,9 @@ class App(ThreadingHTTPServer):
         self.embedding_selection = None
         self.reviews = Reviews()
         self.outbound = threading.BoundedSemaphore(1)
+        self.gateway_lock = threading.Lock()
+        self.intranet_requests = 0
+        self.gateway_changing = False
         self.token = secrets.token_urlsafe(32)
         self.instance_id = secrets.token_hex(16)
         self.generation = threading.BoundedSemaphore(1)
@@ -173,8 +178,28 @@ class App(ThreadingHTTPServer):
         super().server_close()
         if hasattr(self, "search_workers"):
             self.search_workers.shutdown(wait=True, cancel_futures=True)
+            self.retrieval_workers.shutdown(wait=True, cancel_futures=True)
             if self.store.vector_index:
                 self.store.vector_index.close()
+
+    @contextmanager
+    def gateway_access(self, *, settings=False):
+        with self.gateway_lock:
+            allowed = not self.gateway_changing and self.intranet_requests < (1 if settings else INTRANET_ANSWER_LIMIT)
+            if allowed:
+                if settings:
+                    self.gateway_changing = True
+                else:
+                    self.intranet_requests += 1
+        try:
+            yield allowed
+        finally:
+            if allowed:
+                with self.gateway_lock:
+                    if settings:
+                        self.gateway_changing = False
+                    else:
+                        self.intranet_requests -= 1
 
     def handle_error(self, _request, _client_address):
         runtime_logger.error("Request handler failed (%s)", type(sys.exc_info()[1]).__name__)
@@ -589,23 +614,25 @@ class Handler(BaseHTTPRequestHandler):
                             self.query(route, payload)
                     finally:
                         profile.log(runtime_logger, "external_answer" if send else "preview")
-            elif route == "/api/intranet/answer":
+            elif route in {"/api/intranet/answer", "/api/intranet/answer/stream"}:
                 profile = SearchProfile("intranet_answer")
                 with self.server.store.search_session(profile):
                     try:
-                        self.send_json(*self.intranet_answer(payload))
+                        result = self.intranet_answer(payload, stream=route.endswith("/stream"))
+                        if result is not None:
+                            self.send_json(*result)
                     finally:
                         profile.log(runtime_logger, "intranet_answer")
             elif route == "/api/intranet/settings":
-                self.change_intranet_settings(payload)
+                self.exclusive_settings(self.change_intranet_settings, payload)
             elif route == "/api/intranet/defaults":
                 if payload:
                     raise ValueError("gateway_preset")
-                self.use_gateway_preset()
+                self.exclusive_settings(self.use_gateway_preset)
             elif route == "/api/ollama/setup":
                 self.send_json(202, self.server.ollama_setup.start(payload.get("action")))
             elif route == "/api/external/settings":
-                self.change_external_settings(payload)
+                self.exclusive_settings(self.change_external_settings, payload)
             else:
                 self.send_json(404, {"error": "not_found"})
         except (ValueError, TypeError, KeyError, OverflowError):
@@ -812,8 +839,18 @@ class Handler(BaseHTTPRequestHandler):
             return
         self.send_json(200, {"results": [public_row(row) for row in evidence]})
 
-    def retrieve_external_evidence(self, question, context, filters, external, budget, internal_budget, *, turns=()):
+    def exclusive_settings(self, change, *args):
+        with self.server.gateway_access(settings=True) as allowed:
+            if allowed:
+                change(*args)
+            else:
+                self.send_json(409, {"error": "external_busy"})
+
+    def retrieve_external_evidence(self, question, context, filters, external, budget, internal_budget, *, turns=(),
+                                   check=None, worker_check=None, on_rerank=None):
         store, ai = self.server.store, self.server.ai
+        if check:
+            check()
         if internal_budget:
             filters = {**filters, "regular_only": True}
         search_text, filters = question_scope(question, filters)
@@ -826,7 +863,12 @@ class Handler(BaseHTTPRequestHandler):
                 return replies, filters, (), follow_up if replies else ""
         options = {"limit": limit if budget else 9, "expand": bool(budget),
                    "max_evidence": 32 if budget else None, "intent": question, "local_context": follow_up}
-        rewrite = rewritten_evidence(store, ai, question, filters, context, **options)
+        speculative = {}
+        if worker_check:
+            options.update(check=check, on_rerank=on_rerank)
+            speculative = {"workers": self.server.retrieval_workers, "original_query": search_text,
+                           "cancel": worker_check}
+        rewrite = rewritten_evidence(store, ai, question, filters, context, **speculative, **options)
         query_count = 1
         if rewrite:
             evidence, mode, rewritten_filters, query_count = rewrite
@@ -845,10 +887,11 @@ class Handler(BaseHTTPRequestHandler):
             store, ai, question, filters, f"{follow_up} {context}".strip()[:450], evidence, mode, query_count,
             ceiling=32 if budget else 9, expand=bool(budget),
             review_slots=None if budget else MAX_EXCERPTS, allow_intranet_evidence=external.intranet,
+            check=check, worker_check=worker_check, allow_rerank=worker_check is None,
         )
         return evidence, filters, aspects, follow_up
 
-    def intranet_answer(self, payload):
+    def intranet_answer(self, payload, *, stream=False):
         question, context, filters = self.question_input(payload)
         if not question:
             return 400, {"error": "question_required"}
@@ -858,44 +901,117 @@ class Handler(BaseHTTPRequestHandler):
         if not isinstance(conversation, str) or (conversation and not CONVERSATION_ID.fullmatch(conversation)):
             raise ValueError("conversation")
         server = self.server
-        if not server.outbound.acquire(blocking=False):
-            return 409, {"error": "external_busy"}
+        cancelled = threading.Event()
+        stream_started = False
+
+        def worker_check():
+            if cancelled.is_set():
+                raise AnswerCancelled()
+
+        def check():
+            worker_check()
+            if stream:
+                try:
+                    self.check_answer_stream()
+                except AnswerCancelled:
+                    cancelled.set()
+                    raise
+
+        def stage(name, message, **fields):
+            if stream:
+                self.send_answer_event("stage", {"stage": name, "message": message, **fields})
+
         try:
-            external = server.external
-            if not external or not external.intranet:
-                return 403, {"error": "intranet_answer_disabled"}
-            budget = external.internal_budget
-            if not budget:
-                return 400, {"error": "intranet_budget"}
-            sessions = server.answer_sessions
-            session_id, handle, turns = sessions.begin(conversation)
-            evidence, scope, aspects, follow_up = self.retrieve_external_evidence(
-                question, context, filters, external, budget, budget, turns=turns,
-            )
-            previous = next((turn[0] for turn in reversed(turns) if turn[2]), "") if follow_up else ""
-            model_question = f"{question}\n이전 질문: {previous[:250]}" if previous else question
-            with server.store.measure("context"):
-                excerpts = pack_excerpts(model_question, evidence, budget, with_context=True,
-                                         chars=external.review_chars, max_excerpts=MAX_GATEWAY_EXCERPTS, gap_aspects=aspects)
-            if not excerpts:
-                result = report_unconfirmed_aspects({"status": "insufficient", "claims": []}, aspects)
-                result.update(results=[], provider="intranet")
-            else:
-                status, result = self.generate_external_answer(
-                    external, question, excerpts, scope, gap_aspects=aspects, provider="intranet", model_question=model_question,
+            with server.answer_sessions.serialize(conversation, check), server.gateway_access() as allowed:
+                if not allowed:
+                    return 409, {"error": "external_busy"}
+                external = server.external
+                if not external or not external.intranet:
+                    return 403, {"error": "intranet_answer_disabled"}
+                budget = external.internal_budget
+                if not budget:
+                    return 400, {"error": "intranet_budget"}
+                if stream:
+                    self.start_answer_stream()
+                    stream_started = True
+                    stage("retrieving", "메일·문서 검색 및 질문 분석 중...")
+                status, result = self.build_intranet_answer(
+                    question, context, filters, conversation, external, budget, check, worker_check, stage,
+                    stream=stream,
                 )
-                if status != 200:
+                if not stream:
                     return status, result
-            sessions.record(session_id, handle, question, result)
-            return 200, {**result, "conversation": session_id}
+                if status != 200:
+                    self.send_answer_event("error", result)
+        except AnswerCancelled:
+            return None
+        except (sqlite3.Error, ImportIssue, ValueError, TypeError, KeyError, OverflowError) as exc:
+            if not stream_started:
+                raise
+            try:
+                error = "index_unavailable" if isinstance(exc, sqlite3.Error) else "answer_unavailable"
+                self.send_answer_event("error", {"error": error})
+            except AnswerCancelled:
+                pass
         finally:
-            server.outbound.release()
+            cancelled.set()
+
+    def build_intranet_answer(self, question, context, filters, conversation, external, budget, check, worker_check, stage,
+                              *, stream):
+        sessions = self.server.answer_sessions
+        session_id, handle, turns = sessions.begin(conversation)
+        evidence, scope, aspects, follow_up = self.retrieve_external_evidence(
+            question, context, filters, external, budget, budget, turns=turns,
+            check=check, worker_check=worker_check,
+            on_rerank=lambda count, remote: stage(
+                "reranking", "후보 근거 정밀 재정렬 중..." if remote else "후보 근거 순위를 정리 중...", candidates=count,
+            ),
+        )
+        check()
+        previous = next((turn[0] for turn in reversed(turns) if turn[2]), "") if follow_up else ""
+        model_question = f"{question}\n이전 질문: {previous[:250]}" if previous else question
+        with self.server.store.measure("context"):
+            excerpts = pack_excerpts(model_question, evidence, budget, with_context=True,
+                                     chars=external.review_chars, max_excerpts=MAX_GATEWAY_EXCERPTS, gap_aspects=aspects)
+        if not excerpts:
+            result = report_unconfirmed_aspects({"status": "insufficient", "claims": []}, aspects)
+            result.update(results=[], provider="intranet")
+        else:
+            status, result = self.generate_external_answer(
+                external, question, excerpts, scope, gap_aspects=aspects, provider="intranet", model_question=model_question,
+                check=check, on_generate=lambda: stage(
+                    "generating", "사내 AI가 답변을 작성 중입니다...", evidence=len(excerpts),
+                ),
+            )
+            if status != 200:
+                return status, result
+        check()
+        result = {**result, "conversation": session_id}
+        if stream:
+            self.send_answer_event("complete", result)
+        sessions.record(session_id, handle, question, result)
+        return 200, result
+
+    def start_answer_stream(self):
+        self.close_connection = True
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Connection", "close")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.end_headers()
+        except ConnectionError as exc:
+            raise AnswerCancelled() from exc
 
     def stream_answer_event(self, stage, **fields):
-        event = json.dumps({"stage": stage, **fields}, ensure_ascii=False)
+        self.send_answer_event(stage, {"stage": stage, **fields})
+
+    def send_answer_event(self, name, data):
+        event = json.dumps(data, ensure_ascii=False)
         self.check_answer_stream()
         try:
-            self.wfile.write(f"event: {stage}\ndata: {event}\n\n".encode("utf-8"))
+            self.wfile.write(f"event: {name}\ndata: {event}\n\n".encode("utf-8"))
             self.wfile.flush()
         except ConnectionError as exc:
             raise AnswerCancelled() from exc
@@ -921,15 +1037,9 @@ class Handler(BaseHTTPRequestHandler):
         if stream or "session_id" in payload:
             session_id, handle, turns = sessions.begin(session_id)
         if stream:
-            self.close_connection = True
             try:
-                self.send_response(200)
-                self.send_header("Content-Type", "text/event-stream; charset=utf-8")
-                self.send_header("Cache-Control", "no-store")
-                self.send_header("Connection", "close")
-                self.send_header("X-Content-Type-Options", "nosniff")
-                self.end_headers()
-            except ConnectionError:
+                self.start_answer_stream()
+            except AnswerCancelled:
                 return
         report = self.stream_answer_event if stream else lambda *args, **kwargs: None
         check = self.check_answer_stream if stream else None
@@ -1245,13 +1355,17 @@ class Handler(BaseHTTPRequestHandler):
         self.send_json(status, reply)
 
     def generate_external_answer(self, external, question, excerpts, scope, *, pcf=False, gap_aspects=(),
-                                 provider="external", model_question=None):
+                                 provider="external", model_question=None, check=None, on_generate=None):
         store = self.server.store
         ids = [item.passage for item in excerpts]
         windows = {item.passage for item in excerpts if item.window_start is not None}
         rows = {row["passage"]: row for row in store.passages(ids, scope, windows=windows)}
         if any(item.passage not in rows or not item.original_in(rows[item.passage]) for item in excerpts):
             return 409, {"error": "external_source_changed"}
+        if check:
+            check()
+        if on_generate:
+            on_generate()
         try:
             with store.measure("generation"):
                 prompt = model_question or question
@@ -1264,6 +1378,8 @@ class Handler(BaseHTTPRequestHandler):
         except (OSError, ValueError, RuntimeError, KeyError, IndexError, TypeError, http.client.HTTPException) as exc:
             return 200, {"status": "external_unavailable", "claims": [], "results": [], "provider": provider,
                          "reason": type(exc).__name__}
+        if check:
+            check()
         visible = {row["passage"]: row for row in store.passages(ids, scope, windows=windows)}
         verified = [{**visible[item.passage], "text": item.text,
                      "start": visible[item.passage]["start"] + item.start,
