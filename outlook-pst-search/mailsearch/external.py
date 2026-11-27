@@ -11,8 +11,9 @@ from dataclasses import dataclass
 from urllib.parse import urlsplit
 
 from .embedding import GatewayRequestError, gateway_origin, request_gateway_json, request_gateway_stream
-from .store import normalized, query_words, topic_key
-from .answer import ANSWER_INSTRUCTIONS, MODEL_NAME, PARTICIPANT_QUESTION, mail_context, map_citations, participant_domains
+from .store import normalized, query_words, summarize_participants, topic_key
+from .answer import (ANSWER_INSTRUCTIONS, CORRESPONDENCE_INSTRUCTIONS, MODEL_NAME, PARTICIPANT_QUESTION,
+                     mail_context, map_citations, participant_domains)
 
 DEFAULT_URL = "https://api.openai.com/v1/chat/completions"
 DEFAULT_MODEL = "gpt-4.1-mini"
@@ -216,6 +217,7 @@ class ExternalAI:
                         del messages["participant_domains"]
                     else:
                         instructions += "\nparticipant_domains는 확인할 교신 상대 후보 요약이다. 인용은 해당 메일의 context 또는 text에서 가져온다."
+                instructions += add_correspondence_summary(messages, excerpts, self.review_budget)
         if "check_aspects" in messages:
             instructions += ("\ncheck_aspects는 검색 진단의 참고 자료다. 각 항목을 근거와 대조하고 확인할 수 없는 항목은 "
                              "미확인으로 구분한다. 자료에 없는 사실은 단정하거나 claims에 넣지 않는다.")
@@ -267,6 +269,7 @@ class ExternalAI:
                     del data["participant_domains"]
                 else:
                     instructions += "\nparticipant_domains는 확인할 교신 상대 후보 요약이다. 출처는 현재 근거에서 선택한다."
+            instructions += add_correspondence_summary(data, excerpts, self.internal_budget, history)
         if gap_aspects:
             instructions += "\ncheck_aspects는 검색 진단의 참고 자료다. 근거가 없으면 미확인으로 구분한다."
         options = {
@@ -427,6 +430,26 @@ def prioritized_excerpts(rows, extended):
     return primary + remaining
 
 
+def add_correspondence_summary(payload, excerpts, budget, history=()):
+    # The same approved/currently verified excerpts are the only input to this summary.
+    if not budget:
+        return ""
+    headers = {item.mail or item.passage: item.context for item in excerpts
+               if item.context and (item.context.get("sender") or item.context.get("recipient"))}
+    if not headers:
+        return ""
+    summary = summarize_participants(headers.values(), limit=6)
+    payload["correspondence_summary"] = summary
+    history_size = len(compact_json(history).encode("utf-8")) if history else 0
+    while len(compact_json(payload).encode("utf-8")) + history_size > budget:
+        groups = [summary[name] for name in ("participants", "domains") if summary[name]]
+        if not groups:
+            del payload["correspondence_summary"]
+            return ""
+        max(groups, key=len).pop()
+    return CORRESPONDENCE_INSTRUCTIONS
+
+
 def pack_excerpts(question, rows, budget=0, *, with_context=False, chars=0, limit=MAX_EXCERPT_LENGTH,
                   max_excerpts=MAX_INTERNAL_EXCERPTS, gap_aspects=()):
     if not budget:
@@ -438,7 +461,7 @@ def pack_excerpts(question, rows, budget=0, *, with_context=False, chars=0, limi
     if gap_aspects:
         budget -= len(compact_json({"check_aspects": gap_aspects}).encode("utf-8"))
     if with_context and PARTICIPANT_QUESTION.search(question):
-        budget -= min(256, max(0, budget // 10))
+        budget -= min(2200, max(0, budget // 10))
     candidates = prioritized_excerpts(rows, True)
     words = sorted(query_words(question, fuzzy=True), key=len, reverse=True)
     chars_used = 0
