@@ -28,7 +28,7 @@ from .answer import (ANSWER_CLAIM_LIMIT, ANSWER_EVIDENCE_LIMIT, ANSWER_TEXT_LIMI
                      DEFAULT_ANSWER_NUM_CTX, PCF_INSTRUCTIONS, SYNTHESIS_QUESTION, AnswerSessions, LocalAI,
                      answer_groups, answer_plan, combine_answer_evidence, dedupe_by_content, delivery_date_answer, evidence_for,
                      follow_up_evidence, follow_up_replies, follow_up_reply_sender,
-                     map_citations, merge_rows, pcf_candidates, pcf_retrieval, pcf_word, public_row,
+                     map_citations, merge_rows, pcf_candidates, pcf_retrieval, pcf_word, public_row, public_rows,
                      report_unconfirmed_aspects, rewritten_evidence, source_text, supplemental_evidence, validate,
                      validate_markdown_answer)
 from .api_settings import ApiSettings, write_api_settings
@@ -784,9 +784,8 @@ class Handler(BaseHTTPRequestHandler):
         tokens = query_words(query, fuzzy=True)[:8]
         with store.measure("fts"):
             snippets = {} if quick or exact or memory else store.snippets(query, [row["passage"] for row in distinct.values()])
-        results = []
-        for row in distinct.values():
-            shown = public_row(row)
+        results = public_rows(store, distinct.values())
+        for row, shown in zip(distinct.values(), results, strict=True):
             if "similarity" in row:
                 shown["similarity"] = round(row["similarity"], 3)
             haystack = normalized(f"{row['subject']} {row['text']}")
@@ -798,7 +797,6 @@ class Handler(BaseHTTPRequestHandler):
             shown["snippet"] = (snippet if snippet and snippet in normalized(row["text"])
                                 and any(token in snippet for token in matched)
                                 else best_snippet(row["text"], matched))
-            results.append(shown)
         result = {"results": results}
         if quick:
             result["mode"] = "quick"
@@ -852,16 +850,17 @@ class Handler(BaseHTTPRequestHandler):
                     include_gap_aspects=external.intranet and not pcf,
                     max_excerpts=MAX_GATEWAY_EXCERPTS if external.intranet and not pcf else MAX_INTERNAL_EXCERPTS,
                 )
-            by_passage = {row["passage"]: public_row(row) for row in evidence}
+            results = public_rows(store, evidence)
+            by_passage = {row["passage"]: row for row in results}
             self.send_json(200, {
                 **external.public, "review": token, "question": query,
                 "input_bytes": budget or None, "evidence_chars": chars or None,
                 "excerpts": [{"id": item.number, "text": item.text, "context": item.context, "source": by_passage[item.passage]}
                              for item in review.excerpts] if review else [],
-                "results": [public_row(row) for row in evidence],
+                "results": results,
             })
             return
-        self.send_json(200, {"results": [public_row(row) for row in evidence]})
+        self.send_json(200, {"results": public_rows(store, evidence)})
 
     def exclusive_settings(self, change, *args):
         with self.server.gateway_access(settings=True) as allowed:
@@ -1067,7 +1066,7 @@ class Handler(BaseHTTPRequestHandler):
             if not rows:
                 return 409, {"error": "external_source_changed"}
             result = validate_markdown_answer(markdown, excerpts, question=question, rows=rows, gap_aspects=gap_aspects)
-        return 200, {**result, "results": [public_row(row, evidence=True) for row in rows], "provider": "intranet"}
+        return 200, {**result, "results": public_rows(store, rows, evidence=True), "provider": "intranet"}
 
     def start_answer_stream(self):
         self.close_connection = True
@@ -1189,7 +1188,6 @@ class Handler(BaseHTTPRequestHandler):
                 store, ai, query, filters, context, evidence, mode, query_count, check=check,
             )
         report("retrieving", count=len(evidence), queries=query_count, **{"pass": 2 if second else 1})
-        rows = [public_row(row, evidence=True) for row in evidence]
         result = {"status": "insufficient", "claims": []}
         if not ai.model:
             result["status"] = "model_not_configured"
@@ -1217,7 +1215,6 @@ class Handler(BaseHTTPRequestHandler):
                 evidence = [r for r in evidence if r["passage"] in visible
                             and (not r.get("window") or (r["start"], r["text"]) ==
                                  (visible[r["passage"]]["start"], visible[r["passage"]]["text"]))]
-                rows = [public_row(row, evidence=True) for row in evidence]
                 result = delivery_date_answer(query, evidence, context) if direct is not None else None
                 if result is None:
                     with store.measure("validation"):
@@ -1227,7 +1224,8 @@ class Handler(BaseHTTPRequestHandler):
                 result["status"] = "model_unavailable"
             finally:
                 self.server.generation.release()
-        return {**report_unconfirmed_aspects(result, gap_aspects), "results": rows, "retrieval": mode}
+        return {**report_unconfirmed_aspects(result, gap_aspects),
+                "results": public_rows(store, evidence, evidence=True), "retrieval": mode}
 
     def preview_pcf_word(self, passage, question, context, filters, external):
         store = self.server.store
@@ -1466,7 +1464,7 @@ class Handler(BaseHTTPRequestHandler):
             text_for = source_text if not pcf and any(row["reviewed_context"] for row in verified) else lambda row: row["text"]
             checked = validate(result, verified, question, text_for=text_for, pcf=pcf)
         checked = report_unconfirmed_aspects(checked, gap_aspects)
-        return 200, {**checked, "results": [public_row(row, evidence=True) for row in verified], "provider": provider}
+        return 200, {**checked, "results": public_rows(store, verified, evidence=True), "provider": provider}
 
     def intranet_settings(self):
         local, current = self.server.ai.embedding_config
