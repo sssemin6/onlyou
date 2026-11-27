@@ -97,6 +97,12 @@ try {
 - 검색, PST 색인, 이전 질문 맥락은 로컬에서 처리합니다. 기본 설정에서는 별도 메일 메타데이터를 보내지 않습니다. 발췌문 안에 이미 포함된 이름, 주소, 본문 정보는 그대로 표시되므로 전송 전에 확인하세요. 앱은 GUI에서 입력받은 키를 설정 조회나 검색 응답으로 다시 보내지 않습니다.
 - 답변 API 설정과 관계없이 로컬 검색을 사용할 수 있습니다. 외부 API를 쓰면 제공자의 요금과 데이터 처리 정책이 적용됩니다.
 
+### 최근 AI 대화
+
+사이드바의 **최근 AI 대화**에서 일반 메일·문서 질문과 답변을 다시 엽니다. 앱을 재시작한 뒤에도 최근 대화 30개를 보관합니다. 답변 화면에서 **답변 복사**와 **새 대화**를 사용할 수 있습니다. 저장된 답변을 다시 열 때 원문 접근과 인용을 확인합니다.
+
+로컬 AI와 사내 AI는 복합 비교·교신 이력·첨부 질문을 검색 범위 안에서 추가로 탐색합니다. `MAILSEARCH_AGENT_STEPS`의 기본값은 2이며 1~3으로 조절할 수 있습니다.
+
 ### 일반 메일·문서 답변의 입력 예산
 
 사내 답변 모델을 선택하면 질문과 근거 JSON에 UTF-8 64,000바이트를 기본으로 배정합니다. `MAILSEARCH_INTERNAL_INPUT_BYTES`로 3,000~192,000바이트 범위에서 조절하거나, `MAILSEARCH_INTERNAL_EVIDENCE_CHARS`에 `4000`, `12000`, `24000`, `48000` 중 하나를 지정할 수 있습니다. 발췌는 최대 32건이며 답변 호출의 기본 타임아웃은 60초입니다. 시스템 지시문과 출력에 필요한 모델 토큰도 확보하세요.
@@ -174,6 +180,20 @@ python -m unittest discover -s tests -v
 검색 속도는 `python -m tools.benchmark --count 50000`으로 합성 데이터에서 재현할 수 있습니다. 보관함 필터의 의미 검색은 `python -m tools.benchmark --semantic-scope --count 28000 --repetitions 20`으로 재현합니다. 벡터 후보가 겹치도록 만든 합성 자료에서 두 보관함 각각의 상위 20건 반환 수와 예열 후 P95를 출력합니다. 이 시험은 검색 DB의 응답을 측정합니다. PST 추출, 화면 표시, AI 추론 시간은 별도입니다.
 
 메모리 후보 검색과 SQLite FTS5의 비교는 `python -m tools.benchmark --memory-search --count 18000 --repetitions 30`으로 실행합니다. 메모리 로드 시간, 품번 및 자주 나오는 검색어의 중앙값과 P95를 표시합니다.
+
+### RAG 회귀 평가
+
+기존 `mail.sqlite`가 있는 데이터 폴더와 기대 근거가 적힌 JSON을 사용합니다.
+
+```json
+[{"question":"A-17 최종 납품일은?","expected_keywords":["6월 10일"],"expected_senders":["구매팀"],"expected_subjects":["A-17 납기 확정"]}]
+```
+
+```powershell
+python -m mailsearch.eval_harness --cases cases.json --data "C:\path\to\onlyou-data" -k 10 --retrieval-only
+```
+
+표는 표준 오류로, JSON은 표준 출력으로 보냅니다. `--json-out report.json`을 지정하면 JSON을 파일로 저장합니다. Recall@K는 기대 키워드·발신자·제목 중 상위 K개 근거에서 찾은 항목의 비율입니다. `--retrieval-only`는 생성 모델을 호출하지 않습니다. 로컬 의미 검색은 `--embedding-model bge-m3`, 저장한 사내 임베딩·재정렬 설정으로 평가하려면 `--gateway-retrieval`을 사용합니다. 전체 평가는 앱에 저장한 사내 답변 모델로 실행하며 첫 응답 토큰까지 시간과 인용 검증 통과율도 집계합니다.
 
 | 개발 환경 검증 | 결과 |
 |---|---|
