@@ -25,6 +25,11 @@ MAX_GATEWAY_INPUT_BYTES = 192000
 MAX_PCF_CELLS = 1600
 MAX_PCF_BATCHES = 12
 MAX_RESPONSE = 128 * 1024
+ANSWER_DETAILS = {
+    "concise": "장황한 서론·배경 설명 없이 핵심 결론만 2~4줄 또는 간단한 항목이나 표로 최대한 간결하게 답한다.",
+    "balanced": "핵심 결론을 먼저 제시하고 필요한 주요 근거와 경과만 간략히 정리한다.",
+    "detailed": "핵심 결론과 함께 시간순 경과, 이해관계자별 입장 차이, 세부 수치·조건을 빠짐없이 상세히 정리한다.",
+}
 MARKDOWN_ANSWER_INSTRUCTIONS = """제공된 현재 근거의 사실만 사용해 한국어 마크다운으로 답변한다.
 필요한 경우 요약, 비교 표, 불릿, 타임라인으로 정리한다. 모든 핵심 사실·수치·날짜·업체명·담당자 문장
 끝에 현재 근거의 source 번호를 [1] 또는 [1][2] 형식으로 붙인다. 표의 사실에도 출처를 붙인다.
@@ -47,6 +52,57 @@ class ExternalRequestError(RuntimeError):
     def __init__(self, status):
         super().__init__("external_api_http")
         self.status = status
+
+
+def completion_text(content):
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "".join(block["text"] for block in content if isinstance(block, dict)
+                       and block.get("type") == "text" and isinstance(block.get("text"), str))
+    if content is None:
+        return ""
+    raise ValueError("gateway_generation_response")
+
+
+class VisibleCompletion:
+    """Hide reasoning blocks, including tags split across streamed chunks."""
+    tag = re.compile(r"</?think>", re.I)
+    prefixes = {tag[:i] for tag in ("<think>", "</think>") for i in range(1, len(tag))}
+
+    def __init__(self):
+        self.pending = ""
+        self.depth = 0
+
+    def feed(self, chunk):
+        text = self.pending + chunk
+        visible = []
+        start = 0
+        for match in self.tag.finditer(text):
+            if not self.depth:
+                visible.append(text[start:match.start()])
+            self.depth = max(0, self.depth - 1) if match[0].startswith("</") else self.depth + 1
+            start = match.end()
+        tail = text[start:]
+        boundary = tail.rfind("<", max(0, len(tail) - 7))
+        if boundary >= 0 and tail[boundary:].lower() in self.prefixes:
+            self.pending, tail = tail[boundary:], tail[:boundary]
+        else:
+            self.pending = ""
+        if not self.depth:
+            visible.append(tail)
+        return "".join(visible)
+
+
+def completion_json(content):
+    text = VisibleCompletion().feed(completion_text(content))
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        first, last = text.find("{"), text.rfind("}")
+        if first < 0 or last < first:
+            raise
+        return json.loads(text[first:last + 1])
 
 
 def evidence_chars(profile, *, extended=False):
@@ -170,15 +226,38 @@ class ExternalAI:
         return map_citations(result, {item.number: item.passage for item in excerpts})
 
     def test(self):
-        reply = self.complete('Reply with the JSON object {"ok": true}.', "Connection test", token_limit=600, timeout=15)
-        if not isinstance(reply, dict) or reply.get("ok") is not True:
-            raise ValueError("external_test_reply")
+        if self.intranet:
+            payload = self.gateway_completion({
+                "model": self.model, "messages": [{"role": "user", "content": "Hello"}],
+            }, timeout=15)
+            message = payload["choices"][0]["message"]
+            if not isinstance(message, dict):
+                raise ValueError("external_test_reply")
+            text = VisibleCompletion().feed(completion_text(message.get("content")))
+            if text.strip() or completion_text(message.get("reasoning_content")).strip():
+                return
+        else:
+            reply = self.complete('Reply with the JSON object {"ok": true}.', "Connection test", token_limit=600, timeout=15)
+            if isinstance(reply, dict) and reply.get("ok") is True:
+                return
+        raise ValueError("external_test_reply")
 
-    def answer_markdown(self, question, excerpts, *, history=(), gap_aspects=(), on_delta=None, timeout=None):
+    def gateway_completion(self, options, *, timeout):
+        headers = {"Authorization": f"Bearer {self._key}", "Content-Type": "application/json"}
+        try:
+            return request_gateway_json(self.gateway, self.path, options, headers, timeout=timeout,
+                                        max_bytes=MAX_RESPONSE, tls=self.tls, retry_stale=False)
+        except GatewayRequestError as exc:
+            raise ExternalRequestError(exc.status) from exc
+
+    def answer_markdown(self, question, excerpts, *, history=(), gap_aspects=(), on_delta=None, timeout=None,
+                        detail="balanced"):
         if not self.intranet:
             raise ValueError("intranet_answer_disabled")
+        if not isinstance(detail, str) or detail not in ANSWER_DETAILS:
+            raise ValueError("answer_detail")
         data = evidence_payload(question, excerpts, gap_aspects=gap_aspects)
-        instructions = MARKDOWN_ANSWER_INSTRUCTIONS
+        instructions = MARKDOWN_ANSWER_INSTRUCTIONS + ANSWER_DETAILS[detail]
         if PARTICIPANT_QUESTION.search(question):
             domains = participant_domains((item.mail or item.passage, item.context or {}) for item in excerpts)
             if domains:
@@ -200,6 +279,7 @@ class ExternalAI:
         headers = {"Authorization": f"Bearer {self._key}", "Content-Type": "application/json"}
         timeout = 60 if timeout is None else timeout
         parts = []
+        visible = VisibleCompletion()
         size = 0
         replies = request_gateway_stream(self.gateway, self.path, options, headers, timeout=timeout, tls=self.tls)
         try:
@@ -214,14 +294,11 @@ class ExternalAI:
                         raise ValueError("gateway_generation_response")
                     choice = choices[0]
                     message = choice.get("delta", choice.get("message", {}))
-                    text = message.get("content") if isinstance(message, dict) else None
-                    if text is None:
-                        continue
-                    if not isinstance(text, str):
-                        raise ValueError("gateway_generation_response")
+                    text = completion_text(message.get("content")) if isinstance(message, dict) else ""
                     size += len(text.encode("utf-8"))
                     if size > MAX_RESPONSE:
                         raise ValueError("gateway_response_size")
+                    text = visible.feed(text)
                     if text:
                         parts.append(text)
                         if on_delta is not None:
@@ -267,22 +344,11 @@ class ExternalAI:
                 options["max_tokens"] = token_limit
             headers = {"Authorization": f"Bearer {self._key}", "Content-Type": "application/json"}
         if self.gateway:
-            try:
-                payload = request_gateway_json(self.gateway, self.path, options, headers, timeout=timeout,
-                                               max_bytes=MAX_RESPONSE, tls=self.tls, retry_stale=False)
-            except GatewayRequestError as exc:
-                raise ExternalRequestError(exc.status) from exc
+            payload = self.gateway_completion(options, timeout=timeout)
         else:
             payload = self.request_json(options, headers, timeout)
-        if self.anthropic:
-            text = "".join(block.get("text", "") for block in payload["content"] if isinstance(block, dict))
-        else:
-            text = payload["choices"][0]["message"]["content"]
-        if self.intranet and isinstance(text, str):
-            fenced = re.fullmatch(r"\s*```(?:json)?\s*(.*?)\s*```\s*", text, re.S | re.I)
-            if fenced:
-                text = fenced[1]
-        return json.loads(text)
+        content = payload["content"] if self.anthropic else payload["choices"][0]["message"]["content"]
+        return completion_json(content)
 
     def request_json(self, options, headers, timeout):
         # For other HTTPS providers, use the standard certificate verification policy.
