@@ -27,9 +27,9 @@ from .extract import (CREATE_FLAGS, DOCUMENT_SUFFIXES, LEGACY_CONVERTER_MISSING,
                       PDF_EXTRACTOR_MISSING, UNSUPPORTED_FORMAT, extract_attachment, extract_document,
                       office_binary, optional_reader, parse_mail)
 from .filesystem import local_path, source_path, stable_input
-from .outlook import DEFAULT_OUTLOOK, OutlookError, outlook_modules, outlook_store
+from .outlook import DEFAULT_OUTLOOK, OUTLOOK_PST_PREFIX, OutlookError, outlook_modules, outlook_store
 from .pcf import WORD_SUFFIXES
-from .store import (MAIL_INDEX_PREFIXES, buckets, contextual_model_keys, document_kind, document_identity, matches_fingerprint, now,
+from .store import (MAIL_INDEX_PREFIXES, buckets, contextual_model_keys, document_kind, document_identity, like_prefix, matches_fingerprint, now,
                     pack_vector, read_signature, sections, vector_array)
 from .vector_index import prune_vector_files
 
@@ -133,9 +133,10 @@ def folder_files(root, suffixes, *, numbered=False, log_skipped=False, extra_pat
             try:
                 if not path.is_file():
                     continue
-            except PermissionError:
+            except OSError as exc:
                 # Let the importer record failures for supported files.
-                pass
+                if not isinstance(exc, PermissionError) and not (suffix == ".pst" and pst_access_error(exc)):
+                    raise
             yield path
     if log_skipped and skipped:
         runtime_logger.info("Folder scan skipped %d unsupported files", skipped)
@@ -251,10 +252,15 @@ class Indexer:
                     pass
                 kind = "eml_dir"
             elif stat.S_ISREG(mode) and path.suffix.lower() in {".pst", ".eml"} | DOCUMENT_SUFFIXES:
-                with path.open("rb"):
-                    pass
                 suffix = path.suffix.lower()
                 kind = "pst" if suffix == ".pst" else ("eml" if suffix == ".eml" else "doc")
+                try:
+                    with path.open("rb"):
+                        pass
+                except OSError as exc:
+                    if kind != "pst" or getattr(exc, "winerror", None) not in {32, 33}:
+                        raise
+                    # The indexer will check whether Outlook already owns this PST.
             else:
                 raise ImportIssue("source_format")
         except OSError as exc:
@@ -588,20 +594,13 @@ class Indexer:
             return {**{key: read[key] for key in ("item", "position", "total", "files")},
                     "elapsed": int(age - read["started"]), "idle": int(age - read["last_output"])}
 
-    def import_folder_psts(self, folder, stage, event, known, source, already_deferred, outdated, *, ignore_patterns=()):
-        """Also import PST files kept inside a registered mail folder.
-
-        PSTs whose signature matches the last committed import are carried over
-        from that version instead of being re-exported and re-indexed. Empty or
-        unreadable PST files are skipped. A locked PST keeps its previous index
-        and signature so the next refresh still sees it as pending.
-        """
+    def import_folder_psts(self, folder, stage, temporary, event, known, source, version,
+                           already_deferred, outdated, *, ignore_patterns=()):
+        """Reuse unchanged exports and read locked PSTs from their open Outlook stores."""
         extras, carried = [], []
-        skipped = {}
-        signatures = {}
+        skipped, signatures = {}, {}
         files = sorted(folder_files(folder, {".pst"}, extra_patterns=ignore_patterns))
-        current_items = {path.relative_to(folder).as_posix() for path in files} if already_deferred else ()
-        deferred = {item: code for item, code in already_deferred.items() if item in current_items}
+        deferred = {}
         for position, pst in enumerate(files, 1):
             self.check(event)
             item = pst.relative_to(folder).as_posix()
@@ -609,91 +608,138 @@ class Indexer:
             label = item + "/"
             slot = stage / ("pst-" + hashlib.sha1(label.encode("utf-8")).hexdigest()[:16])
             checkpoint = slot / "pst-signature"
-            if item in deferred:
-                runtime_logger.warning("PST deferred (source=%d, archive=%d/%d, reason=%s)",
-                                       source, position, len(files), deferred[item])
-                if label in known:
-                    carried.append(label)
-                    signatures[label] = known[label]
-                continue
+            checkpoint_signature = None
+            signature = None
             try:
-                if pst.is_symlink() or not stat.S_ISREG(pst.stat().st_mode):
+                if pst.is_symlink():
+                    continue
+                if item in already_deferred:
+                    raise ImportIssue(already_deferred[item])
+                if not stat.S_ISREG(pst.stat().st_mode):
                     continue
                 signature = read_signature(pst)
-                previous_signature = checkpoint.read_text(encoding="ascii") if checkpoint.is_file() else None
-                if previous_signature and previous_signature != signature:
-                    cached = self.original_cache(source, label, previous_signature)
+                checkpoint_signature = checkpoint.read_text(encoding="ascii") if checkpoint.is_file() else None
+                was_outlook = bool(checkpoint_signature and checkpoint_signature.startswith(OUTLOOK_PST_PREFIX))
+                if checkpoint_signature and not was_outlook and checkpoint_signature != signature:
+                    cached = self.original_cache(source, label, checkpoint_signature)
                     if not cached.is_dir() and (slot / "export-complete").is_file():
                         cached = slot / "eml"
-                    if cached.is_dir():
-                        extras.append((cached, label))
-                        signatures[label] = previous_signature
-                        continue
-                    deferred[item] = "pst_changed"
-                    if label in known:
-                        carried.append(label)
-                        signatures[label] = known[label]
+                    if not cached.is_dir():
+                        raise ImportIssue("pst_changed")
+                    extras.append((cached, label))
+                    signatures[label] = checkpoint_signature
                     continue
                 if known.get(label) == signature and label not in outdated:
+                    self.discard_folder_outlook(source, version, label, checkpoint, checkpoint_signature)
                     carried.append(label)
                     signatures[label] = signature
                     continue
-            except FileNotFoundError:
-                continue
-            except OSError as exc:
-                if not pst_access_error(exc):
-                    raise
-                deferred[item] = pst_access_issue(exc)
-                runtime_logger.warning("PST deferred (source=%d, archive=%d/%d, reason=%s)",
-                                       source, position, len(files), deferred[item])
-                if label in known:
-                    carried.append(label)
-                    signatures[label] = known[label]
-                continue
-            slot.mkdir(parents=True, exist_ok=True, mode=0o700)
-            try:
+                slot.mkdir(parents=True, exist_ok=True, mode=0o700)
                 with stable_input(pst):
                     if not self.pst_header(pst):
                         raise ImportIssue("pst_invalid")
+                    self.discard_folder_outlook(source, version, label, checkpoint, checkpoint_signature)
                     if not checkpoint.exists():
-                        temporary = slot / "pst-signature.tmp"
-                        temporary.write_text(signature, encoding="ascii")
-                        temporary.replace(checkpoint)
+                        self.save_pst_checkpoint(checkpoint, signature)
                     cached = self.original_cache(source, label, signature)
                     output = (cached if label in outdated and cached.is_dir() else
                               self.cached_export(pst, slot, event, source, label, signature))
                     if read_signature(pst) != signature:
                         raise ImportIssue("changed")
-            except OSError as exc:
-                if not pst_access_error(exc):
-                    raise
-                deferred[item] = pst_access_issue(exc)
-                runtime_logger.warning("PST deferred (source=%d, archive=%d/%d, reason=%s)",
-                                       source, position, len(files), deferred[item])
-                if label in known:
-                    carried.append(label)
-                    signatures[label] = known[label]
+            except FileNotFoundError:
                 continue
-            except ImportIssue as exc:
-                if str(exc) == "changed":
-                    deferred[item] = "pst_changed"
+            except (OSError, ImportIssue) as exc:
+                if isinstance(exc, OSError) and not pst_access_error(exc):
+                    raise
+                issue = pst_access_issue(exc) if isinstance(exc, OSError) else str(exc)
+                if issue == "pst_in_use":
+                    try:
+                        signatures[label] = self.index_open_folder_pst(pst, checkpoint, temporary, event,
+                                                                      source, version, label)
+                    except OutlookError:
+                        pass
+                    else:
+                        continue
+                if issue == "changed":
+                    issue = "pst_changed"
+                if issue in PST_DEFERRED:
+                    self.discard_folder_outlook(source, version, label, checkpoint)
+                    deferred[item] = issue
+                    runtime_logger.warning("PST deferred (source=%d, archive=%d/%d, reason=%s)",
+                                           source, position, len(files), issue)
                     if label in known:
                         carried.append(label)
                         signatures[label] = known[label]
                     continue
-                if str(exc) in {"pst_no_mail", "pst_export", "pst_invalid"}:
-                    skipped[item] = str(exc)
+                if issue in {"pst_no_mail", "pst_export", "pst_invalid"}:
+                    self.discard_folder_outlook(source, version, label, checkpoint)
+                    skipped[item] = issue
                     if label in outdated and known.get(label) == signature:
-                        # A failed migration must not drop results from an unchanged PST.
                         carried.append(label)
-                    # Remember the signature so an unchanged unusable PST is not
-                    # flagged as an update target on every later refresh.
                     signatures[label] = signature
                     continue
                 raise
             extras.append((output, label))
             signatures[label] = signature
         return extras, carried, skipped, signatures, deferred
+
+    @staticmethod
+    def save_pst_checkpoint(checkpoint, signature):
+        temporary = checkpoint.with_suffix(".tmp")
+        temporary.write_text(signature, encoding="ascii")
+        temporary.replace(checkpoint)
+
+    @staticmethod
+    def delete_pending_pst(conn, source, version, prefix):
+        scope = "source=? AND version=? AND item LIKE ? ESCAPE '\\'"
+        params = source, version, like_prefix(prefix)
+        deleted = conn.execute(f"DELETE FROM mails WHERE {scope}", params).rowcount
+        failed = conn.execute(f"DELETE FROM problems WHERE {scope} AND code='parse'", params).rowcount
+        if deleted or failed:
+            conn.execute("UPDATE sources SET done=max(0,done-?),failed=max(0,failed-?) WHERE id=? AND pending=?",
+                         (deleted, failed, source, version))
+        return deleted
+
+    def discard_folder_outlook(self, source, version, label, checkpoint, signature=None):
+        if signature is None and checkpoint.is_file():
+            signature = checkpoint.read_text(encoding="ascii")
+        if signature and signature.startswith(OUTLOOK_PST_PREFIX):
+            with self.store.connection() as conn:
+                deleted = self.delete_pending_pst(conn, source, version, label + OUTLOOK_PST_PREFIX)
+            checkpoint.unlink(missing_ok=True)
+            if deleted and self.store.source(source)["active"] is None:
+                self.store.reload_memory(source)
+
+    def index_open_folder_pst(self, pst, checkpoint, temporary, event, source, version, label):
+        self.check(event)
+        if pst.parent.resolve(strict=True) != pst.parent or pst.is_symlink():
+            raise OutlookError("outlook_pst_path")
+        with (outlook_store(OUTLOOK_PST_PREFIX + str(pst), open_only=True) as outlook,
+              self.extraction_pool() as pool, self.store.connection() as conn):
+            folders, aliases = self.outlook_folders(outlook, event)
+            self.check(event)
+            deleted = self.delete_pending_pst(conn, source, version, label)
+            ids = []
+            for entry, folder in folders.items():
+                self.check(event)
+                mail = outlook.read(entry, folder, temporary, aliases.get(entry, ()))
+                mail["folder"] = "/" + label + mail["folder"]
+                item = label + OUTLOOK_PST_PREFIX + entry
+                mail_id = self.store.add_mail(conn, source, version, item, mail)
+                self.index_outlook_attachments(conn, mail_id, mail, temporary, event, pool)
+                ids.append(mail_id)
+            self.check(event)
+            conn.execute("UPDATE sources SET done=done+? WHERE id=? AND pending=?", (len(ids), source, version))
+            signature = OUTLOOK_PST_PREFIX + outlook.store_id
+            checkpoint.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            for flag in ("export-complete", "cached-export"):
+                (checkpoint.parent / flag).unlink(missing_ok=True)
+            self.save_pst_checkpoint(checkpoint, signature)
+        if deleted and self.store.source(source)["active"] is None:
+            self.store.reload_memory(source)
+        else:
+            self.store.append_pending_memory(source, ids)
+        return signature
 
     def original_cache(self, source, label, signature):
         key = hashlib.sha256((label + "\0" + signature).encode()).hexdigest()
@@ -733,8 +779,12 @@ class Indexer:
             return self.outlook_attachment_bytes(row)
         source, version, item = row["source"], row["version"], row["item"]
         root = Path(row["path"])
-        if root.resolve(strict=True) != root:
-            raise ImportIssue("attachment_missing")
+        try:
+            if root.resolve(strict=True) != root:
+                raise ImportIssue("attachment_missing")
+        except OSError as exc:
+            if row["kind"] != "pst" or not pst_access_error(exc) or pst_access_issue(exc) != "pst_in_use":
+                raise
         stage = self.spool / str(source) / str(version)
         parts = Path(item).parts
         split = next((i + 1 for i, part in enumerate(parts[:-1]) if part.lower().endswith(".pst")), 0)
@@ -744,7 +794,17 @@ class Indexer:
                 signature = row["active_signature"] if version == row["active"] else row["signature"]
             else:
                 label = Path(*parts[:split]).as_posix() + "/"
-                pst = self.contained_file(root, label)
+                candidate = root / label
+                try:
+                    pst = self.contained_file(root, label)
+                    if pst != candidate:
+                        raise ImportIssue("attachment_missing")
+                except OSError as exc:
+                    if (not pst_access_error(exc) or pst_access_issue(exc) != "pst_in_use"
+                            or not candidate.is_relative_to(root) or ".." in candidate.parts
+                            or candidate.parent.resolve(strict=True) != candidate.parent or candidate.is_symlink()):
+                        raise
+                    pst = candidate
                 eml = Path(*parts[split:]).as_posix()
                 stage = stage / ("pst-" + hashlib.sha1(label.encode("utf-8")).hexdigest()[:16])
                 snapshot = stage / "pst-signature"
@@ -753,17 +813,26 @@ class Indexer:
                     signature = read_signature(pst)
             if not signature:
                 raise ImportIssue("attachment_missing")
-            with pst.open("rb"):
-                pass
-            cached = self.original_cache(source, label, signature)
-            if not cached.is_dir():
-                if (stage / "export-complete").is_file() and (stage / "eml").is_dir():
-                    cached = stage / "eml"
-                else:
-                    if read_signature(pst) != signature:
-                        raise ImportIssue("attachment_changed")
-                    self.prepare_original(pst, source, label, signature)
-                    return None
+            if signature.startswith(OUTLOOK_PST_PREFIX):
+                return self.outlook_attachment_bytes(row, pst=pst, label=label, signature=signature)
+            try:
+                with pst.open("rb"):
+                    pass
+                cached = self.original_cache(source, label, signature)
+                if not cached.is_dir():
+                    if (stage / "export-complete").is_file() and (stage / "eml").is_dir():
+                        cached = stage / "eml"
+                    else:
+                        with stable_input(pst):
+                            if read_signature(pst) != signature:
+                                raise ImportIssue("attachment_changed")
+                            self.prepare_original(pst, source, label, signature)
+                        return None
+            except (OSError, ImportIssue) as exc:
+                if (isinstance(exc, OSError) and pst_access_error(exc) and pst_access_issue(exc) == "pst_in_use"
+                        or isinstance(exc, ImportIssue) and str(exc) == "pst_in_use"):
+                    return self.outlook_attachment_bytes(row, pst=pst, label=label, signature=signature)
+                raise
             path = self.contained_file(cached, eml)
         elif row["kind"] == "eml_dir":
             path = self.contained_file(root, item)
@@ -785,15 +854,26 @@ class Indexer:
             raise ImportIssue("attachment_missing")
         return payload
 
-    def outlook_attachment_bytes(self, row):
+    def outlook_attachment_bytes(self, row, *, pst=None, label="", signature=None):
+        path = row["path"] if pst is None else OUTLOOK_PST_PREFIX + str(pst)
+        item, folder = row["item"], row["folder"]
+        legacy = pst is not None and not signature.startswith(OUTLOOK_PST_PREFIX)
         try:
-            with tempfile.TemporaryDirectory(dir=self.spool, prefix="outlook-") as folder, outlook_store(row["path"]) as outlook:
-                signature = row["active_signature"] if row["version"] == row["active"] else row["signature"]
-                if signature != outlook.store_id:
-                    raise ImportIssue("attachment_changed")
-                mail = outlook.read(row["item"], row["folder"], folder)
+            with (tempfile.TemporaryDirectory(dir=self.spool, prefix="outlook-") as temporary,
+                  outlook_store(path, open_only=pst is not None) as outlook):
+                if pst is None:
+                    signature = row["active_signature"] if row["version"] == row["active"] else row["signature"]
+                if legacy:
+                    mail = outlook.find_message(row["message_id"], temporary)
+                else:
+                    expected = outlook.store_id if pst is None else OUTLOOK_PST_PREFIX + outlook.store_id
+                    if signature != expected:
+                        raise ImportIssue("attachment_changed")
+                    entry = item.removeprefix(label).removeprefix(OUTLOOK_PST_PREFIX) if pst is not None else item
+                    mail = outlook.read(entry, folder.removeprefix("/" + label) if label else folder, temporary)
                 position = row["position"]
-                if not matches_fingerprint(mail, row["item"], row["fingerprint"]) or position >= len(mail["attachments"]):
+                verified = matches_fingerprint(mail, item, row["fingerprint"])
+                if (not verified and not legacy) or position >= len(mail["attachments"]):
                     raise ImportIssue("attachment_changed")
                 name, part = mail["attachments"][position]
                 if name != row["name"]:
@@ -801,9 +881,26 @@ class Indexer:
                 content = part.get_payload(decode=True)
                 if not content or len(content) > MAX_ATTACHMENT:
                     raise ImportIssue("outlook_attachment_size")
+                if pst is not None and row["content_key"] is not None:
+                    digest = hashlib.sha256(Path(name).suffix.lower().encode("ascii") + b"\0" + content).digest()
+                    if digest != row["content_key"]:
+                        raise ImportIssue("attachment_changed")
+                    verified = True
+                if legacy and not verified:
+                    # Without a cached digest, require the same file snapshot in
+                    # addition to the unique Message-ID.
+                    try:
+                        verified = read_signature(pst) == signature
+                    except OSError:
+                        pass
+                    if not verified:
+                        raise ImportIssue("attachment_changed")
                 return content
         except OutlookError as exc:
-            raise ImportIssue(str(exc)) from exc
+            code = str(exc)
+            if pst is not None and code in {"outlook_windows", "outlook_pywin32", "outlook_unavailable", "outlook_pst_not_open"}:
+                code = "pst_in_use"
+            raise ImportIssue(code) from exc
 
     def prepare_original(self, path, source, label, signature):
         key = (source, label, signature)
@@ -828,7 +925,10 @@ class Indexer:
                 except Paused:
                     pass
                 except (OSError, ImportIssue, ValueError) as exc:
-                    issue = str(exc) if isinstance(exc, ImportIssue) else "attachment_missing"
+                    if isinstance(exc, ImportIssue):
+                        issue = str(exc)
+                    else:
+                        issue = pst_access_issue(exc) if pst_access_error(exc) else "attachment_missing"
                     with self.lock:
                         self.original_failure = (key, issue)
 
@@ -920,17 +1020,19 @@ class Indexer:
             signature = source_signature(path, kind)
         except OSError as exc:
             if kind == "pst" and pst_access_error(exc):
-                raise ImportIssue(pst_access_issue(exc)) from exc
+                self.process_locked_pst(row, stage, temp, event, pst_access_issue(exc))
+                return
             raise
         saved = row["signature"]
         if saved and kind == "eml_dir":
             saved = folder_identity(saved)
-        if saved and signature != saved:
-            raise ImportIssue("changed")
-        with self.store.connection() as conn:
-            conn.execute("UPDATE sources SET signature=? WHERE id=? AND state='extracting'", (signature, source))
+        is_pst = kind == "pst"
+        if not is_pst:
+            if saved and signature != saved:
+                raise ImportIssue("changed")
+            with self.store.connection() as conn:
+                conn.execute("UPDATE sources SET signature=? WHERE id=? AND state='extracting'", (signature, source))
         self.check(event)
-        is_pst = row["kind"] == "pst"
         extras, carried, signatures, deferred = (), (), None, ()
         ignore_patterns = ()
         if is_pst:
@@ -939,8 +1041,16 @@ class Indexer:
                 with stable_input(path):
                     if read_signature(path) != signature:
                         raise ImportIssue("changed")
+                    from_outlook = saved and saved.startswith(OUTLOOK_PST_PREFIX)
+                    if saved and signature != saved and not from_outlook:
+                        raise ImportIssue("changed")
                     if not self.pst_header(path):
                         raise ImportIssue("pst_invalid")
+                    with self.store.connection() as conn:
+                        deleted = from_outlook and self.delete_pending_pst(conn, source, version, OUTLOOK_PST_PREFIX)
+                        conn.execute("UPDATE sources SET signature=? WHERE id=? AND pending=?", (signature, source, version))
+                    if deleted and previous is None:
+                        self.store.reload_memory(source)
                     outdated = self.store.outdated_pst_labels(source, previous, ("",))
                     cached = self.original_cache(source, "", signature)
                     if previous is not None and row["active_signature"] == signature and not outdated:
@@ -950,10 +1060,15 @@ class Indexer:
                         root = cached if outdated and cached.is_dir() else self.cached_export(path, stage, event, source, "", signature)
                     if read_signature(path) != signature:
                         raise ImportIssue("changed")
-            except OSError as exc:
-                if not pst_access_error(exc):
+            except (OSError, ImportIssue) as exc:
+                if isinstance(exc, OSError) and pst_access_error(exc):
+                    lock_issue = pst_access_issue(exc)
+                elif isinstance(exc, ImportIssue) and str(exc) == "pst_in_use":
+                    lock_issue = "pst_in_use"
+                else:
                     raise
-                raise ImportIssue(pst_access_issue(exc)) from exc
+                self.process_locked_pst(self.store.source(source), stage, temp, event, lock_issue)
+                return
         else:
             root = path
             if path.is_dir():
@@ -968,7 +1083,8 @@ class Indexer:
                 known = self.store.pst_files(source)
                 outdated = self.store.outdated_pst_labels(source, previous, known)
                 extras, carried, skipped_psts, signatures, deferred = self.import_folder_psts(
-                    path, stage, event, known, source, already_deferred, outdated, ignore_patterns=ignore_patterns)
+                    path, stage, temp, event, known, source, version, already_deferred, outdated,
+                    ignore_patterns=ignore_patterns)
                 with self.store.connection() as conn:
                     conn.execute("""DELETE FROM problems WHERE source=? AND version=?
                                     AND code IN ('pst_in_use','pst_access_denied','pst_changed','pst_no_mail','pst_export','pst_invalid')""",
@@ -1001,8 +1117,14 @@ class Indexer:
         self.index_attachments(root, temp, source, version, event, extras=extras)
         issue = self.embed_revision(source, version, event)
         self.start_finalization(source, version, event, "verify_source", issue)
-        if source_signature(path, kind) != signature:
-            raise ImportIssue("changed")
+        try:
+            if source_signature(path, kind) != signature:
+                raise ImportIssue("changed")
+        except OSError as exc:
+            if is_pst and pst_access_error(exc):
+                self.process_locked_pst(self.store.source(source), stage, temp, event, pst_access_issue(exc))
+                return
+            raise
         self.publish_revision(source, version, signature, event, issue, empty_eml=empty_eml, signatures=signatures)
         shutil.rmtree(stage, ignore_errors=True)
         if signatures is not None or is_pst:
@@ -1012,6 +1134,18 @@ class Indexer:
             for folder in cached.iterdir() if cached.is_dir() else ():
                 if folder / "eml" not in keep:
                     shutil.rmtree(folder, ignore_errors=True)
+
+    def process_locked_pst(self, row, stage, temporary, event, issue):
+        if issue == "pst_in_use":
+            self.check(event)
+            try:
+                with self.store.thread_connection():
+                    self.process_outlook(row, temporary, event, open_only=True)
+            except OutlookError as exc:
+                raise ImportIssue(issue) from exc
+            shutil.rmtree(stage, ignore_errors=True)
+            return
+        raise ImportIssue(issue)
 
     def embed_revision(self, source, version, event, *, retain=False):
         if self.ai is not None and self.ai.embedding_index:
@@ -1101,24 +1235,36 @@ class Indexer:
                 report("commit")
         self.prune_vectors()
 
-    def process_outlook(self, row, temporary, event):
+    def outlook_folders(self, outlook, event, old=None, pending=None, *, item_prefix=""):
+        old = old or {}
+        pending = pending or {}
+        folders, aliases = {}, {}
+        for entry_id, folder in outlook.identities(lambda: self.check(event)):
+            # Virtual search folders can expose the same EntryID more than once.
+            item = item_prefix + entry_id
+            if item in folders and folders[item] != folder:
+                aliases.setdefault(item, {folders[item]}).add(folder)
+            previous_item = old.get(item) or pending.get(item)
+            if item not in folders or (previous_item and previous_item["folder"] == folder):
+                folders[item] = folder
+        return folders, aliases
+
+    def process_outlook(self, row, temporary, event, *, open_only=False):
         source, version, previous = row["id"], row["pending"], row["active"]
-        with outlook_store(row["path"]) as outlook, self.extraction_pool() as pool:
-            signature = outlook.store_id
+        item_prefix = OUTLOOK_PST_PREFIX if open_only else ""
+        with (outlook_store(item_prefix + row["path"], open_only=open_only) as outlook,
+              self.extraction_pool() as pool):
+            signature = item_prefix + outlook.store_id
             with self.store.connection() as conn:
                 old = self.store.mail_identities(conn, source, previous) if row["active_signature"] == signature else {}
                 retry_mails = {attachment["mail"] for attachment in self.retryable_extracts(conn, source, previous)}
+                deleted = False
                 if row["signature"] and row["signature"] != signature:
-                    conn.execute("DELETE FROM mails WHERE source=? AND version=?", (source, version))
+                    deleted = self.delete_pending_pst(conn, source, version, "")
                 pending = self.store.mail_identities(conn, source, version)
-            folders, aliases = {}, {}
-            for entry_id, folder in outlook.identities(lambda: self.check(event)):
-                # Virtual search folders can expose the same EntryID more than once.
-                if entry_id in folders and folders[entry_id] != folder:
-                    aliases.setdefault(entry_id, {folders[entry_id]}).add(folder)
-                previous_item = old.get(entry_id) or pending.get(entry_id)
-                if entry_id not in folders or (previous_item and previous_item["folder"] == folder):
-                    folders[entry_id] = folder
+            folders, aliases = self.outlook_folders(outlook, event, old, pending, item_prefix=item_prefix)
+            if not folders and open_only:
+                raise ImportIssue("pst_no_mail")
 
             self.state(source, "headers")
             self.check(event)
@@ -1137,15 +1283,17 @@ class Indexer:
                 conn.execute("""UPDATE sources SET signature=?,done=?,index_done=?,index_total=?,
                                 failed=0,omitted=0,partial=0 WHERE id=? AND pending=?""",
                              (signature, done, done, len(folders), source, version))
+            if previous is None and (deleted or pending.keys() - pending_ids):
+                self.store.reload_memory(source)
             remaining = (entry for entry in folders if entry not in retained and entry not in pending_ids)
             log_index_progress(source, "Outlook 메일·첨부", done, len(folders))
             next_log = time.monotonic() + PST_PROGRESS_INTERVAL
             batch = []
             with self.store.connection() as conn:
-                for entry_id in remaining:
+                for item in remaining:
                     self.check(event)
-                    mail = outlook.read(entry_id, folders[entry_id], temporary, aliases.get(entry_id, ()))
-                    mail_id = self.store.add_mail(conn, source, version, entry_id, mail)
+                    mail = outlook.read(item.removeprefix(item_prefix), folders[item], temporary, aliases.get(item, ()))
+                    mail_id = self.store.add_mail(conn, source, version, item, mail)
                     self.index_outlook_attachments(conn, mail_id, mail, temporary, event, pool)
                     del mail
                     done += 1
@@ -1426,7 +1574,8 @@ class Indexer:
             extracted, pending = [], deque()
             new_extracts, inflight = {}, {}
             conn.executemany("UPDATE attachments SET status='대기' WHERE id=?",
-                             ((row["id"],) for row in self.retryable_extracts(conn, source, version)))
+                             ((row["id"],) for row in self.retryable_extracts(conn, source, version)
+                              if not row["item"].rsplit("/", 1)[-1].startswith(OUTLOOK_PST_PREFIX)))
             total, done = conn.execute(
                 """SELECT COUNT(*),COALESCE(SUM(a.status<>'대기'),0)
                    FROM mails m JOIN attachments a ON a.mail=m.id WHERE m.source=? AND m.version=? AND m.kind='mail'""",
@@ -1536,7 +1685,7 @@ class Indexer:
         if version is None:
             return []
         candidates = conn.execute(
-            """SELECT a.id,a.mail,a.name,a.status FROM mails m JOIN attachments a ON a.mail=m.id
+            """SELECT a.id,a.mail,a.name,a.status,m.item FROM mails m JOIN attachments a ON a.mail=m.id
                WHERE m.source=? AND m.version=? AND m.kind='mail' AND (
                     a.status IN (?,?) OR (a.status=? AND lower(substr(a.name,-4)) IN ('.xls','.doc')))""",
             (source, version, PDF_EXTRACTOR_MISSING, LEGACY_CONVERTER_MISSING, UNSUPPORTED_FORMAT),
