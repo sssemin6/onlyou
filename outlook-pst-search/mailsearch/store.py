@@ -23,7 +23,7 @@ from itertools import tee, zip_longest
 from pathlib import Path
 
 from .pcf import COMMENT_HEADER, PCF_CELL, PCF_FIELDS, case_key, cell_location, pcf_field_value
-from .outlook import DEFAULT_OUTLOOK
+from .outlook import DEFAULT_OUTLOOK, OutlookError, outlook_store
 from .extract import DOCUMENT_SUFFIXES, UNSUPPORTED_FORMAT
 
 
@@ -425,7 +425,13 @@ def source_readable(path, kind):
             with path.open("rb"):
                 pass
         return True
-    except OSError:
+    except OSError as exc:
+        if kind == "pst" and getattr(exc, "winerror", None) in {32, 33}:
+            try:
+                with outlook_store("outlook:" + str(path), open_only=True):
+                    return True
+            except OutlookError:
+                pass
         return False
 
 
@@ -2084,7 +2090,7 @@ class Store:
     def original_attachment(self, attachment):
         with self.connection() as conn:
             row = conn.execute(
-                f"""SELECT a.name,m.item,m.folder,m.fingerprint,m.version,m.source,s.kind,s.path,
+                f"""SELECT a.name,a.content_key,m.message_id,m.item,m.folder,m.fingerprint,m.version,m.source,s.kind,s.path,
                            s.active,s.pending,s.signature,s.active_signature,
                            (SELECT COUNT(*) FROM attachments earlier WHERE earlier.mail=m.id AND earlier.id<a.id) position
                     FROM attachments a JOIN mails m ON m.id=a.mail {JOIN}
