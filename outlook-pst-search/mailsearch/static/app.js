@@ -943,6 +943,13 @@ async function openEvidence(id, quote, window = false) {
         body.append(original);
         if (cell.passage === id) requestAnimationFrame(() => original.scrollIntoView({ block: "nearest" }));
       }
+    } else if (mail && item.attachment) {
+      body.append(node("h3", "메일 본문"), node("pre", formatEvidenceText(item.body || "본문 없음")));
+      if (item.location !== "파일명" && item.text?.trim()) {
+        const text = formatEvidenceText(item.text);
+        const heading = "일치한 첨부 내용 · " + item.attachment + " (" + item.location + ")";
+        body.append(node("h3", heading), displayQuote ? highlight(text, displayQuote) : node("pre", text));
+      }
     } else {
       const text = formatEvidenceText(item.attachment ? item.text : item.body || item.text);
       body.append(displayQuote ? highlight(text, displayQuote) : node("pre", text));
