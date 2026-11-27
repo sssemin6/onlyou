@@ -118,6 +118,7 @@ const issueNames = {
   evidence_missing: "이 근거의 보관함이 갱신되었거나 접근 권한이 사라졌습니다.",
   invalid_input: "검색 범위와 입력 값을 확인하세요.",
   answer_detail: "답변 구체화 정도를 선택하세요.",
+  conversation_missing: "저장된 대화를 찾을 수 없습니다.",
   question_required: "질문을 입력하세요.",
   index_unavailable: "색인 DB에 접근하지 못했습니다. 잠시 후 다시 시도하세요.",
 };
@@ -145,8 +146,8 @@ const SEARCH_HINT = {
   pcf: "선주 COMMENT나 호선·도면번호로 검색",
 };
 let activeTab = "mail";
-function selectTab(value) {
-  if (value !== activeTab) {
+function selectTab(value, restoring = false) {
+  if (value !== activeTab && !restoring) {
     clearSearch();
     setQuestionContext("");
   }
@@ -199,11 +200,10 @@ function node(tag, text, className) {
   return result;
 }
 
-async function call(route, data, signal) {
+async function call(route, data, signal, method = data === undefined ? "GET" : "POST") {
   const headers = { "X-Mail-Session": token };
-  const options = { headers, signal, cache: "no-store" };
+  const options = { headers, signal, method, cache: "no-store" };
   if (data !== undefined) {
-    options.method = "POST";
     headers["Content-Type"] = "application/json";
     options.body = JSON.stringify(data);
   }
@@ -747,7 +747,8 @@ async function showSources() {
     entry.append(actions);
     sourcesList.append(entry);
   }
-  sourceSelect.value = selectedSource;
+  if (answerConversation) selectConversationSource(selectedSource);
+  else sourceSelect.value = selectedSource;
   if (sourceSelect.selectedIndex < 0) {
     sourceSelect.value = "";
     clearSearch();
@@ -1200,6 +1201,29 @@ function renderAnswerMarkdown(markdown, sources) {
   return body;
 }
 
+function answerHeader(data) {
+  const header = node("div", "", "answer-header");
+  const actions = node("div", "", "answer-actions");
+  const text = data.markdown || (data.claims || []).map((claim) => claim.text).join("\n");
+  const copy = node("button", "답변 복사", "button small");
+  copy.type = "button";
+  copy.disabled = !text.trim();
+  copy.addEventListener("click", async () => {
+    try {
+      await navigator.clipboard.writeText(text.trim());
+      notice("답변을 복사했습니다.");
+    } catch {
+      notice("클립보드에 복사하지 못했습니다.");
+    }
+  });
+  const reset = node("button", "새 대화", "button small");
+  reset.type = "button";
+  reset.addEventListener("click", newConversation);
+  actions.append(copy, reset);
+  header.append(node("h2", "AI 답변"), actions);
+  return header;
+}
+
 function showAnswer(data) {
   const box = element("answer");
   if (data.format === "markdown") {
@@ -1208,7 +1232,7 @@ function showAnswer(data) {
       partial: "일부 항목을 확인하지 못했습니다.",
       external_unavailable: "AI 답변을 완료하지 못했습니다.",
     }[data.status];
-    box.replaceChildren(node("h2", "AI 답변"));
+    box.replaceChildren(answerHeader(data));
     if (status) box.append(node("p", status, "answer-status"));
     box.append(renderAnswerMarkdown(data.markdown, data.sources));
     for (const unknown of data.unknowns || []) {
@@ -1229,8 +1253,7 @@ function showAnswer(data) {
     index_unavailable: issueNames.index_unavailable,
     external_unavailable: "답변 API 응답을 받지 못했습니다. 연결 주소, 키, 모델, 네트워크를 확인하세요.",
   };
-  const heading = node("h2", "AI 답변");
-  box.replaceChildren(heading, node("p", statuses[data.status] || "", "answer-status"));
+  box.replaceChildren(answerHeader(data), node("p", statuses[data.status] || "", "answer-status"));
   let count = 0;
   for (const claim of data.claims) {
     const paragraph = node("p", claim.text + " ", "answer-claim");
@@ -1363,6 +1386,8 @@ async function intranetAnswer(payload, active) {
       }, "/api/intranet/answer");
     if (active.signal.aborted) return;
     answerConversation = data.conversation || "";
+    showAnswerControls();
+    refreshConversations();
     showAnswer(data);
     box.prepend(progress.finish());
     complete = true;
@@ -1394,13 +1419,16 @@ async function localAnswer(payload, active) {
         synthesizing: "로컬 AI가 근거를 정리하고 있습니다.",
         validating: "인용 원문과 수치를 대조하고 있습니다.",
       };
-      if (labels[event.stage]) {
-        progress.update(event.stage, labels[event.stage]);
-        notice(labels[event.stage]);
+      const message = event.message || labels[event.stage];
+      if (message) {
+        progress.update(event.stage, message);
+        notice(message);
       }
     });
     if (active.signal.aborted) return;
     answerConversation = data.session_id || "";
+    showAnswerControls();
+    refreshConversations();
     showAnswer(data);
     box.prepend(progress.finish());
     complete = true;
@@ -1421,22 +1449,101 @@ element("cancel-answer").addEventListener("click", () => {
   notice("답변을 중단했습니다.");
 });
 
-element("reset-conversation").addEventListener("click", async () => {
-  const old = answerConversation;
+function newConversation() {
   answerConversation = "";
   showAnswerControls();
   clearSearch();
   setQuestionContext("");
+  element("query").value = "";
   element("query").focus();
-  const cleared = request;
-  if (old) {
-    try {
-      await call("/api/answer/reset", { session_id: old });
-    } catch (error) {
-      if (request === cleared) notice(error.message);
+  refreshConversations();
+}
+
+element("reset-conversation").addEventListener("click", newConversation);
+
+const conversationHistory = element("conversation-history");
+let conversationRequest = 0;
+
+async function refreshConversations() {
+  if (!conversationHistory.open) return;
+  const list = element("conversation-list");
+  const version = ++conversationRequest;
+  try {
+    const data = await call("/api/conversations");
+    if (version !== conversationRequest) return;
+    list.replaceChildren();
+    for (const item of data.conversations) {
+      const row = node("div", "", "conversation-row");
+      const open = node("button", item.title, "text-button conversation-open");
+      open.type = "button";
+      open.title = item.title + " · " + formatDate(item.updated);
+      if (item.id === answerConversation) open.setAttribute("aria-current", "true");
+      open.addEventListener("click", () => openConversation(item.id));
+      const remove = node("button", "삭제", "text-button conversation-remove");
+      remove.type = "button";
+      remove.setAttribute("aria-label", item.title + " 대화 삭제");
+      remove.addEventListener("click", async () => {
+        if (!window.confirm("이 대화를 삭제할까요?")) return;
+        try {
+          if (answerConversation === item.id) newConversation();
+          await call("/api/conversations/" + item.id, undefined, undefined, "DELETE");
+          refreshConversations();
+        } catch (error) {
+          notice(error.message);
+        }
+      });
+      row.append(open, remove);
+      list.append(row);
     }
+    if (!data.conversations.length) list.append(node("p", "저장된 대화가 없습니다.", "source-empty"));
+  } catch (error) {
+    if (version === conversationRequest) list.replaceChildren(node("p", error.message, "source-empty"));
   }
-});
+}
+
+conversationHistory.addEventListener("toggle", refreshConversations);
+
+function selectConversationSource(value) {
+  if (value && !Array.from(sourceSelect.options).some((item) => item.value === value)) {
+    sourceSelect.append(new Option("이전 보관함 (현재 사용할 수 없음)", value));
+  }
+  sourceSelect.value = value;
+}
+
+async function openConversation(id) {
+  clearSearch();
+  const active = request = new AbortController();
+  try {
+    const data = await call("/api/conversations/" + id, undefined, active.signal);
+    if (active.signal.aborted) return;
+    selectTab(data.filters.tab || "all", true);
+    selectConversationSource(String(data.filters.source || ""));
+    for (const field of ALL_FILTERS) {
+      if (field !== "source") element(field).value = data.filters[field] || "";
+    }
+    showFilterCount();
+    answerConversation = id;
+    showAnswerControls();
+    const latest = data.turns.at(-1);
+    element("query").value = "";
+    setQuestionContext(latest.answer ? latest.question : "");
+    const unavailable = "이전 답변의 출처를 확인할 수 없습니다.";
+    showAnswer(latest.answer || { format: "markdown", markdown: unavailable, sources: [] });
+    if (latest.answer) showAnswerEvidence(latest.answer);
+    const previous = data.turns.slice(0, -1).map((turn) => {
+      const detail = node("details", "", "conversation-turn");
+      detail.append(node("summary", turn.question), turn.answer
+        ? renderAnswerMarkdown(turn.answer.markdown, turn.answer.sources)
+        : node("p", unavailable, "answer-status"));
+      return detail;
+    });
+    element("answer").prepend(...previous, node("p", latest.question, "conversation-question"));
+    refreshConversations();
+    element("query").focus();
+  } catch (error) {
+    if (!active.signal.aborted) notice(error.message);
+  }
+}
 
 function showReview(data, pcf) {
   pendingReview = { ...data, pcf };
@@ -1648,7 +1755,8 @@ form.addEventListener("submit", async (event) => {
     } else if (ask && !pcf && localAnswerAvailable && !externalAnswerAvailable) {
       await localAnswer(payload, active);
     } else if (ask) {
-      await previewAnswer(pcf ? "/api/pcf/preview" : "/api/external/preview", payload, active, pcf);
+      const reviewed = pcf ? payload : { ...payload, context: "", conversation: answerConversation };
+      await previewAnswer(pcf ? "/api/pcf/preview" : "/api/external/preview", reviewed, active, pcf);
     } else {
       await showSearch(payload, mode, active);
     }
@@ -1671,12 +1779,18 @@ reviewSend.addEventListener("click", async () => {
   notice(message);
   try {
     const data = await call(review.pcf ? "/api/pcf/send" : "/api/external/send",
-      { review: review.review, excerpts: selected }, active.signal);
+      { review: review.review, excerpts: selected, ...(review.pcf ? {} : { conversation: answerConversation }) },
+      active.signal);
     if (active.signal.aborted) return;
     showAnswer(data);
     box.prepend(progress.finish());
     complete = true;
     if (data.status !== "external_unavailable") showAnswerEvidence(data);
+    if (!review.pcf) {
+      answerConversation = data.conversation || "";
+      showAnswerControls();
+      refreshConversations();
+    }
     rememberQuestion(data, review.question);
     notice("");
   } catch (error) {
