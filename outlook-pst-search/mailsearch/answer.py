@@ -844,12 +844,12 @@ def passage_cost(row):
     return estimate_tokens(json.dumps(source_text(row), ensure_ascii=False)) + 18
 
 
-def public_row(row):
+def public_row(row, *, evidence=False):
     return {
         "mail": row["id"], "source": row["source"], "archive": Path(row["path"]).name, "folder": row["folder"],
         "subject": row["subject"], "sender": row["sender"], "recipient": row["recipient"], "sent": row["sent"],
         "as_of": row["updated"], "passage": row["passage"], "attachment": row["attachment"],
-        "location": row["location"], "preview": row["text"][:260],
+        "location": row["location"], "preview": row["text"][:400 if evidence else 260],
         "kind": row["kind"] if "kind" in row.keys() else "mail",
         **({"window": True, "start": row["start"]} if "window" in row.keys() and row["window"] else {}),
     }
@@ -1378,7 +1378,8 @@ def evidence_for(store, ai, question, filters, context, semantic=True, limit=9, 
 
 def supplemental_evidence(store, ai, question, filters, context, evidence, mode, query_count, *,
                           ceiling=ANSWER_EVIDENCE_LIMIT, expand=True, check=None, review_slots=None,
-                          allow_intranet_evidence=True, worker_check=None, allow_rerank=True, expand_targets=False):
+                          allow_intranet_evidence=True, worker_check=None, allow_rerank=True, expand_targets=False,
+                          on_followup=None):
     """Run at most one supplemental retrieval under the current scope and budget."""
     unchanged = evidence, mode, (), False
     complex_question = bool(query_count > 1 or SYNTHESIS_QUESTION.search(question) or COMPARISON_QUESTION.search(question))
@@ -1408,6 +1409,14 @@ def supplemental_evidence(store, ai, question, filters, context, evidence, mode,
     gap_options = {} if allow_intranet_evidence else {"allow_intranet_evidence": False}
     if expand_targets:
         gap_options["expand_targets"] = True
+    followup_started = threading.Event() if on_followup else None
+
+    def progress_check():
+        if check:
+            check()
+        if followup_started and followup_started.is_set():
+            followup_started.clear()
+            on_followup()
 
     def search(stop):
         def time_check():
@@ -1432,6 +1441,8 @@ def supplemental_evidence(store, ai, question, filters, context, evidence, mode,
             if not gap:
                 return None
             time_check()
+            if followup_started and (gap.queries or gap.expand_mails or gap.read_attachments):
+                followup_started.set()
             rows, next_mode = [], mode
             if expand_targets:
                 seeds = list(dict.fromkeys(
@@ -1461,11 +1472,10 @@ def supplemental_evidence(store, ai, question, filters, context, evidence, mode,
             return [live[pid] for pid in ids if pid in live], next_mode, gap.aspects
 
     with store.measure("followup"):
-        if check:
-            check()
-        extra = bounded_task(ai.followup_slot, remaining, search, "supplemental-search", check=check)
-        if check:
-            check()
+        progress_check()
+        extra = bounded_task(ai.followup_slot, remaining, search, "supplemental-search",
+                             check=progress_check if check or on_followup else None)
+        progress_check()
     if extra is None:
         return unchanged
     supplemental, extra_mode, aspects = extra
