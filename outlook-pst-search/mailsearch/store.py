@@ -1868,9 +1868,19 @@ class Store:
                 (json.dumps(sorted(mails)),),
             ).fetchall()
 
-    def evidence_attachment_names(self, mails):
+    def evidence_attachment_names(self, mails, *, indexed_only=True):
         names = defaultdict(list)
+        if not mails:
+            return names
         with self.connection() as conn:
+            if not indexed_only:
+                rows = conn.execute(
+                    """SELECT a.mail,a.name FROM json_each(?) ids CROSS JOIN attachments a ON a.mail=ids.value
+                       ORDER BY a.mail,a.id""", (json.dumps(sorted(set(mails))),),
+                )
+                for row in rows:
+                    names[row["mail"]].append(row["name"])
+                return names
             for mail in mails:
                 names[mail] = [row[0][:160] for row in conn.execute(
                     """SELECT DISTINCT a.name FROM attachments a WHERE a.mail=? AND EXISTS
@@ -1878,6 +1888,16 @@ class Store:
                        ORDER BY a.name LIMIT 6""", (mail,),
                 )]
         return names
+
+    def mail_body_previews(self, mails):
+        if not mails:
+            return {}
+        with self.connection() as conn:
+            return dict(conn.execute(
+                """SELECT ids.value,(SELECT substr(p.text,1,200) FROM passages p WHERE p.mail=ids.value
+                   AND p.attachment IS NULL AND p.location='본문' ORDER BY p.start,p.id LIMIT 1)
+                   FROM json_each(?) ids""", (json.dumps(sorted(set(mails))),),
+            ))
 
     def attachment_evidence(self, mails, filenames, filters, question):
         """Find indexed attachment text only on the supplied, currently scoped mails."""
