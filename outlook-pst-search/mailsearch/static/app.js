@@ -80,22 +80,22 @@ const issueNames = {
   pcf_input_too_large: "선택한 COMMENT이 현재 입력 한도를 초과합니다.",
   gateway_indexing: "색인 중에는 모델 설정을 유지합니다. 색인이 끝나거나 일시정지한 뒤 적용하세요.",
   gateway_models: "용도별 모델 선택을 확인하세요.",
-  gateway_url: "설정 창에서 올바른 사내 HTTPS 주소를 입력하세요.",
-  gateway_settings: "사내 API 주소와 인증서 경로를 확인하세요.",
-  gateway_preset_missing: "이 배포본에 사내 기본값이 없습니다. 주소와 모델 ID를 직접 입력하거나 사내용 배포본을 실행하세요.",
+  gateway_url: "설정 창에서 올바른 게이트웨이 HTTPS 주소를 입력하세요.",
+  gateway_settings: "API 주소와 인증서 경로를 확인하세요.",
+  gateway_preset_missing: "이 배포본에 게이트웨이 기본값이 없습니다. 주소와 모델 ID를 입력하거나 기본값이 포함된 배포본을 실행하세요.",
   gateway_preset_invalid: "프리셋의 HTTPS 주소, 모델 ID와 인증서 설정을 확인하세요.",
   gateway_preset_io: "앱 폴더의 gateway-defaults.json 파일을 읽거나 쓸 수 없습니다.",
   api_settings_save_failed: "설정을 저장하지 못했습니다. 앱 데이터 폴더에 쓸 수 있는지 확인하세요.",
-  embedding_api_key: "사내 API 키에 공백이 있는지 확인하세요.",
+  embedding_api_key: "API 키에 공백이 있는지 확인하세요.",
   external_disabled: "상단의 API 설정에서 답변에 사용할 AI를 연결해 주세요.",
-  intranet_answer_disabled: "사내 API 즉시 답변을 사용하려면 사내 답변 모델을 선택해 주세요.",
-  intranet_budget: "사내 API의 입력 한도를 3,000~192,000바이트로 설정해 주세요.",
+  intranet_answer_disabled: "API 즉시 답변을 사용하려면 답변 모델을 선택해 주세요.",
+  intranet_budget: "API의 입력 한도를 3,000~192,000바이트로 설정해 주세요.",
   external_url: "HTTPS 주소를 확인하세요. 주소는 /chat/completions 또는 /messages로 끝나야 합니다.",
   external_model: "제공자에서 안내한 모델명을 입력하세요.",
   external_key: "API 키에 공백이 있는지 확인하세요.",
   external_key_required: "이 주소에서 사용할 API 키를 입력하세요.",
   external_test_auth: "인증이 거부되었습니다. API 키와 모델 사용 권한을 확인하세요.",
-  external_test_endpoint: "요청이 거부되었습니다. 주소, 모델명, JSON 모드 지원 여부를 확인하세요.",
+  external_test_endpoint: "요청이 거부되었습니다. 주소와 모델명을 확인하세요.",
   external_test_limit: "제공자의 요청 한도 또는 잔액을 확인하세요.",
   external_test_failed: "연결 테스트에 실패했습니다. 네트워크와 제공자의 응답을 확인하세요.",
   external_busy: "답변 API가 다른 질문을 처리하고 있습니다. 잠시 후 다시 시도하세요.",
@@ -117,6 +117,7 @@ const issueNames = {
   source_missing: "보관함을 찾지 못했습니다.",
   evidence_missing: "이 근거의 보관함이 갱신되었거나 접근 권한이 사라졌습니다.",
   invalid_input: "검색 범위와 입력 값을 확인하세요.",
+  answer_detail: "답변 구체화 정도를 선택하세요.",
   question_required: "질문을 입력하세요.",
   index_unavailable: "색인 DB에 접근하지 못했습니다. 잠시 후 다시 시도하세요.",
 };
@@ -181,6 +182,15 @@ for (const [id, value] of TABS) {
 let savedTab;
 try { savedTab = localStorage.getItem("mailsearch-tab"); } catch { /* private mode */ }
 selectTab(Object.hasOwn(SEARCH_HINT, savedTab) ? savedTab : "all");
+
+const answerDetail = element("answer-detail");
+try {
+  const saved = localStorage.getItem("mailsearch-answer-detail");
+  if (["concise", "balanced", "detailed"].includes(saved)) answerDetail.value = saved;
+} catch { /* private mode */ }
+answerDetail.addEventListener("change", () => {
+  try { localStorage.setItem("mailsearch-answer-detail", answerDetail.value); } catch { /* private mode */ }
+});
 
 function node(tag, text, className) {
   const result = document.createElement(tag);
@@ -749,26 +759,25 @@ async function showSources() {
     (replacement || addOpen).focus({ preventScroll: true });
   }
   if (pinnedPopover) sourcePopovers.get(pinnedPopover)?.open(true);
-  const modelStatus = element("model-status");
   localAnswerAvailable = Boolean(data.model);
   externalAnswerAvailable = Boolean(data.external);
   intranetAnswerAvailable = Boolean(data.intranet_answer);
   semanticSources = data.embedding ? data.sources.filter((source) =>
     source.embedding_model_current && source.embedding_done > 0 && (source.active || source.pending)) : [];
   showAnswerControls();
-  modelStatus.parentElement.dataset.configured = Boolean(data.embedding);
-  if (data.embedding_endpoint) {
-    modelStatus.textContent = "사내 API 의미 검색 · " + data.embedding;
-    modelStatus.title = data.embedding_endpoint;
-  } else {
-    modelStatus.textContent = data.embedding ? "로컬 의미 검색 · " + data.embedding : "로컬 키워드 검색";
-    modelStatus.removeAttribute("title");
-  }
-  element("external-panel").dataset.configured = Boolean(data.external);
-  const externalStatus = element("external-status");
-  externalStatus.textContent = data.external
-    ? "답변 API · " + new URL(data.external.destination).host + " · " + data.external.model : "답변 API 연결 전";
-  externalStatus.title = data.external?.destination || "";
+  setModelStatus("model-status", data.embedding_endpoint,
+    data.embedding_endpoint ? data.embedding : data.embedding && "로컬 · " + data.embedding, data.embedding_endpoint);
+  setModelStatus("external-status", data.external, data.external?.model, data.external?.destination);
+  setModelStatus("rerank-status", data.rerank, data.rerank);
+}
+
+function setModelStatus(id, configured, model, destination = "") {
+  const name = element(id);
+  const panel = name.closest(".model-panel");
+  panel.dataset.configured = String(Boolean(configured));
+  panel.querySelector(".model-badge").textContent = configured ? "연결됨" : "미연결";
+  name.textContent = model || "";
+  name.title = destination || model || "";
 }
 
 function highlight(text, quote) {
@@ -782,41 +791,117 @@ function highlight(text, quote) {
   return container;
 }
 
+async function fetchAttachment(attachment, button, status, previewSignal) {
+  const route = "/api/attachment/" + attachment.id + (previewSignal ? "?inline=1" : "");
+  while (button.isConnected && element("viewer").open && !previewSignal?.aborted) {
+    const timeout = AbortSignal.timeout(20000);
+    const response = await fetch(route, {
+      headers: { "X-Mail-Session": token }, cache: "no-store",
+      signal: previewSignal ? AbortSignal.any([previewSignal, timeout]) : timeout,
+    });
+    if (response.status === 202) {
+      await response.json();
+      status.textContent = "PST에서 원본을 준비하는 중입니다.";
+      await new Promise((resolve) => setTimeout(resolve, 2000));
+      continue;
+    }
+    if (!response.ok) {
+      const data = await response.json();
+      throw new Error(issueNames[data.error] || issueNames.attachment_missing);
+    }
+    return response.blob();
+  }
+}
+
+function attachmentError(error) {
+  return error.name === "TimeoutError" ? "원본 응답이 지연되고 있습니다. 다시 시도하세요." : error.message;
+}
+
 async function downloadAttachment(attachment, button, status) {
   button.disabled = true;
   status.textContent = "";
   try {
-    while (button.isConnected && element("viewer").open) {
-      const response = await fetch("/api/attachment/" + attachment.id, {
-        headers: { "X-Mail-Session": token }, cache: "no-store", signal: AbortSignal.timeout(20000),
-      });
-      if (response.status === 202) {
-        status.textContent = "PST에서 원본을 준비하는 중입니다.";
-        await new Promise((resolve) => setTimeout(resolve, 2000));
-        continue;
-      }
-      if (!response.ok) {
-        const data = await response.json();
-        throw new Error(issueNames[data.error] || issueNames.attachment_missing);
-      }
-      const url = URL.createObjectURL(await response.blob());
+    const blob = await fetchAttachment(attachment, button, status);
+    if (blob && button.isConnected && element("viewer").open) {
+      const url = URL.createObjectURL(blob);
       const save = node("a");
       save.href = url;
       save.download = attachment.name.split(/[\\/]/).pop();
-      if (button.isConnected && element("viewer").open) save.click();
+      save.click();
       setTimeout(() => URL.revokeObjectURL(url), 30000);
-      status.textContent = "";
-      return;
     }
   } catch (error) {
-    status.textContent = error.name === "TimeoutError" ? "원본 응답이 지연되고 있습니다. 다시 시도하세요." : error.message;
+    status.textContent = attachmentError(error);
+    return;
   } finally {
     button.disabled = false;
   }
+  status.textContent = "";
+}
+
+let attachmentPreview;
+function closeAttachmentPreview() {
+  if (!attachmentPreview) return;
+  const { controller, panel, url } = attachmentPreview;
+  attachmentPreview = undefined;
+  controller.abort();
+  panel.remove();
+  if (url) URL.revokeObjectURL(url);
+}
+
+async function previewAttachment(attachment, button, row) {
+  closeAttachmentPreview();
+  const controller = new AbortController();
+  const panel = node("section", "", "attachment-preview");
+  const close = node("button", "미리보기 닫기", "text-button");
+  close.type = "button";
+  close.addEventListener("click", () => {
+    closeAttachmentPreview();
+    button.focus();
+  });
+  const heading = node("div", "", "attachment-preview-heading");
+  heading.append(node("strong", attachment.name), close);
+  const status = node("p", "미리보기를 여는 중입니다.", "answer-status");
+  status.setAttribute("role", "status");
+  panel.append(heading, status);
+  row.append(panel);
+  close.focus();
+  const preview = attachmentPreview = { controller, panel };
+  try {
+    const blob = await fetchAttachment(attachment, button, status, controller.signal);
+    if (!blob || controller.signal.aborted || !element("viewer").open) return;
+    const mime = blob.type.split(";")[0];
+    let content;
+    if (mime === "text/plain") {
+      content = node("pre", formatEvidenceText(await blob.text()));
+    } else if (/^(?:application\/pdf|image\/(?:png|jpeg|gif|webp))$/.test(mime)) {
+      preview.url = URL.createObjectURL(blob);
+      content = node(mime === "application/pdf" ? "iframe" : "img");
+      if (mime === "application/pdf") content.title = attachment.name;
+      else content.alt = attachment.name;
+      content.src = preview.url;
+    } else {
+      throw new Error("이 파일은 브라우저에서 미리 볼 수 없습니다. 다운로드해서 열어 주세요.");
+    }
+    if (!controller.signal.aborted) status.replaceWith(content);
+  } catch (error) {
+    if (!controller.signal.aborted) status.textContent = attachmentError(error);
+  }
+}
+
+function formatEvidenceText(text) {
+  return text.replace(/\r\n?/g, "\n").replace(/[ \t]+(?=\n|$)/g, "").replace(/\n{3,}/g, "\n\n");
 }
 
 let viewerRequest = 0;
+element("viewer").addEventListener("close", () => {
+  if (!element("viewer").open) {
+    viewerRequest++;
+    closeAttachmentPreview();
+  }
+});
 async function openEvidence(id, quote, window = false) {
+  closeAttachmentPreview();
   const version = ++viewerRequest;
   const dialog = element("viewer");
   element("viewer-title").textContent = "원문";
@@ -845,20 +930,22 @@ async function openEvidence(id, quote, window = false) {
     if (!mail && item.attachments[0]) fields.push(["추출 상태", item.attachments[0].status]);
     for (const [label, value] of fields) metadata.append(node("dt", label), node("dd", value));
     body.replaceChildren(metadata);
-    if (quote) body.append(node("blockquote", quote));
+    const displayQuote = quote ? formatEvidenceText(quote) : "";
+    if (displayQuote) body.append(node("blockquote", displayQuote));
     if (item.pcf) {
       body.append(node("h3", "COMMENT " + item.pcf.number + (item.pcf.revision ? " · Rev. " + item.pcf.revision : "")));
       for (const warning of item.pcf.warnings) body.append(node("p", warning, "answer-status"));
       for (const cell of item.pcf.cells) {
         const heading = cell.location + (cell.label ? " · " + cell.label : "");
         body.append(node("h4", heading));
-        const original = highlight(cell.text || "원본 셀 빈칸", cell.passage === id ? quote : null);
+        const text = formatEvidenceText(cell.text || "원본 셀 빈칸");
+        const original = displayQuote && cell.passage === id ? highlight(text, displayQuote) : node("pre", text);
         body.append(original);
         if (cell.passage === id) requestAnimationFrame(() => original.scrollIntoView({ block: "nearest" }));
       }
     } else {
-      const text = item.attachment ? item.text : item.body || item.text;
-      body.append(highlight(text, quote || item.text));
+      const text = formatEvidenceText(item.attachment ? item.text : item.body || item.text);
+      body.append(displayQuote ? highlight(text, displayQuote) : node("pre", text));
     }
     if (mail && item.attachments.length) {
       const attachments = node("ul");
@@ -867,17 +954,19 @@ async function openEvidence(id, quote, window = false) {
         const row = node("li", "", "attachment-row");
         const state = attachment.status === "미지원 형식" ? "본문 색인 미지원" : attachment.status;
         row.append(node("span", attachment.name + " · " + state));
-        const download = node("button", "원본 받기", "text-button");
+        const download = node("button", "다운로드", "text-button");
         const status = node("span", "", "attachment-download-status");
         status.setAttribute("role", "status");
         download.type = "button";
         download.addEventListener("click", () => downloadAttachment(attachment, download, status));
         row.append(download);
-        if (attachment.passage) {
-          const text = node("button", "색인 텍스트", "text-button");
-          text.type = "button";
-          text.addEventListener("click", () => openEvidence(attachment.passage));
-          row.append(text);
+        const inline = /\.(?:pdf|png|jpe?g|gif|webp|txt|csv|log)$/i.test(attachment.name);
+        if (inline || attachment.passage) {
+          const preview = node("button", "미리보기", "text-button");
+          preview.type = "button";
+          preview.addEventListener("click", () => inline
+            ? previewAttachment(attachment, preview, row) : openEvidence(attachment.passage));
+          row.append(preview);
         }
         row.append(status);
         attachments.append(row);
@@ -914,17 +1003,19 @@ function marked(text, words) {
   return parts;
 }
 
-function showResults(rows, title, emptyMessage = "이 범위에서 일치하는 자료를 찾지 못했습니다.") {
+function showResults(rows, title, emptyMessage = "이 범위에서 일치하는 자료를 찾지 못했습니다.", { evidence = false } = {}) {
   const result = element("results");
   element("result-section").hidden = false;
-  const snapshot = JSON.stringify([title, rows.length ? "" : emptyMessage, rows]);
+  const snapshot = JSON.stringify([title, rows.length ? "" : emptyMessage, evidence, rows]);
   if (result.searchSnapshot === snapshot) return;
   result.searchSnapshot = snapshot;
   element("result-heading").textContent = title + " (" + rows.length + ")";
   const content = document.createDocumentFragment();
   if (!rows.length) content.append(node("p", emptyMessage, "result-empty"));
-  for (const row of rows) {
-    const button = node("button", "", "result");
+  const more = evidence && rows.length > 4 ? node("details", "", "evidence-more") : null;
+  if (more) more.append(node("summary", "근거 자료 " + (rows.length - 4) + "건 더 보기"));
+  for (const [index, row] of rows.entries()) {
+    const button = node("button", "", evidence ? "result evidence-result" : "result");
     button.type = "button";
     const reasons = [];
     if (row.matched?.length) reasons.push("단어 " + row.matched.slice(0, 3).join(" · "));
@@ -934,12 +1025,34 @@ function showResults(rows, title, emptyMessage = "이 범위에서 일치하는 
     if (reasons.length) button.append(node("span", reasons.join(" · "), "result-why"));
     const preview = node("span", "", "result-preview");
     if (row.snippet && row.matched?.length) preview.append(...marked(row.snippet, row.matched));
-    else preview.textContent = row.preview;
+    else preview.textContent = evidence ? (row.preview || "").slice(0, 400) : row.preview;
+    if (evidence) {
+      const fields = [
+        row.sender && "발신 " + row.sender, row.recipient && "수신 " + row.recipient,
+        row.sent && "날짜 " + formatDate(row.sent), row.attachment && "첨부 " + row.attachment,
+      ];
+      button.append(node("span", fields.filter(Boolean).join(" · "), "evidence-preview result-meta"));
+    }
     button.append(preview);
-    button.addEventListener("click", () => openEvidence(row.passage));
-    content.append(button);
+    button.addEventListener("click", () => openEvidence(row.passage, undefined, evidence && row.window));
+    (more && index >= 4 ? more : content).append(button);
   }
+  if (more) content.append(more);
   result.replaceChildren(content);
+}
+
+function showAnswerEvidence(data, title = "사용한 근거") {
+  const byPassage = new Map((data.results || []).map((row) => [row.passage, row]));
+  const citations = data.format === "markdown" ? data.sources || [] : (data.claims || []).flatMap((claim) => claim.citations);
+  const cited = [];
+  for (const ref of citations) {
+    const row = byPassage.get(ref.passage);
+    if (row) {
+      cited.push(row);
+      byPassage.delete(ref.passage);
+    }
+  }
+  showResults([...cited, ...byPassage.values()], title, undefined, { evidence: true });
 }
 
 function appendMarkdownInline(container, text, sources) {
@@ -1055,7 +1168,7 @@ function showAnswer(data) {
     const status = {
       ambiguous: "근거에 서로 다른 내용이 있습니다. 각 원문을 확인해 주세요.",
       partial: "일부 항목을 확인하지 못했습니다.",
-      external_unavailable: "사내 AI 답변을 완료하지 못했습니다.",
+      external_unavailable: "AI 답변을 완료하지 못했습니다.",
     }[data.status];
     box.replaceChildren(node("h2", "AI 답변"));
     if (status) box.append(node("p", status, "answer-status"));
@@ -1129,6 +1242,57 @@ function clearSearch() {
   notice("");
 }
 
+function startAnswerProgress(signal, stage, message) {
+  const box = element("answer");
+  const panel = node("div", "", "answer-progress");
+  const heading = node("div", "", "answer-progress-heading");
+  const spinner = node("span", "", "answer-progress-spinner");
+  spinner.setAttribute("aria-hidden", "true");
+  const elapsed = node("span", "0.0초", "answer-progress-time");
+  elapsed.setAttribute("aria-hidden", "true");
+  heading.append(spinner, node("strong", "진행 내역"), elapsed);
+  const list = node("ol", "", "answer-progress-steps");
+  panel.append(heading, list);
+  box.replaceChildren(panel);
+  box.hidden = false;
+
+  const start = performance.now();
+  const seconds = (ms) => (ms / 1000).toFixed(1) + "초";
+  let current;
+  const timer = setInterval(() => { elapsed.textContent = seconds(performance.now() - start); }, 100);
+  const stop = () => {
+    clearInterval(timer);
+    signal.removeEventListener("abort", stop);
+  };
+  signal.addEventListener("abort", stop, { once: true });
+  const completeStep = (at) => {
+    if (!current) return;
+    current.line.textContent = "✓ " + current.message + " (" + seconds(at - current.at) + ")";
+    current.line.classList.remove("active");
+  };
+  const update = (name, text) => {
+    if (!text || (current?.name === name && current.message === text)) return;
+    const at = performance.now();
+    completeStep(at);
+    const line = node("li", "● " + text, "active");
+    list.append(line);
+    current = { name, message: text, at, line };
+  };
+  update(stage, message);
+  return {
+    update,
+    stop,
+    finish() {
+      stop();
+      const at = performance.now();
+      completeStep(at);
+      const details = node("details", "", "answer-progress-done");
+      details.append(node("summary", "분석 완료 · 총 " + seconds(at - start) + " (진행 내역 보기)"), list);
+      return details;
+    },
+  };
+}
+
 async function intranetAnswer(payload, active) {
   const box = element("answer");
   const stop = element("cancel-answer");
@@ -1136,16 +1300,20 @@ async function intranetAnswer(payload, active) {
   let text = "";
   let frame = null;
   stop.hidden = false;
+  const progress = startAnswerProgress(active.signal, "retrieving", "질문 분석 및 메일·문서 검색 중...");
+  let complete = false;
   try {
-    const data = await streamAnswer({ ...payload, context: "", conversation: answerConversation }, active.signal,
+    const data = await streamAnswer({ ...payload, context: "", conversation: answerConversation, detail: answerDetail.value }, active.signal,
       (event, type) => {
         if (active.signal.aborted) return;
-        if (type === "stage" && event.message) notice(event.message);
+        if (type === "stage" && event.message) {
+          progress.update(event.stage, event.message);
+          notice(event.message);
+        }
         if (type !== "delta" || typeof event.text !== "string") return;
         if (!draft) {
           draft = node("div", "", "answer-draft");
-          box.replaceChildren(node("h2", "AI 답변"), node("p", "작성 중 · 출처 확인 전", "answer-status"), draft);
-          box.hidden = false;
+          box.append(node("h2", "AI 답변"), node("p", "작성 중 · 출처 확인 전", "answer-status"), draft);
         }
         text += event.text;
         if (frame === null) {
@@ -1158,21 +1326,27 @@ async function intranetAnswer(payload, active) {
     if (active.signal.aborted) return;
     answerConversation = data.conversation || "";
     showAnswer(data);
-    if (data.status !== "external_unavailable") showResults(data.results, "사용한 근거");
+    box.prepend(progress.finish());
+    complete = true;
+    if (data.status !== "external_unavailable") showAnswerEvidence(data);
     rememberQuestion(data, payload.query);
     notice("");
-  } catch (error) {
-    if (request === active && draft) box.hidden = true;
-    throw error;
   } finally {
+    progress.stop();
     if (frame !== null) cancelAnimationFrame(frame);
-    if (request === active) stop.hidden = true;
+    if (request === active) {
+      stop.hidden = true;
+      if (!complete) box.hidden = true;
+    }
   }
 }
 
 async function localAnswer(payload, active) {
+  const box = element("answer");
   const stop = element("cancel-answer");
   stop.hidden = false;
+  const progress = startAnswerProgress(active.signal, "planning", "질문을 분석하고 있습니다.");
+  let complete = false;
   try {
     const data = await streamAnswer({ ...payload, context: "", session_id: answerConversation }, active.signal, (event) => {
       if (active.signal.aborted) return;
@@ -1182,15 +1356,24 @@ async function localAnswer(payload, active) {
         synthesizing: "로컬 AI가 근거를 정리하고 있습니다.",
         validating: "인용 원문과 수치를 대조하고 있습니다.",
       };
-      if (labels[event.stage]) notice(labels[event.stage]);
+      if (labels[event.stage]) {
+        progress.update(event.stage, labels[event.stage]);
+        notice(labels[event.stage]);
+      }
     });
     if (active.signal.aborted) return;
     answerConversation = data.session_id || "";
     showAnswer(data);
-    showResults(data.results, "근거 후보");
+    box.prepend(progress.finish());
+    complete = true;
+    showAnswerEvidence(data);
     notice("");
   } finally {
-    if (request === active) stop.hidden = true;
+    progress.stop();
+    if (request === active) {
+      stop.hidden = true;
+      if (!complete) box.hidden = true;
+    }
   }
 }
 
@@ -1443,17 +1626,26 @@ reviewSend.addEventListener("click", async () => {
   request?.abort();
   const active = request = new AbortController();
   clearReview();
-  notice("답변 API 응답을 기다리는 중입니다.");
+  const box = element("answer");
+  const message = "근거 " + selected.length + "건을 바탕으로 AI 답변 작성 중...";
+  const progress = startAnswerProgress(active.signal, "generating", message);
+  let complete = false;
+  notice(message);
   try {
     const data = await call(review.pcf ? "/api/pcf/send" : "/api/external/send",
       { review: review.review, excerpts: selected }, active.signal);
     if (active.signal.aborted) return;
     showAnswer(data);
-    if (data.status !== "external_unavailable") showResults(data.results, "사용한 근거");
+    box.prepend(progress.finish());
+    complete = true;
+    if (data.status !== "external_unavailable") showAnswerEvidence(data);
     rememberQuestion(data, review.question);
     notice("");
   } catch (error) {
     if (!active.signal.aborted) notice(error.message);
+  } finally {
+    progress.stop();
+    if (request === active && !complete) box.hidden = true;
   }
 });
 element("review-cancel").addEventListener("click", () => {
@@ -1489,9 +1681,9 @@ const gatewayCheckReasons = {
   tls_certificate: "TLS 인증서를 신뢰할 수 없습니다. 고급 설정의 CA 인증서 경로를 확인하세요.",
   missing_ca: "고급 설정의 CA 인증서 파일을 찾을 수 없습니다.",
   tls_error: "TLS 연결 또는 CA 파일에 오류가 있습니다. 연결 로그를 확인하세요.",
-  dns: "사내 API 주소의 이름을 확인할 수 없습니다.",
+  dns: "API 주소의 이름을 확인할 수 없습니다.",
   timeout: "서버 응답 시간이 초과되었습니다.",
-  connection: "사내 API 서버에 연결하지 못했습니다.",
+  connection: "API 서버에 연결하지 못했습니다.",
   invalid_response: "서버 응답 형식이 예상과 다릅니다.",
   ollama_not_found: "이 PC에서 Ollama를 찾을 수 없습니다.",
   ollama_not_started: "로컬 Ollama 서버를 시작하지 못했습니다.",
@@ -1685,9 +1877,9 @@ function renderSettings() {
     element("gateway-runtime-unverified").checked = fields.runtime_unverified ?? false;
     element("gateway-rerank-unverified").checked = fields.rerank_unverified ?? false;
     element("settings-current").textContent = gatewaySettings.configured
-      ? (gatewaySettings.active_answer ? "사내 답변 모델 사용 중" : "사내 API 키 등록됨")
-      : (fields.gateway_url ? "사내 API를 선택한 기능에만 키가 필요합니다."
-        : "사내 API를 사용하려면 고급 설정에 HTTPS 주소를 입력하세요.");
+      ? (gatewaySettings.active_answer ? "답변 모델 사용 중" : "API 키 등록됨")
+      : (fields.gateway_url ? "API를 선택한 기능에만 키가 필요합니다."
+        : "API를 사용하려면 고급 설정에 HTTPS 주소를 입력하세요.");
     if (gatewaySettings.runtime_unverified) {
       element("settings-current").textContent += " · 답변·임베딩 인증서 검증 생략 중";
     }
@@ -1695,7 +1887,7 @@ function renderSettings() {
       element("settings-current").textContent += " · 재정렬 인증서 검증 생략 중";
     }
     element("settings-remove").hidden = !gatewaySettings.configured;
-    element("settings-key").placeholder = gatewaySettings.configured ? "등록된 사내 키를 쓰려면 비워 두세요" : "";
+    element("settings-key").placeholder = gatewaySettings.configured ? "등록된 API 키를 쓰려면 비워 두세요" : "";
     const roles = element("settings-roles");
     roles.replaceChildren();
     for (const [role, [label, disabled]] of Object.entries(gatewayRoles)) {
@@ -1834,7 +2026,7 @@ async function changeSettings(action) {
         checks.push("재정렬의 인증서 검증을 생략했습니다.");
       }
       if (payload.runtime_unverified && (payload.selections.answer || payload.selections.embedding === "bge-m3")) {
-        checks.push("답변·사내 임베딩의 인증서 검증을 생략했습니다.");
+        checks.push("답변·API 임베딩의 인증서 검증을 생략했습니다.");
       } else if (payload.test_unverified && checks.length) {
         checks.push("인증서 검증을 생략한 테스트입니다. 실제 사용 전에 체크를 해제하고 다시 테스트하세요.");
       }
