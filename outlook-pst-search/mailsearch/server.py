@@ -22,7 +22,7 @@ from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from urllib.parse import quote, urlsplit
+from urllib.parse import parse_qs, quote, urlsplit
 
 from .answer import (ANSWER_CLAIM_LIMIT, ANSWER_EVIDENCE_LIMIT, ANSWER_TEXT_LIMIT, CONVERSATION_ID,
                      DEFAULT_ANSWER_NUM_CTX, PCF_INSTRUCTIONS, SYNTHESIS_QUESTION, AnswerSessions, LocalAI,
@@ -35,7 +35,7 @@ from .api_settings import ApiSettings, write_api_settings
 from .embedding import (CA_FILE_ENV, GatewayTLSOptions, MODEL as BGE_MODEL, PATH as EMBEDDING_PATH,
                         gateway_origin, logger as gateway_logger)
 from .external import (
-    DEFAULT_MODEL, DEFAULT_URL, MAX_EXCERPTS, MAX_GATEWAY_EXCERPTS, MAX_INTERNAL_EXCERPTS,
+    ANSWER_DETAILS, DEFAULT_MODEL, DEFAULT_URL, MAX_EXCERPTS, MAX_GATEWAY_EXCERPTS, MAX_INTERNAL_EXCERPTS,
     MAX_PCF_CELLS, ExternalAI, ExternalRequestError, Reviews, compact_json, pack_excerpts, pcf_batches, pcf_input_fits,
 )
 from .extract import MAX_ATTACHMENT
@@ -59,6 +59,11 @@ FILES = {
 MAX_REQUEST = 16 * 1024
 PAGE_IDLE_SECONDS = 12
 INTRANET_ANSWER_LIMIT = 4
+INLINE_ATTACHMENT_TYPES = {
+    ".pdf": "application/pdf", ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+    ".gif": "image/gif", ".webp": "image/webp",
+    ".txt": "text/plain; charset=utf-8", ".csv": "text/plain; charset=utf-8", ".log": "text/plain; charset=utf-8",
+}
 
 
 class SessionBusy(Exception):
@@ -419,17 +424,21 @@ class Handler(BaseHTTPRequestHandler):
         # Paths and query parameters contain private mail metadata.
         return
 
-    def send_bytes(self, status, content_type, body, *, filename=None):
+    def send_bytes(self, status, content_type, body, *, filename=None, inline=False, app_page=False):
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
         if filename is not None:
-            self.send_header("Content-Disposition", "attachment; filename*=UTF-8''" + quote(filename, safe=""))
+            disposition = "inline" if inline else "attachment"
+            self.send_header("Content-Disposition", disposition + "; filename*=UTF-8''" + quote(filename, safe=""))
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Referrer-Policy", "no-referrer")
         self.send_header("Cross-Origin-Resource-Policy", "same-origin")
-        self.send_header("Content-Security-Policy", "default-src 'self'; connect-src 'self'; style-src 'self'; script-src 'self'; img-src 'none'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'")
+        preview_policy = "img-src blob:; frame-src blob:; " if app_page else "img-src 'none'; "
+        self.send_header("Content-Security-Policy",
+                         "default-src 'self'; connect-src 'self'; style-src 'self'; script-src 'self'; "
+                         + preview_policy + "object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'")
         self.end_headers()
         self.wfile.write(body)
 
@@ -474,7 +483,7 @@ class Handler(BaseHTTPRequestHandler):
             body = (STATIC / file).read_bytes()
             if route.path == "/":
                 body = body.replace(b"__LOCAL_SESSION__", self.server.token.encode())
-            self.send_bytes(200, content_type, body)
+            self.send_bytes(200, content_type, body, app_page=route.path == "/")
         elif route.path == "/session-instance":
             key = self.headers.get("X-Mail-Instance", "")
             if hmac.compare_digest(key.encode(), self.server.instance_id.encode()):
@@ -501,6 +510,7 @@ class Handler(BaseHTTPRequestHandler):
                 "embedding_endpoint": embedding.endpoint if use_gateway else None,
                 "external": external.public if external else None,
                 "intranet_answer": bool(external and external.intranet),
+                "rerank": embedding.models["rerank"] if isinstance(embedding, IntranetAI) else None,
             })
         elif re.fullmatch(r"/api/source-updates/\d{1,16}", route.path):
             source = int(route.path.rsplit("/", 1)[-1])
@@ -511,7 +521,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(200, {"available": bool(self.server.store.allowed_sources(source)),
                                      "updates": self.server.indexer.pending_updates(row)})
         elif re.fullmatch(r"/api/attachment/\d{1,16}", route.path):
-            self.download_attachment(int(route.path.rsplit("/", 1)[-1]))
+            self.download_attachment(int(route.path.rsplit("/", 1)[-1]),
+                                     inline=parse_qs(route.query).get("inline") == ["1"])
         elif route.path == "/api/ping":
             self.server.last_seen = time.monotonic()
             self.server.answer_sessions.prune()
@@ -545,7 +556,7 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self.send_json(404, {"error": "not_found"})
 
-    def download_attachment(self, attachment):
+    def download_attachment(self, attachment, *, inline=False):
         row = self.server.store.original_attachment(attachment)
         if row is None:
             self.send_json(404, {"error": "attachment_missing"})
@@ -563,7 +574,9 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(404, {"error": "attachment_missing"})
             else:
                 filename = re.split(r"[/\\]", row["name"])[-1]
-                self.send_bytes(200, "application/octet-stream", body, filename=filename)
+                preview_type = INLINE_ATTACHMENT_TYPES.get(Path(filename).suffix.lower()) if inline else None
+                self.send_bytes(200, preview_type or "application/octet-stream", body,
+                                filename=filename, inline=bool(preview_type))
 
     def do_POST(self):
         route = urlsplit(self.path).path
@@ -858,7 +871,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(409, {"error": "external_busy"})
 
     def retrieve_external_evidence(self, question, context, filters, external, budget, internal_budget, *, turns=(),
-                                   check=None, worker_check=None, on_rerank=None):
+                                   check=None, worker_check=None, on_rerank=None, on_followup=None):
         store, ai = self.server.store, self.server.ai
         if check:
             check()
@@ -899,6 +912,7 @@ class Handler(BaseHTTPRequestHandler):
             ceiling=32 if budget else 9, expand=bool(budget),
             review_slots=None if budget else MAX_EXCERPTS, allow_intranet_evidence=external.intranet,
             check=check, worker_check=worker_check, allow_rerank=worker_check is None, expand_targets=worker_check is not None,
+            on_followup=on_followup,
         )
         return evidence, filters, aspects, follow_up
 
@@ -908,6 +922,9 @@ class Handler(BaseHTTPRequestHandler):
             return 400, {"error": "question_required"}
         if filters.get("tab") == "pcf":
             return 400, {"error": "pcf_review_required"}
+        detail = payload.get("detail", "balanced")
+        if not isinstance(detail, str) or detail not in ANSWER_DETAILS:
+            return 400, {"error": "answer_detail"}
         conversation = payload.get("conversation", "")
         if not isinstance(conversation, str) or (conversation and not CONVERSATION_ID.fullmatch(conversation)):
             raise ValueError("conversation")
@@ -945,10 +962,10 @@ class Handler(BaseHTTPRequestHandler):
                 if stream:
                     self.start_answer_stream()
                     stream_started = True
-                    stage("retrieving", "메일·문서 검색 및 질문 분석 중...")
+                    stage("retrieving", "질문 분석 및 메일·문서 검색 중...")
                 status, result = self.build_intranet_answer(
                     question, context, filters, conversation, external, budget, check, worker_check, stage,
-                    stream=stream,
+                    stream=stream, detail=detail,
                 )
                 if not stream:
                     return status, result
@@ -968,15 +985,16 @@ class Handler(BaseHTTPRequestHandler):
             cancelled.set()
 
     def build_intranet_answer(self, question, context, filters, conversation, external, budget, check, worker_check, stage,
-                              *, stream):
+                              *, stream, detail):
         sessions = self.server.answer_sessions
         session_id, handle, turns = sessions.begin(conversation)
         evidence, scope, aspects, _ = self.retrieve_external_evidence(
             question, context, filters, external, budget, budget, turns=turns,
             check=check, worker_check=worker_check,
             on_rerank=lambda count, remote: stage(
-                "reranking", "후보 근거 정밀 재정렬 중..." if remote else "후보 근거 순위를 정리 중...", candidates=count,
+                "reranking", f"후보 근거 {count}건 " + ("정밀 재정렬 중..." if remote else "순위 정리 중..."), candidates=count,
             ),
+            on_followup=(lambda: stage("followup", "부족한 근거·첨부 추가 탐색 중...")) if stream else None,
         )
         check()
         with self.server.store.measure("context"):
@@ -994,8 +1012,8 @@ class Handler(BaseHTTPRequestHandler):
 
             status, result = self.generate_intranet_markdown(
                 external, question, excerpts, scope, history=history, gap_aspects=aspects,
-                check=check, on_delta=delta if stream else None, on_generate=lambda: stage(
-                    "generating", "사내 AI가 답변을 작성 중입니다...", evidence=len(excerpts),
+                check=check, on_delta=delta if stream else None, detail=detail, on_generate=lambda: stage(
+                    "generating", f"근거 {len(excerpts)}건을 바탕으로 AI 답변 작성 중...", evidence=len(excerpts),
                 ),
             )
             if status != 200:
@@ -1021,7 +1039,7 @@ class Handler(BaseHTTPRequestHandler):
         return history
 
     def generate_intranet_markdown(self, external, question, excerpts, scope, *, history, gap_aspects,
-                                   check, on_delta, on_generate):
+                                   check, on_delta, on_generate, detail):
         store = self.server.store
         ids = [item.passage for item in excerpts]
         windows = {item.passage for item in excerpts if item.window_start is not None}
@@ -1039,7 +1057,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             with store.measure("generation"):
                 markdown = external.answer_markdown(question, excerpts, history=history, gap_aspects=gap_aspects,
-                                                    on_delta=on_delta)
+                                                    on_delta=on_delta, detail=detail)
         except (OSError, ValueError, RuntimeError, KeyError, IndexError, TypeError, http.client.HTTPException) as exc:
             return 200, {"status": "external_unavailable", "format": "markdown", "markdown": "", "sources": [],
                          "claims": [], "results": [], "provider": "intranet", "reason": type(exc).__name__}
@@ -1049,7 +1067,7 @@ class Handler(BaseHTTPRequestHandler):
             if not rows:
                 return 409, {"error": "external_source_changed"}
             result = validate_markdown_answer(markdown, excerpts, question=question, rows=rows, gap_aspects=gap_aspects)
-        return 200, {**result, "results": [public_row(row) for row in rows], "provider": "intranet"}
+        return 200, {**result, "results": [public_row(row, evidence=True) for row in rows], "provider": "intranet"}
 
     def start_answer_stream(self):
         self.close_connection = True
@@ -1171,7 +1189,7 @@ class Handler(BaseHTTPRequestHandler):
                 store, ai, query, filters, context, evidence, mode, query_count, check=check,
             )
         report("retrieving", count=len(evidence), queries=query_count, **{"pass": 2 if second else 1})
-        rows = [public_row(row) for row in evidence]
+        rows = [public_row(row, evidence=True) for row in evidence]
         result = {"status": "insufficient", "claims": []}
         if not ai.model:
             result["status"] = "model_not_configured"
@@ -1199,7 +1217,7 @@ class Handler(BaseHTTPRequestHandler):
                 evidence = [r for r in evidence if r["passage"] in visible
                             and (not r.get("window") or (r["start"], r["text"]) ==
                                  (visible[r["passage"]]["start"], visible[r["passage"]]["text"]))]
-                rows = [public_row(row) for row in evidence]
+                rows = [public_row(row, evidence=True) for row in evidence]
                 result = delivery_date_answer(query, evidence, context) if direct is not None else None
                 if result is None:
                     with store.measure("validation"):
@@ -1247,7 +1265,7 @@ class Handler(BaseHTTPRequestHandler):
         budget = external.pcf_budget
         if not budget:
             self.send_json(200, {"results": [public_row(seed)], "pcf_issue":
-                                 "PCF 전체 답변은 등록된 사내 API 주소에서 사용할 수 있습니다. 원문은 열 수 있습니다."})
+                                 "PCF 전체 답변은 등록된 API 주소에서 사용할 수 있습니다. 원문은 열 수 있습니다."})
             return True
         token, review = self.server.reviews.create(
             question, rows, external.review_generation, pcf=True, case=case)
@@ -1323,7 +1341,7 @@ class Handler(BaseHTTPRequestHandler):
                 row = rows[passage]
                 verified.append({**row, "text": item["text"], "pcf_cell": case["cells"][passage]})
                 used_lengths[passage] = used_lengths.get(passage, 0) + len(item["text"])
-                results[passage] = public_row(row)
+                results[passage] = public_row(row, evidence=True)
             checked = validate(result, verified, review.question, text_for=lambda row: row["text"],
                                pcf=True, claim_limit=12, complete=batch["coverage"]["complete"])
             statuses.append(checked["status"])
@@ -1448,7 +1466,7 @@ class Handler(BaseHTTPRequestHandler):
             text_for = source_text if not pcf and any(row["reviewed_context"] for row in verified) else lambda row: row["text"]
             checked = validate(result, verified, question, text_for=text_for, pcf=pcf)
         checked = report_unconfirmed_aspects(checked, gap_aspects)
-        return 200, {**checked, "results": [public_row(row) for row in verified], "provider": provider}
+        return 200, {**checked, "results": [public_row(row, evidence=True) for row in verified], "provider": provider}
 
     def intranet_settings(self):
         local, current = self.server.ai.embedding_config
