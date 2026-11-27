@@ -25,11 +25,11 @@ from pathlib import Path
 from urllib.parse import parse_qs, quote, urlsplit
 
 from .answer import (ANSWER_CLAIM_LIMIT, ANSWER_EVIDENCE_LIMIT, ANSWER_TEXT_LIMIT, CONVERSATION_ID,
-                     DEFAULT_ANSWER_NUM_CTX, PCF_INSTRUCTIONS, SYNTHESIS_QUESTION, AnswerSessions, LocalAI,
+                     DEFAULT_ANSWER_NUM_CTX, PARTICIPANT_QUESTION, PCF_INSTRUCTIONS, SYNTHESIS_QUESTION, AnswerSessions, LocalAI,
                      answer_groups, answer_plan, combine_answer_evidence, dedupe_by_content, delivery_date_answer, evidence_for,
                      follow_up_evidence, follow_up_replies, follow_up_reply_sender,
                      map_citations, merge_rows, pcf_candidates, pcf_retrieval, pcf_word, public_row, public_rows,
-                     report_unconfirmed_aspects, rewritten_evidence, source_text, supplemental_evidence, validate,
+                     report_unconfirmed_aspects, restore_conversation_turn, rewritten_evidence, source_text, supplemental_evidence, validate,
                      validate_markdown_answer)
 from .api_settings import ApiSettings, write_api_settings
 from .embedding import (CA_FILE_ENV, GatewayTLSOptions, MODEL as BGE_MODEL, PATH as EMBEDDING_PATH,
@@ -151,7 +151,7 @@ class App(ThreadingHTTPServer):
         self.search_workers = ThreadPoolExecutor(max_workers=2, thread_name_prefix="semantic-search")
         self.retrieval_workers = ThreadPoolExecutor(max_workers=4, thread_name_prefix="answer-retrieval")
         self.search_tickets = SearchTickets()
-        self.answer_sessions = AnswerSessions()
+        self.answer_sessions = AnswerSessions(store)
         self.ollama_setup = OllamaSetup(ai)
         self.external = external
         self.generic_answer = external
@@ -377,6 +377,17 @@ def best_snippet(text, tokens, size=170):
     return best[:size] + ("…" if len(best) > size else "")
 
 
+def conversation_key(payload, field):
+    key = payload.get(field, "")
+    if not isinstance(key, str) or (key and not CONVERSATION_ID.fullmatch(key)):
+        raise ValueError(field)
+    return key
+
+
+def followup_message(step):
+    return f"추가 탐색 {step}단계 · 부족한 근거와 관련 메일·첨부를 확인 중입니다."
+
+
 def filters_from(get):
     filters = {}
     for name in ("sender", "recipient", "subject", "body"):
@@ -408,6 +419,89 @@ def filters_from(get):
                 date += datetime.timedelta(days=1)
             filters[name] = local_midnight_utc(date)
     return filters
+
+
+def retrieve_answer_evidence(store, ai, question, context, filters, external, budget, internal_budget, *, turns=(),
+                             check=None, worker_check=None, on_rerank=None, on_followup=None, workers=None,
+                             retrieval_only=False, limit=None):
+    intranet = bool(external and external.intranet)
+    if check:
+        check()
+    if internal_budget:
+        filters = {**filters, "regular_only": True}
+    search_text, filters = question_scope(question, filters)
+    limit = limit or (MAX_GATEWAY_EXCERPTS if intranet else MAX_INTERNAL_EXCERPTS)
+    with store.measure("context"):
+        follow_up, anchors = follow_up_evidence(store, question, filters, turns)
+        reply_sender = follow_up_reply_sender(question) if turns and filters.get("tab") != "document" else ""
+        if reply_sender:
+            replies = follow_up_replies(store, anchors, filters, reply_sender)
+            return replies, filters, (), follow_up if replies else ""
+    searched_queries = set()
+    options = {"limit": limit if budget or retrieval_only else 9, "expand": bool(budget) or retrieval_only,
+               "max_evidence": 32 if budget or retrieval_only else None, "intent": question, "local_context": follow_up,
+               "searched_queries": searched_queries}
+    speculative = {}
+    if worker_check:
+        options.update(check=check, on_rerank=on_rerank)
+        speculative = {"workers": workers, "original_query": search_text,
+                       "cancel": worker_check}
+    rewrite = None if retrieval_only else rewritten_evidence(store, ai, question, filters, context, **speculative, **options)
+    query_count = 1
+    if rewrite:
+        evidence, mode, rewritten_filters, query_count = rewrite
+        if anchors and rewritten_filters != filters:
+            with store.measure("context"):
+                follow_up, anchors = follow_up_evidence(store, question, rewritten_filters, turns)
+        filters = rewritten_filters
+    else:
+        evidence, mode = evidence_for(store, ai, search_text, filters, context, **options)
+    if anchors:
+        with store.measure("context"):
+            related = store.related(list(dict.fromkeys(row["id"] for row in anchors if row["kind"] == "mail")),
+                                    filters, hops=3, question=question)
+            evidence = combine_answer_evidence([related, evidence], anchors, limit=limit)
+    if retrieval_only:
+        return evidence, filters, (), follow_up
+    evidence, _, aspects, _ = supplemental_evidence(
+        store, ai, question, filters, f"{follow_up} {context}".strip()[:450], evidence, mode, query_count,
+        ceiling=32 if budget else 9, expand=bool(budget),
+        review_slots=None if budget else MAX_EXCERPTS, allow_intranet_evidence=intranet,
+        check=check, worker_check=worker_check, allow_rerank=worker_check is None, expand_targets=worker_check is not None,
+        on_followup=on_followup, searched_queries=searched_queries,
+    )
+    return evidence, filters, aspects, follow_up
+
+
+def generate_intranet_markdown(store, external, question, excerpts, scope, *, history=(), gap_aspects=(),
+                               check=lambda: None, on_delta=None, on_generate=lambda: None, detail="balanced"):
+    ids = [item.passage for item in excerpts]
+    windows = {item.passage for item in excerpts if item.window_start is not None}
+
+    def verified_excerpts():
+        rows = {row["passage"]: row for row in store.passages(ids, scope, windows=windows)}
+        if all(item.passage in rows and item.original_in(rows[item.passage]) for item in excerpts):
+            return [rows[pid] for pid in ids]
+        return []
+
+    if not verified_excerpts():
+        return 409, {"error": "external_source_changed"}
+    check()
+    on_generate()
+    try:
+        with store.measure("generation"):
+            markdown = external.answer_markdown(question, excerpts, history=history, gap_aspects=gap_aspects,
+                                                on_delta=on_delta, detail=detail)
+    except (OSError, ValueError, RuntimeError, KeyError, IndexError, TypeError, http.client.HTTPException) as exc:
+        return 200, {"status": "external_unavailable", "format": "markdown", "markdown": "", "sources": [],
+                     "claims": [], "results": [], "provider": "intranet", "reason": type(exc).__name__}
+    check()
+    with store.measure("validation"):
+        rows = verified_excerpts()
+        if not rows:
+            return 409, {"error": "external_source_changed"}
+        result = validate_markdown_answer(markdown, excerpts, question=question, rows=rows, gap_aspects=gap_aspects)
+    return 200, {**result, "results": public_rows(store, rows, evidence=True), "provider": "intranet"}
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -491,6 +585,26 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_bytes(200, "text/plain; charset=utf-8", b"Outlook PST Search")
             else:
                 self.send_json(404, {"error": "not_found"})
+        elif route.path == "/api/conversations":
+            self.send_json(200, {"conversations": self.server.store.list_conversations()})
+        elif match := re.fullmatch(r"/api/conversations/([A-Za-z0-9_-]{32})", route.path):
+            store = self.server.store
+            key = match[1]
+            turns = store.conversation_turns(key)
+            if not turns:
+                self.send_json(404, {"error": "conversation_missing"})
+                return
+            filters = {name: value for name, value in turns[-1]["scope"].items() if name in (
+                "source", "tab", "sender", "recipient", "subject", "body", "attachment", "after", "before",
+            )}
+            for name in ("after", "before"):
+                if name in filters:
+                    day = datetime.datetime.fromisoformat(filters[name]).astimezone().date()
+                    filters[name] = (day - datetime.timedelta(days=name == "before")).isoformat()
+            self.send_json(200, {"id": key, "filters": filters, "turns": [
+                {"question": turn["question"], "created": turn["created"],
+                 "answer": restore_conversation_turn(store, turn, include_evidence=True)} for turn in turns
+            ]})
         elif route.path == "/api/sources":
             sources = self.server.store.sources()
             scan = route.query != "scan=0"
@@ -578,6 +692,27 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_bytes(200, preview_type or "application/octet-stream", body,
                                 filename=filename, inline=bool(preview_type))
 
+    def do_DELETE(self):
+        self.close_connection = True
+        route = urlsplit(self.path).path
+        if not self.authorized(route):
+            return
+        match = re.fullmatch(r"/api/conversations/([A-Za-z0-9_-]{32})", route)
+        if not match:
+            self.send_json(404, {"error": "not_found"})
+            return
+        key = match[1]
+        try:
+            with self.server.answer_sessions.serialize(key, lambda: None):
+                deleted = self.server.store.delete_conversation(key)
+                self.server.answer_sessions.reset(key)
+            if deleted:
+                self.send_json(200, {"ok": True})
+            else:
+                self.send_json(404, {"error": "conversation_missing"})
+        except sqlite3.Error:
+            self.send_json(503, {"error": "index_unavailable"})
+
     def do_POST(self):
         route = urlsplit(self.path).path
         if not self.authorized(route):
@@ -617,7 +752,8 @@ class Handler(BaseHTTPRequestHandler):
                 key = payload.get("session_id")
                 if not isinstance(key, str) or not CONVERSATION_ID.fullmatch(key):
                     raise ValueError("session_id")
-                self.server.answer_sessions.reset(key)
+                with self.server.answer_sessions.serialize(key, lambda: None):
+                    self.server.answer_sessions.reset(key)
                 self.send_json(200, {"ok": True})
             elif route == "/api/search":
                 self.query(route, payload)
@@ -836,9 +972,13 @@ class Handler(BaseHTTPRequestHandler):
             evidence, _ = pcf_retrieval(store, ai, query, filters, context)
             evidence = [row for row in evidence if not pcf_word(row)]
         elif route == "/api/external/preview":
-            evidence, filters, gap_aspects, _ = self.retrieve_external_evidence(
-                query, context, filters, external, budget, internal_budget,
-            )
+            conversation = conversation_key(payload, "conversation")
+            sessions = self.server.answer_sessions
+            with sessions.serialize(conversation, lambda: None):
+                turns = sessions.begin(conversation)[2] if conversation else ()
+                evidence, filters, gap_aspects, _ = retrieve_answer_evidence(
+                    store, ai, query, context, filters, external, budget, internal_budget, turns=turns,
+                )
         else:
             search_text, filters = question_scope(query, filters)
             evidence, _ = evidence_for(store, ai, search_text, filters, context, semantic=False, intent=query)
@@ -869,52 +1009,6 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 self.send_json(409, {"error": "external_busy"})
 
-    def retrieve_external_evidence(self, question, context, filters, external, budget, internal_budget, *, turns=(),
-                                   check=None, worker_check=None, on_rerank=None, on_followup=None):
-        store, ai = self.server.store, self.server.ai
-        if check:
-            check()
-        if internal_budget:
-            filters = {**filters, "regular_only": True}
-        search_text, filters = question_scope(question, filters)
-        limit = MAX_GATEWAY_EXCERPTS if external.intranet else MAX_INTERNAL_EXCERPTS
-        with store.measure("context"):
-            follow_up, anchors = follow_up_evidence(store, question, filters, turns)
-            reply_sender = follow_up_reply_sender(question) if turns and filters.get("tab") != "document" else ""
-            if reply_sender:
-                replies = follow_up_replies(store, anchors, filters, reply_sender)
-                return replies, filters, (), follow_up if replies else ""
-        options = {"limit": limit if budget else 9, "expand": bool(budget),
-                   "max_evidence": 32 if budget else None, "intent": question, "local_context": follow_up}
-        speculative = {}
-        if worker_check:
-            options.update(check=check, on_rerank=on_rerank)
-            speculative = {"workers": self.server.retrieval_workers, "original_query": search_text,
-                           "cancel": worker_check}
-        rewrite = rewritten_evidence(store, ai, question, filters, context, **speculative, **options)
-        query_count = 1
-        if rewrite:
-            evidence, mode, rewritten_filters, query_count = rewrite
-            if anchors and rewritten_filters != filters:
-                with store.measure("context"):
-                    follow_up, anchors = follow_up_evidence(store, question, rewritten_filters, turns)
-            filters = rewritten_filters
-        else:
-            evidence, mode = evidence_for(store, ai, search_text, filters, context, **options)
-        if anchors:
-            with store.measure("context"):
-                related = store.related(list(dict.fromkeys(row["id"] for row in anchors if row["kind"] == "mail")),
-                                        filters, hops=3, question=question)
-                evidence = combine_answer_evidence([related, evidence], anchors, limit=limit)
-        evidence, _, aspects, _ = supplemental_evidence(
-            store, ai, question, filters, f"{follow_up} {context}".strip()[:450], evidence, mode, query_count,
-            ceiling=32 if budget else 9, expand=bool(budget),
-            review_slots=None if budget else MAX_EXCERPTS, allow_intranet_evidence=external.intranet,
-            check=check, worker_check=worker_check, allow_rerank=worker_check is None, expand_targets=worker_check is not None,
-            on_followup=on_followup,
-        )
-        return evidence, filters, aspects, follow_up
-
     def intranet_answer(self, payload, *, stream=False):
         question, context, filters = self.question_input(payload)
         if not question:
@@ -924,9 +1018,7 @@ class Handler(BaseHTTPRequestHandler):
         detail = payload.get("detail", "balanced")
         if not isinstance(detail, str) or detail not in ANSWER_DETAILS:
             return 400, {"error": "answer_detail"}
-        conversation = payload.get("conversation", "")
-        if not isinstance(conversation, str) or (conversation and not CONVERSATION_ID.fullmatch(conversation)):
-            raise ValueError("conversation")
+        conversation = conversation_key(payload, "conversation")
         server = self.server
         cancelled = threading.Event()
         stream_started = False
@@ -987,13 +1079,14 @@ class Handler(BaseHTTPRequestHandler):
                               *, stream, detail):
         sessions = self.server.answer_sessions
         session_id, handle, turns = sessions.begin(conversation)
-        evidence, scope, aspects, _ = self.retrieve_external_evidence(
-            question, context, filters, external, budget, budget, turns=turns,
+        evidence, scope, aspects, _ = retrieve_answer_evidence(
+            self.server.store, self.server.ai, question, context, filters, external, budget, budget, turns=turns,
+            workers=self.server.retrieval_workers,
             check=check, worker_check=worker_check,
             on_rerank=lambda count, remote: stage(
                 "reranking", f"후보 근거 {count}건 " + ("정밀 재정렬 중..." if remote else "순위 정리 중..."), candidates=count,
             ),
-            on_followup=(lambda: stage("followup", "부족한 근거·첨부 추가 탐색 중...")) if stream else None,
+            on_followup=(lambda step: stage("followup", followup_message(step), step=step)) if stream else None,
         )
         check()
         with self.server.store.measure("context"):
@@ -1009,8 +1102,8 @@ class Handler(BaseHTTPRequestHandler):
                 check()
                 self.send_answer_event("delta", {"text": text})
 
-            status, result = self.generate_intranet_markdown(
-                external, question, excerpts, scope, history=history, gap_aspects=aspects,
+            status, result = generate_intranet_markdown(
+                self.server.store, external, question, excerpts, scope, history=history, gap_aspects=aspects,
                 check=check, on_delta=delta if stream else None, detail=detail, on_generate=lambda: stage(
                     "generating", f"근거 {len(excerpts)}건을 바탕으로 AI 답변 작성 중...", evidence=len(excerpts),
                 ),
@@ -1019,9 +1112,9 @@ class Handler(BaseHTTPRequestHandler):
                 return status, result
         check()
         result = {**result, "conversation": session_id}
+        sessions.record(session_id, handle, question, result, scope)
         if stream:
             self.send_answer_event("complete", result)
-        sessions.record(session_id, handle, question, result)
         return 200, result
 
     def intranet_history(self, turns, scope, budget):
@@ -1036,37 +1129,6 @@ class Handler(BaseHTTPRequestHandler):
                 break
             history[:0] = pair
         return history
-
-    def generate_intranet_markdown(self, external, question, excerpts, scope, *, history, gap_aspects,
-                                   check, on_delta, on_generate, detail):
-        store = self.server.store
-        ids = [item.passage for item in excerpts]
-        windows = {item.passage for item in excerpts if item.window_start is not None}
-
-        def verified_excerpts():
-            rows = {row["passage"]: row for row in store.passages(ids, scope, windows=windows)}
-            if all(item.passage in rows and item.original_in(rows[item.passage]) for item in excerpts):
-                return [rows[pid] for pid in ids]
-            return []
-
-        if not verified_excerpts():
-            return 409, {"error": "external_source_changed"}
-        check()
-        on_generate()
-        try:
-            with store.measure("generation"):
-                markdown = external.answer_markdown(question, excerpts, history=history, gap_aspects=gap_aspects,
-                                                    on_delta=on_delta, detail=detail)
-        except (OSError, ValueError, RuntimeError, KeyError, IndexError, TypeError, http.client.HTTPException) as exc:
-            return 200, {"status": "external_unavailable", "format": "markdown", "markdown": "", "sources": [],
-                         "claims": [], "results": [], "provider": "intranet", "reason": type(exc).__name__}
-        check()
-        with store.measure("validation"):
-            rows = verified_excerpts()
-            if not rows:
-                return 409, {"error": "external_source_changed"}
-            result = validate_markdown_answer(markdown, excerpts, question=question, rows=rows, gap_aspects=gap_aspects)
-        return 200, {**result, "results": public_rows(store, rows, evidence=True), "provider": "intranet"}
 
     def start_answer_stream(self):
         self.close_connection = True
@@ -1105,9 +1167,16 @@ class Handler(BaseHTTPRequestHandler):
         if not query:
             self.send_json(400, {"error": "question_required"})
             return
-        session_id = payload.get("session_id", "")
-        if not isinstance(session_id, str) or (session_id and not CONVERSATION_ID.fullmatch(session_id)):
-            raise ValueError("session_id")
+        session_id = conversation_key(payload, "session_id")
+        sessions = self.server.answer_sessions
+        check = self.check_answer_stream if stream else None
+        try:
+            with sessions.serialize(session_id, check or (lambda: None)):
+                self.run_local_answer(payload, profile, query, context, filters, session_id, check, stream=stream)
+        except AnswerCancelled:
+            return
+
+    def run_local_answer(self, payload, profile, query, context, filters, session_id, check, *, stream):
         sessions = self.server.answer_sessions
         handle, turns = None, None
         if stream or "session_id" in payload:
@@ -1118,9 +1187,11 @@ class Handler(BaseHTTPRequestHandler):
             except AnswerCancelled:
                 return
         report = self.stream_answer_event if stream else lambda *args, **kwargs: None
-        check = self.check_answer_stream if stream else None
+        followup = (lambda step: self.send_answer_event(
+            "stage", {"stage": "followup", "message": followup_message(step), "step": step},
+        )) if stream else None
         try:
-            result = self.local_answer(query, context, filters, report, turns, check)
+            result = self.local_answer(query, context, filters, report, turns, check, on_followup=followup)
             if check:
                 check()
         except AnswerCancelled:
@@ -1137,7 +1208,8 @@ class Handler(BaseHTTPRequestHandler):
             profile.log(runtime_logger, "answer")
         if handle is not None:
             result["session_id"] = session_id
-            sessions.record(session_id, handle, query, result)
+            scope = result.pop("_scope", filters)
+            sessions.record(session_id, handle, query, result, scope)
         try:
             if stream:
                 report("done", **result)
@@ -1146,7 +1218,7 @@ class Handler(BaseHTTPRequestHandler):
         except AnswerCancelled:
             return
 
-    def local_answer(self, query, context, filters, report, turns, check):
+    def local_answer(self, query, context, filters, report, turns, check, *, on_followup=None):
         store, ai = self.server.store, self.server.ai
         report("planning")
         search_text, filters = question_scope(query, filters)
@@ -1157,8 +1229,9 @@ class Handler(BaseHTTPRequestHandler):
             follow_up, anchors = follow_up_evidence(store, query, filters, turns)
             if reply_sender:
                 anchors = follow_up_replies(store, anchors, filters, reply_sender)
+        searched_queries = set()
         options = {"limit": 12, "expand": True, "thread_hops": 3, "max_evidence": ANSWER_EVIDENCE_LIMIT,
-                   "local_context": follow_up, "check": check, "intent": query}
+                   "local_context": follow_up, "check": check, "intent": query, "searched_queries": searched_queries}
         rewritten = None
         if not reply_sender and filters.get("tab") != "pcf":
             rewritten = rewritten_evidence(store, ai, query, filters, context, **options)
@@ -1186,6 +1259,7 @@ class Handler(BaseHTTPRequestHandler):
         if ai.model and not reply_sender:
             evidence, mode, gap_aspects, second = supplemental_evidence(
                 store, ai, query, filters, context, evidence, mode, query_count, check=check,
+                expand_targets=True, on_followup=on_followup, searched_queries=searched_queries,
             )
         report("retrieving", count=len(evidence), queries=query_count, **{"pass": 2 if second else 1})
         result = {"status": "insufficient", "claims": []}
@@ -1198,10 +1272,19 @@ class Handler(BaseHTTPRequestHandler):
                 full_question = f"{query} {context}"
                 synthesis = query_count > 1 or SYNTHESIS_QUESTION.search(query)
                 direct = None if synthesis or gap_aspects else delivery_date_answer(query, evidence, context)
+                correspondence_summary = None
+                if direct is None and PARTICIPANT_QUESTION.search(query):
+                    with store.measure("context"):
+                        seeds = list(dict.fromkeys(row["id"] for row in evidence if row.get("kind") == "mail"))[:12]
+                        summary = store.participant_summary(search_text, filters, limit=5, seed_ids=seeds)
+                        if summary["mail_count"]:
+                            correspondence_summary = summary
                 report("synthesizing")
                 with store.measure("generation"):
                     groups = answer_groups(store, evidence) if synthesis else ()
                     options = {"groups": groups} if groups else {}
+                    if correspondence_summary:
+                        options["correspondence_summary"] = correspondence_summary
                     if check:
                         options["check"] = check
                     if gap_aspects:
@@ -1225,7 +1308,8 @@ class Handler(BaseHTTPRequestHandler):
             finally:
                 self.server.generation.release()
         return {**report_unconfirmed_aspects(result, gap_aspects),
-                "results": public_rows(store, evidence, evidence=True), "retrieval": mode}
+                "results": public_rows(store, evidence, evidence=True), "retrieval": mode,
+                **({"_scope": filters} if turns is not None else {})}
 
     def preview_pcf_word(self, passage, question, context, filters, external):
         store = self.server.store
@@ -1390,6 +1474,8 @@ class Handler(BaseHTTPRequestHandler):
         if not server.external:
             self.send_json(403, {"error": "external_disabled"})
             return
+        save_conversation = not pcf and "conversation" in payload
+        conversation = conversation_key(payload, "conversation") if save_conversation else ""
         token, selected = payload.get("review"), payload.get("excerpts")
         if (not isinstance(token, str) or not re.fullmatch(r"[\w-]{32}", token, re.ASCII)
                 or not isinstance(selected, list) or not 1 <= len(selected) <= (MAX_PCF_CELLS if pcf else MAX_GATEWAY_EXCERPTS)
@@ -1422,9 +1508,15 @@ class Handler(BaseHTTPRequestHandler):
             if len(excerpts) > (extended if review.review_budget else MAX_EXCERPTS):
                 raise ValueError("external_excerpts")
             scope = {"tab": "pcf"} if pcf else review.filters or {}
-            status, reply = self.generate_external_answer(
-                external, review.question, excerpts, scope, pcf=pcf, gap_aspects=review.gap_aspects,
-            )
+            sessions = server.answer_sessions
+            with sessions.serialize(conversation, lambda: None):
+                status, reply = self.generate_external_answer(
+                    external, review.question, excerpts, scope, pcf=pcf, gap_aspects=review.gap_aspects,
+                )
+                if status == 200 and save_conversation:
+                    key, handle, _ = sessions.begin(conversation)
+                    sessions.record(key, handle, review.question, reply, scope)
+                    reply["conversation"] = key
         finally:
             server.outbound.release()
         self.send_json(status, reply)
