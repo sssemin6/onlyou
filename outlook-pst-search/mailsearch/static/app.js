@@ -1017,28 +1017,59 @@ function showResults(rows, title, emptyMessage = "이 범위에서 일치하는 
   for (const [index, row] of rows.entries()) {
     const button = node("button", "", evidence ? "result evidence-result" : "result");
     button.type = "button";
+    const mail = row.kind === "mail";
     const reasons = [];
     if (row.matched?.length) reasons.push("단어 " + row.matched.slice(0, 3).join(" · "));
     if (row.similarity != null) reasons.push("유사도 " + Math.round(row.similarity * 100) + "%");
-    button.append(node("strong", row.subject || "제목 없는 메일"),
-      node("span", [row.sender, formatDate(row.sent), row.archive, row.folder, row.kind === "mail" ? row.attachment : null, row.attachment || row.kind !== "mail" ? row.location : ""].filter(Boolean).join(" · "), "result-meta"));
+    button.append(node("strong", row.subject || "제목 없는 메일"));
+    if (mail) {
+      const meta = node("span", mailResultMeta(row), "result-meta");
+      if (row.recipient) meta.title = row.recipient;
+      button.append(meta);
+      const names = row.attachments?.length ? row.attachments : row.attachment ? [row.attachment] : [];
+      if (names.length) {
+        const name = names.includes(row.attachment) ? row.attachment : names[0];
+        const badge = node("span", "첨부 " + name + (names.length > 1 ? " (외 " + (names.length - 1) + "건)" : ""),
+          "result-attachment");
+        badge.title = names.join("\n");
+        button.append(badge);
+      }
+    } else {
+      button.append(node("span", [row.sender, formatDate(row.sent), row.archive, row.folder, row.location]
+        .filter(Boolean).join(" · "), "result-meta"));
+    }
     if (reasons.length) button.append(node("span", reasons.join(" · "), "result-why"));
     const preview = node("span", "", "result-preview");
     if (row.snippet && row.matched?.length) preview.append(...marked(row.snippet, row.matched));
-    else preview.textContent = evidence ? (row.preview || "").slice(0, 400) : row.preview;
+    else {
+      const text = (mail ? row.snippet : "") || row.preview || "";
+      preview.textContent = evidence ? text.slice(0, 400) : text;
+    }
     if (evidence) {
       const fields = [
         row.sender && "발신 " + row.sender, row.recipient && "수신 " + row.recipient,
         row.sent && "날짜 " + formatDate(row.sent), row.attachment && "첨부 " + row.attachment,
       ];
-      button.append(node("span", fields.filter(Boolean).join(" · "), "evidence-preview result-meta"));
+      button.append(node("span", mail ? mailResultMeta(row, true) : fields.filter(Boolean).join(" · "),
+        "evidence-preview result-meta"));
     }
     button.append(preview);
+    if (mail && row.body_preview && row.body_preview !== (row.snippet || row.preview)) {
+      button.append(node("span", row.body_preview, "result-preview result-body-preview"));
+    }
     button.addEventListener("click", () => openEvidence(row.passage, undefined, evidence && row.window));
     (more && index >= 4 ? more : content).append(button);
   }
   if (more) content.append(more);
   result.replaceChildren(content);
+}
+
+function mailResultMeta(row, full = false) {
+  const recipients = (row.recipient || "").match(/(?:"(?:[^"\\]|\\.)*"|<[^>]*>|[^,;\r\n"])+/g) || [];
+  const people = recipients.map((person) => person.trim()).filter(Boolean);
+  const short = people.slice(0, 2).join(", ") + (people.length > 2 ? " 외 " + (people.length - 2) + "명" : "");
+  return ["발신 " + (row.sender || "정보 없음"), "수신 " + ((full ? row.recipient : short) || "정보 없음"),
+    formatDate(row.sent), row.archive, row.folder].filter(Boolean).join(" · ");
 }
 
 function showAnswerEvidence(data, title = "사용한 근거") {
