@@ -8,6 +8,7 @@ import os
 from .extract import MAX_ATTACHMENT, clean
 
 DEFAULT_OUTLOOK = "outlook:default"
+OUTLOOK_PST_PREFIX = "outlook:"
 MAIL_FILTER = '@SQL="http://schemas.microsoft.com/mapi/proptag/0x001A001F" LIKE \'IPM.Note%\''
 
 
@@ -27,26 +28,38 @@ def outlook_modules():
 
 
 @contextmanager
-def outlook_store(path):
+def outlook_store(path, *, open_only=False):
     pythoncom, client = outlook_modules()
     pythoncom.CoInitialize()
     namespace = attached = store = root = session = None
     try:
         try:
-            namespace = client.Dispatch("Outlook.Application").GetNamespace("MAPI")
-            if path == DEFAULT_OUTLOOK:
+            application = (client.GetActiveObject("Outlook.Application") if open_only
+                           else client.Dispatch("Outlook.Application"))
+            namespace = application.GetNamespace("MAPI")
+            if path == DEFAULT_OUTLOOK and not open_only:
                 store = namespace.DefaultStore
             else:
                 path = path.removeprefix("outlook:")
-                if not Path(path).is_file() or Path(path) != Path(path).resolve(strict=True):
+                if not open_only and (not Path(path).is_file() or Path(path) != Path(path).resolve(strict=True)):
                     raise OutlookError("outlook_pst_path")
                 target = os.path.normcase(os.path.normpath(path))
-                store = next((entry for entry in namespace.Stores
-                              if entry.FilePath and os.path.normcase(os.path.normpath(entry.FilePath)) == target), None)
+
+                def find_store():
+                    for entry in namespace.Stores:
+                        try:
+                            filename = entry.FilePath
+                        except pythoncom.com_error:
+                            continue
+                        if filename and os.path.normcase(os.path.normpath(filename)) == target:
+                            return entry
+
+                store = find_store()
                 if store is None:
+                    if open_only:
+                        raise OutlookError("outlook_pst_not_open")
                     namespace.AddStoreEx(path, 3)  # olStoreUnicode
-                    store = next(entry for entry in namespace.Stores
-                                 if entry.FilePath and os.path.normcase(os.path.normpath(entry.FilePath)) == target)
+                    store = find_store()
                     attached = store.GetRootFolder()
             root = attached if attached is not None else store.GetRootFolder()
             session = OutlookStore(namespace, store.StoreID, root, pythoncom.com_error)
@@ -61,7 +74,7 @@ def outlook_store(path):
                 pass
         if session is not None:
             session.namespace = session.root = None
-        session = root = store = attached = namespace = None
+        session = root = store = attached = namespace = application = None
         pythoncom.CoUninitialize()
 
 
@@ -72,7 +85,11 @@ class OutlookStore:
         self.root = root
         self.com_error = com_error
 
-    def identities(self, check):
+    def identities(self, check, *, message_id=""):
+        restriction = MAIL_FILTER
+        if message_id:
+            value = message_id.replace("'", "''")
+            restriction += f' AND "http://schemas.microsoft.com/mapi/proptag/0x1035001F" = \'{value}\''
         folders = [self.root]
         try:
             while folders:
@@ -80,7 +97,7 @@ class OutlookStore:
                 folder = folders.pop()
                 folders.extend(folder.Folders)
                 path = folder.FolderPath
-                table = folder.GetTable(MAIL_FILTER)
+                table = folder.GetTable(restriction)
                 columns = table.Columns
                 columns.RemoveAll()
                 columns.Add("EntryID")
@@ -92,6 +109,22 @@ class OutlookStore:
                         yield entry_id, path
         except self.com_error as exc:
             raise OutlookError("outlook_enumeration") from exc
+
+    def find_message(self, message_id, temporary):
+        if not message_id:
+            raise OutlookError("outlook_item_changed")
+        entry, folders = None, []
+        for candidate, folder in self.identities(lambda: None, message_id=message_id):
+            if entry is not None and entry != candidate:
+                raise OutlookError("outlook_item_changed")
+            entry = candidate
+            folders.append(folder)
+        if entry is None:
+            raise OutlookError("outlook_item_changed")
+        mail = self.read(entry, folders[0], temporary, folders[1:])
+        if mail["message_id"] != message_id:
+            raise OutlookError("outlook_item_changed")
+        return mail
 
     def read(self, entry_id, folder, temporary, aliases=()):
         try:
