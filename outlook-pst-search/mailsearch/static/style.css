@@ -499,8 +499,21 @@ kbd {
 .result::after { content: "↗"; position: absolute; right: 16px; top: 14px; color: var(--accent); font-size: 1.16rem; }
 .result strong { display: block; font-weight: 810; letter-spacing: -.025em; }
 .result-meta { display: block; margin: 2px 0 4px; color: var(--muted); font-size: .78rem; }
+.result-attachment {
+  display: table;
+  max-width: 100%;
+  margin-bottom: 5px;
+  padding: 2px 7px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--page);
+  color: var(--accent-dark);
+  font-size: .75rem;
+  font-weight: 700;
+}
 .result-why { font-size: .72rem; font-weight: 700; color: var(--accent-dark); margin-top: 2px; overflow-wrap: anywhere; }
 .result-preview { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; font-size: .87rem; white-space: pre-line; }
+.result-body-preview { margin-top: 3px; }
 .result-empty { padding: 18px; color: var(--muted); font-size: .87rem; }
 .evidence-more { border-top: 1px solid var(--line); }
 .evidence-more summary { padding: 10px 17px; color: var(--accent-dark); font-size: .82rem; }
