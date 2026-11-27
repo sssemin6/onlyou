@@ -1,20 +1,18 @@
 """Configured gateway text model roles and reranking calls."""
 import http.client
-import json
 import os
-import re
 import socket
 import ssl
 
 from .answer import GAP_TOKEN_LIMIT, MODEL_NAME, QUERY_REWRITE_TOKEN_LIMIT
 from .embedding import EmbeddingAPI, GatewayRequestError, MODEL, gateway_origin
-from .external import ExternalAI, ExternalRequestError
+from .external import ExternalAI, ExternalRequestError, completion_json
 
 LOCAL_EMBEDDING = "ollama:" + MODEL
 CHAT_PATH = "/v1/chat/completions"
 RERANK_PATH = "/v1/rerank"
 MODELS = {
-    "embedding": {LOCAL_EMBEDDING: "로컬 Ollama · BGE-M3", MODEL: "사내 API · BGE-M3"},
+    "embedding": {LOCAL_EMBEDDING: "로컬 Ollama · BGE-M3", MODEL: "API · BGE-M3"},
     "rerank": {"bge-reranker-v2-m3": "BGE-Reranker-v2-M3"},
 }
 
@@ -74,8 +72,7 @@ class IntranetAI(EmbeddingAPI):
             "stream": False,
         }, timeout, retry_stale=retry_stale)
         content = response["choices"][0]["message"]["content"]
-        fenced = re.fullmatch(r"\s*```(?:json)?\s*(.*?)\s*```\s*", content, re.S | re.I)
-        return json.loads(fenced[1] if fenced else content)
+        return completion_json(content)
 
     def rerank(self, query, documents, timeout=15):
         data = self.request(RERANK_PATH, {
