@@ -47,6 +47,8 @@ BASE_ANSWER_NUM_CTX = 8192
 QUERY_EMBEDDING_TIMEOUT = 6
 RAG_CANDIDATE_LIMIT = 80
 RAG_MIN_SIMILARITY = .18
+MAX_AGENT_STEPS = 2
+EVIDENCE_SUFFICIENT = object()
 SYNTHESIS_QUESTION = re.compile(r"종합|비교|타임라인|시간\s*순|경과|흐름|이력|각각|항목별|쟁점별|상충")
 TIMELINE_QUESTION = re.compile(r"타임라인|시간\s*순|경과|흐름|이력")
 PROJECT_CODE = re.compile(r"(?<![A-Za-z0-9_-])[A-Za-z0-9]+(?:[-_][A-Za-z0-9]+)+(?![A-Za-z0-9_-])")
@@ -644,6 +646,7 @@ class LocalAI:
         data = {"question": question}
         local_model, gateway = self.rewrite_model, self.embedding_api
         instructions = GAP_INSTRUCTIONS
+        report_sufficient = expand_targets
         if local_model or (allow_intranet_evidence and self.trusted_gateway(gateway)
                            and gateway.rewrite_model):
             data["evidence"] = [
@@ -667,9 +670,11 @@ class LocalAI:
         raw = self.retrieval_completion(instructions, json.dumps(data, ensure_ascii=False),
                                         "diagnose_evidence_gap", token_limit=GAP_TOKEN_LIMIT, timeout=timeout,
                                         backend=(local_model, gateway), num_ctx=8192)
+        if report_sufficient and isinstance(raw, dict) and raw.get("sufficient") is True:
+            return EVIDENCE_SUFFICIENT
         return parse_evidence_gap(raw, question, expand_targets=expand_targets)
 
-    def answer(self, question, evidence, context, *, groups=(), check=None, gap_aspects=()):
+    def answer(self, question, evidence, context, *, groups=(), check=None, gap_aspects=(), correspondence_summary=None):
         if check:
             check()
         self.ensure_server()
@@ -679,9 +684,12 @@ class LocalAI:
                   "독립된 사실마다 해당 출처를 직접 인용한다.")
         if gap_aspects:
             prompt += " 확인 항목은 검색 진단에서 나온 참고 사항이다. 근거가 없는 항목은 해당 범위에서 미확인으로 처리한다."
+        summary_json = json.dumps(correspondence_summary, ensure_ascii=False) if correspondence_summary else ""
+        if summary_json:
+            prompt += CORRESPONDENCE_INSTRUCTIONS
         # Ollama has no generation-model tokenizer endpoint. Estimate from JSON UTF-8
         # size and reserve room for output and the model's template.
-        fixed_cost = 640 + estimate_tokens(prompt + question + context + " ".join(gap_aspects))
+        fixed_cost = 640 + estimate_tokens(prompt + question + context + " ".join(gap_aspects) + summary_json)
         costs = {row["passage"]: passage_cost(row) for row in evidence}
         maximum = min(self.answer_num_ctx, self.model_context_limit or BASE_ANSWER_NUM_CTX)
         num_ctx = min(BASE_ANSWER_NUM_CTX, maximum)
@@ -713,6 +721,8 @@ class LocalAI:
         ]}
         if gap_aspects:
             data["check_aspects"] = gap_aspects
+        if summary_json:
+            data["correspondence_summary"] = correspondence_summary
         if groups:
             for item, row in zip(data["evidence"], evidence):
                 item["group"] = group_numbers[row["passage"]]
@@ -805,7 +815,11 @@ def map_citations(result, ids):
 
 MAIL_HEADERS = (("Sent", "sent"), ("From", "sender"), ("To", "recipient"),
                 ("Subject", "subject"), ("Attachment", "attachment"))
-PARTICIPANT_QUESTION = re.compile(r"업체|공급사|제조사|벤더|담당자|누구|누가|교신|상대방|\b(?:vendor|supplier|maker)\b", re.I)
+CORRESPONDENCE_INSTRUCTIONS = (
+    "\ncorrespondence_summary는 검색·스레드 범위에서 집계한 메일 헤더 요약이다. "
+    "전체 보관함 통계로 단정하지 말고 직접 확인 가능한 출처를 인용한다."
+)
+PARTICIPANT_QUESTION = re.compile(r"업체|공급사|제조사|벤더|담당자|누구|누가|교신|상대방|\b(?:vendor|supplier|maker|contact|correspondence|participant|who)\b", re.I)
 EMAIL_DOMAIN = re.compile(r"@[a-z0-9-]+(?:\.[a-z0-9-]+)+", re.I | re.ASCII)
 
 
@@ -900,9 +914,45 @@ def answer_plan(question):
     return [question]
 
 
+def conversation_snapshot(result):
+    snapshot = {key: result[key] for key in ("status", "provider", "unknowns") if key in result}
+    if result.get("format") == "markdown":
+        markdown, sources = result["markdown"], result["sources"]
+    else:
+        lines, sources = [], []
+        for claim in result["claims"]:
+            citations = []
+            for ref in claim["citations"]:
+                sources.append({"index": len(sources) + 1, **ref})
+                citations.append(f"[{len(sources)}]")
+            lines.append("- " + claim["text"] + " " + "".join(citations))
+        markdown = "\n".join(lines) or "검색된 자료에서 답을 확인하지 못했습니다."
+    snapshot.update(format="markdown", markdown=markdown, sources=sources, claims=[])
+    snapshot["evidence"] = [[row["passage"], bool(row.get("window"))] for row in result.get("results", [])]
+    return snapshot
+
+
+def restore_conversation_turn(store, turn, *, include_evidence=False):
+    saved = turn["answer"]
+    refs = saved["sources"]
+    targets = {ref["passage"]: ref.get("window", False) for ref in refs}
+    if include_evidence:
+        targets.update((pid, window or targets.get(pid, False)) for pid, window in saved["evidence"])
+    windows = {pid for pid, window in targets.items() if window}
+    visible = {row["passage"]: row for row in store.passages(list(targets), turn["scope"], windows=windows)}
+    if any(ref["passage"] not in visible or (ref.get("quote") and not original_quote(
+            source_text(visible[ref["passage"]]), ref["quote"])) for ref in refs):
+        return None
+    result = {key: value for key, value in saved.items() if key != "evidence"}
+    if include_evidence:
+        result["results"] = public_rows(store, list(visible.values()), evidence=True)
+    return result
+
+
 class AnswerSessions:
     """Keep up to three verified turns per local conversation for a limited time."""
-    def __init__(self):
+    def __init__(self, store=None):
+        self.store = store
         self.items = OrderedDict()
         self.lock = threading.Lock()
         self.turns_ready = threading.Condition()
@@ -943,20 +993,31 @@ class AnswerSessions:
         with self.lock:
             now = time.monotonic()
             self.expire(now)
-            if key in self.items:
-                _, turns = self.items[key]
-            else:
-                key, turns = token_urlsafe(24), []
-            self.items[key] = now + CONVERSATION_TTL, turns
-            self.items.move_to_end(key)
-            if len(self.items) > 64:
-                self.items.popitem(last=False)
-            return key, turns, tuple(turns)
+            known = key in self.items
+            if known and self.items[key][1] is not None:
+                turns = self.items[key][1]
+                return self.activate(key, turns, now)
+        saved = self.store.conversation_turns(key, limit=3) if self.store and key and not known else []
+        turns = []
+        for turn in saved:
+            result = restore_conversation_turn(self.store, turn)
+            if result is not None:
+                ids = tuple(dict.fromkeys(ref["passage"] for ref in result["sources"]))
+                turns.append((turn["question"], (), ids, result["markdown"][:1200]))
+        with self.lock:
+            return self.activate(key if saved else token_urlsafe(24), turns, time.monotonic())
 
-    def record(self, key, handle, question, result):
-        claims = result["claims"]
+    def activate(self, key, turns, now):
+        self.items[key] = now + CONVERSATION_TTL, turns
+        self.items.move_to_end(key)
+        if len(self.items) > 64:
+            self.items.popitem(last=False)
+        return key, turns, tuple(turns or ())
+
+    def record(self, key, handle, question, result, scope=None):
         if result["status"] not in {"answered", "partial", "ambiguous", "insufficient"}:
             return
+        claims = result["claims"]
         facts = tuple(claim["text"] for claim in claims)
         if result.get("format") == "markdown":
             ids = tuple(dict.fromkeys(ref["passage"] for ref in result["sources"]))
@@ -970,14 +1031,22 @@ class AnswerSessions:
             self.expire(now)
             current = self.items.get(key)
             if current and current[1] is handle:
+                if self.store:
+                    try:
+                        self.store.save_conversation_turn(key, question, conversation_snapshot(result), scope or {})
+                    except sqlite3.Error:
+                        runtime_logger.warning("Could not save conversation turn")
                 handle.append(turn)
                 del handle[:-3]
-                self.items[key] = now + CONVERSATION_TTL, handle
-                self.items.move_to_end(key)
+                self.activate(key, handle, now)
 
     def reset(self, key):
         with self.lock:
-            self.items.pop(key, None)
+            self.expire(time.monotonic())
+            if self.store:
+                self.activate(key, None, time.monotonic())
+            else:
+                self.items.pop(key, None)
 
 
 def follow_up_evidence(store, question, filters, turns):
@@ -1294,7 +1363,8 @@ def lexical_candidates(store, query, filters, required=()):
 
 def evidence_for(store, ai, question, filters, context, semantic=True, limit=9, expand=False, *, thread_hops=1,
                  max_evidence=None, local_context="", sub_queries=(), keywords=(), check=None, intent=None,
-                 allow_rerank=True, embedding_timeout=None, warm_lexical=None, embedding_failed=False, on_rerank=None):
+                 allow_rerank=True, embedding_timeout=None, warm_lexical=None, embedding_failed=False, on_rerank=None,
+                 searched_queries=None, link_threads=True):
     search_text = f"{question} {context}".strip()
     rerank = allow_rerank and semantic and search_text and ai.rerank_enabled
     candidate_limit = max(RAG_CANDIDATE_LIMIT if rerank else 40, limit)
@@ -1316,6 +1386,8 @@ def evidence_for(store, ai, question, filters, context, semantic=True, limit=9, 
     for sub_query, query in zip(questions, queries, strict=True):
         if check:
             check()
+        if searched_queries is not None:
+            searched_queries.add(normalized(compact_space(sub_query)))
         lexical_query = f"{query} {local_context}".strip()
         required = keywords
         if len(sub_queries) > 1:
@@ -1360,7 +1432,8 @@ def evidence_for(store, ai, question, filters, context, semantic=True, limit=9, 
         if counts[group] <= per_document or (limit > 9 and PCF_CELL.fullmatch(row["location"])):
             chosen.append(row)
     with store.measure("context"):
-        linked = store.related(list(dict.fromkeys(row["id"] for row in chosen[:7])), filters, hops=thread_hops, question=search_text)
+        linked = store.related(list(dict.fromkeys(row["id"] for row in chosen[:7])), filters,
+                               hops=thread_hops, question=search_text) if link_threads else []
     reserved = latest_thread_decisions(intent, chosen, [*ranked, *linked], min(4, limit)) if recent else []
     leading = max(0, min(4, limit - len(reserved)))
     ordered = [*chosen[:leading], *reserved, *chosen[leading:4], *linked[:4], *chosen[4:]]
@@ -1389,11 +1462,22 @@ def evidence_for(store, ai, question, filters, context, semantic=True, limit=9, 
     return evidence, mode
 
 
+def unvisited_attachment_names(fragments, names, visited):
+    available = {normalized(name): name for group in names.values() for name in group}
+    selected = []
+    for fragment in map(normalized, fragments):
+        key = fragment if fragment in available else next((name for name in available if fragment in name), "")
+        if key and key not in visited:
+            selected.append(available[key])
+            visited.add(key)
+    return selected
+
+
 def supplemental_evidence(store, ai, question, filters, context, evidence, mode, query_count, *,
                           ceiling=ANSWER_EVIDENCE_LIMIT, expand=True, check=None, review_slots=None,
                           allow_intranet_evidence=True, worker_check=None, allow_rerank=True, expand_targets=False,
-                          on_followup=None):
-    """Run at most one supplemental retrieval under the current scope and budget."""
+                          on_followup=None, searched_queries=()):
+    """Run a bounded sequence of supplemental searches in the original scope."""
     unchanged = evidence, mode, (), False
     complex_question = bool(query_count > 1 or SYNTHESIS_QUESTION.search(question) or COMPARISON_QUESTION.search(question))
     target_question = expand_targets and bool(re.search(r"첨부|견적서|사양서|회신|메일 이력|attachment|thread|pdf|엑셀", question, re.I))
@@ -1416,88 +1500,142 @@ def supplemental_evidence(store, ai, question, filters, context, evidence, mode,
         total, reserve, addition = (40, 20, 6) if complex_question else (20, 10, 4)
     elapsed = time.perf_counter() - profile.started if profile else 0
     remaining = min(addition, total - reserve - elapsed)
-    if remaining < 1:
+    if remaining < (2 if expand_targets else 1):
         return unchanged
     deadline = time.monotonic() + remaining
     gap_options = {} if allow_intranet_evidence else {"allow_intranet_evidence": False}
     if expand_targets:
         gap_options["expand_targets"] = True
-    followup_started = threading.Event() if on_followup else None
-
-    def progress_check():
-        if check:
-            check()
-        if followup_started and followup_started.is_set():
-            followup_started.clear()
-            on_followup()
-
-    def search(stop):
-        def time_check():
-            if worker_check:
-                worker_check()
-            if time.monotonic() >= stop:
-                raise TimeoutError("supplemental_search")
-
-        time_check()
-        with store.search_session(profile):
-            windows = {row["passage"] for row in evidence if row.get("window")}
-            visible = store.passages([row["passage"] for row in evidence[:8]], filters, windows=windows)
-            mail_ids = list(dict.fromkeys(row["id"] for row in visible if row.get("kind") == "mail")) if expand_targets else []
-            if mail_ids:
-                names = store.evidence_attachment_names(mail_ids)
-                visible = [{**row, "attachment_names": names.get(row["id"], ())} for row in visible]
-            remaining = stop - time.monotonic()
-            if remaining < .25:
-                return None
-            time_check()
-            gap = ai.diagnose_evidence_gap(question, visible, timeout=min(2.5, remaining), **gap_options)
-            if not gap:
-                return None
-            time_check()
-            if followup_started and (gap.queries or gap.expand_mails or gap.read_attachments):
-                followup_started.set()
-            rows, next_mode = [], mode
-            if expand_targets:
-                seeds = list(dict.fromkeys(
-                    row["id"] for target in gap.expand_mails for row in visible
-                    if row.get("kind") == "mail" and target in (row["passage"], row["id"])
-                ))[:2]
-                if seeds:
-                    rows.extend(store.related(seeds, filters, hops=3, question=question))
-                    time_check()
-                if gap.read_attachments:
-                    attachment_mails = list(dict.fromkeys([*mail_ids, *(row["id"] for row in rows)]))
-                    rows[:0] = store.attachment_evidence(attachment_mails, gap.read_attachments, filters, question)
-                    time_check()
-            # Local diagnostics can include mail text in the generated search terms.
-            if gap.queries:
-                semantic = trusted or not (ai.rewrite_model and getattr(gateway, "index_key", ""))
-                found, next_mode = evidence_for(
-                    store, ai, question, filters, context, sub_queries=gap.queries, limit=9,
-                    semantic=semantic, expand=expand, max_evidence=12, check=time_check, allow_rerank=False,
-                    embedding_timeout=min(QUERY_EMBEDDING_TIMEOUT, stop - time.monotonic()),
-                )
-                rows.extend(found)
-            ids = list(dict.fromkeys(row["passage"] for row in rows))
-            windows = {row["passage"] for row in rows if row.get("window")}
-            live = {row["passage"]: row for row in store.passages(ids, filters, windows=windows)}
-            time_check()
-            return [live[pid] for pid in ids if pid in live], next_mode, gap.aspects
-
-    with store.measure("followup"):
-        progress_check()
-        extra = bounded_task(ai.followup_slot, remaining, search, "supplemental-search",
-                             check=progress_check if check or on_followup else None)
-        progress_check()
-    if extra is None:
-        return unchanged
-    supplemental, extra_mode, aspects = extra
     primary = dedupe_by_content(evidence)
     seen = {evidence_content_key(row) for row in primary}
     ids = {row["passage"] for row in primary}
-    # Reserve up to four slots for new content without replacing the first pass's strongest hits.
-    new = [row for row in dedupe_by_content(supplemental)
-           if row["passage"] not in ids and evidence_content_key(row) not in seen]
+    visited = {"queries": {normalized(compact_space(question)), *searched_queries}, "mails": set(), "attachments": set()}
+    try:
+        steps = max(1, min(3, int(os.environ.get("MAILSEARCH_AGENT_STEPS", MAX_AGENT_STEPS))))
+    except ValueError:
+        steps = MAX_AGENT_STEPS
+    multi_step = target_question or SYNTHESIS_QUESTION.search(question) or COMPARISON_QUESTION.search(question)
+    if not expand_targets or not (multi_step or len(ANSWER_ASPECT.findall(question)) > 1):
+        steps = 1
+
+    new, aspects, extra_mode = [], (), mode
+    ran = False
+    for step in range(1, steps + 1):
+        remaining = deadline - time.monotonic()
+        if step > 1 and remaining < 2:
+            break
+        # A subsequent diagnosis should see the new findings even if the original
+        # search filled all evidence slots.
+        candidates = [*new, *primary] if new else evidence
+        progress = threading.Event()
+        reported = False
+        actions = {key: set(values) for key, values in visited.items()}
+
+        def progress_check():
+            nonlocal reported
+            if check:
+                check()
+            if on_followup and not reported and progress.is_set():
+                reported = True
+                on_followup(step)
+
+        def search(stop, candidates=candidates, actions=actions, progress=progress):
+            stop = min(stop, deadline)
+
+            def time_check():
+                if worker_check:
+                    worker_check()
+                if time.monotonic() >= stop:
+                    raise TimeoutError("supplemental_search")
+
+            time_check()
+            with store.search_session(profile):
+                windows = {row["passage"] for row in candidates[:8] if row.get("window")}
+                visible = store.passages([row["passage"] for row in candidates[:8]], filters, windows=windows)
+                mail_ids = list(dict.fromkeys(row["id"] for row in visible if row.get("kind") == "mail")) if expand_targets else []
+                names = store.evidence_attachment_names(mail_ids) if mail_ids else {}
+                if names:
+                    visible = [{**row, "attachment_names": names.get(row["id"], ())} for row in visible]
+                remaining = stop - time.monotonic()
+                minimum = 2 if expand_targets else .25
+                if remaining < minimum:
+                    return None
+                gap = ai.diagnose_evidence_gap(question, visible, timeout=min(2.5, remaining), **gap_options)
+                if gap is None or gap is EVIDENCE_SUFFICIENT:
+                    return gap
+                time_check()
+                if stop - time.monotonic() < minimum:
+                    return None
+
+                queries = []
+                for query in gap.queries:
+                    key = normalized(compact_space(query))
+                    if key not in actions["queries"]:
+                        queries.append(query)
+                        actions["queries"].add(key)
+                seeds = []
+                passage_mails = {row["passage"]: row["id"] for row in visible if row.get("kind") == "mail"}
+                for target in gap.expand_mails:
+                    mail = target if target in mail_ids else passage_mails.get(target)
+                    if mail is not None and mail not in actions["mails"]:
+                        seeds.append(mail)
+                        actions["mails"].add(mail)
+                rows, next_mode = [], mode
+                if seeds or queries:
+                    progress.set()
+                if seeds:
+                    rows.extend(store.related(seeds, filters, hops=3, question=question))
+                    time_check()
+                if gap.read_attachments and stop - time.monotonic() >= minimum:
+                    related_mails = list(dict.fromkeys(row["id"] for row in rows if row["id"] not in mail_ids))
+                    if related_mails:
+                        names = {**names, **store.evidence_attachment_names(related_mails)}
+                    filenames = unvisited_attachment_names(gap.read_attachments, names, actions["attachments"])
+                    if filenames:
+                        progress.set()
+                        rows[:0] = store.attachment_evidence([*mail_ids, *related_mails], filenames, filters, question)
+                        time_check()
+                if queries and stop - time.monotonic() >= minimum:
+                    # A query proposed from raw mail text must stay local unless
+                    # this request permits the trusted intranet evidence path.
+                    semantic = trusted or not (ai.rewrite_model and getattr(gateway, "index_key", ""))
+                    options = {"link_threads": False} if expand_targets else {}
+                    found, next_mode = evidence_for(
+                        store, ai, question, filters, context, sub_queries=tuple(queries), limit=9,
+                        semantic=semantic, expand=expand, max_evidence=12, check=time_check, allow_rerank=False,
+                        embedding_timeout=min(QUERY_EMBEDDING_TIMEOUT, stop - time.monotonic()), **options,
+                    )
+                    rows.extend(found)
+                ids = list(dict.fromkeys(row["passage"] for row in rows))
+                windows = {row["passage"] for row in rows if row.get("window")}
+                live = {row["passage"]: row for row in store.passages(ids, filters, windows=windows)} if ids else {}
+                time_check()
+                return [live[pid] for pid in ids if pid in live], next_mode, gap.aspects
+
+        with store.measure("followup"):
+            progress_check()
+            extra = bounded_task(ai.followup_slot, remaining, search, "supplemental-search",
+                                 check=progress_check if check or on_followup else None)
+            progress_check()
+        if extra is EVIDENCE_SUFFICIENT:
+            aspects = ()
+            break
+        if extra is None:
+            break
+        visited = actions
+        supplemental, next_mode, aspects = extra
+        ran = True
+        added = [row for row in dedupe_by_content(supplemental)
+                 if row["passage"] not in ids and evidence_content_key(row) not in seen]
+        if not added:
+            break
+        new = [added[0], *new, *added[1:]]
+        ids.update(row["passage"] for row in added)
+        seen.update(map(evidence_content_key, added))
+        if next_mode == "hybrid":
+            extra_mode = next_mode
+    if not ran:
+        return unchanged
     leading = min(4, len(primary), max(0, ceiling - min(4, len(new))))
     if review_slots is not None:
         # The ordinary external profile reviews at most five excerpts.
