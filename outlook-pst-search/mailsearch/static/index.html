@@ -114,6 +114,13 @@
               <label class="settings-checkbox" title="제목과 메일 본문 앞부분을 빠르게 검색합니다."><input id="search-quick" type="checkbox"> 빠른 검색</label>
               <label class="settings-checkbox" title="전체 본문과 첨부파일을 키워드로 검색합니다."><input id="search-keyword" type="checkbox"> 키워드만 검색</label>
               <label class="settings-checkbox"><input id="search-rerank" type="checkbox"> 의미 검색 결과 재정렬</label>
+              <label class="answer-detail">답변 구체화 정도
+                <select id="answer-detail">
+                  <option value="concise">간결</option>
+                  <option value="balanced" selected>보통</option>
+                  <option value="detailed">상세</option>
+                </select>
+              </label>
             </div>
             <button id="clear-filters" type="button" class="text-button" hidden>검색 범위 초기화</button>
           </div>
@@ -161,13 +168,20 @@
       </form>
       <div id="sources" class="sources" aria-label="등록한 자료"></div>
       <div class="model-panels">
-        <div class="model-panel">
+        <div class="model-panel" data-configured="false">
           <span class="model-dot" aria-hidden="true"></span>
-          <p id="model-status">검색 설정 확인 중</p>
+          <p><strong>의미 검색 API</strong><span id="model-status" class="model-name"></span></p>
+          <span class="model-badge">미연결</span>
         </div>
-        <div class="model-panel" id="external-panel">
+        <div class="model-panel" id="external-panel" data-configured="false">
           <span class="model-dot" aria-hidden="true"></span>
-          <p id="external-status">답변 API 연결 전</p>
+          <p><strong>답변 API</strong><span id="external-status" class="model-name"></span></p>
+          <span class="model-badge">미연결</span>
+        </div>
+        <div class="model-panel" data-configured="false">
+          <span class="model-dot" aria-hidden="true"></span>
+          <p><strong>재정렬 API</strong><span id="rerank-status" class="model-name"></span></p>
+          <span class="model-badge">미연결</span>
         </div>
       </div>
     </aside>
@@ -184,7 +198,7 @@
         <div class="settings-fields">
           <label for="settings-provider">API 연결</label>
           <select id="settings-provider">
-            <option value="intranet">임베딩 · 사내 API 모델</option>
+            <option value="intranet">임베딩 · API 모델</option>
             <option value="external">기타 답변 API</option>
           </select>
           <div id="settings-gateway" class="settings-fields">
@@ -198,12 +212,12 @@
               </div>
               <p id="ollama-install-help" hidden>설치에는 인터넷 연결이 필요합니다. BGE-M3 다운로드는 약 1.2GB입니다.</p>
             </div>
-            <p>사내 API 임베딩과 재정렬에는 텍스트가 전송됩니다.</p>
+            <p>API 임베딩과 재정렬에는 텍스트가 전송됩니다.</p>
             <details id="gateway-advanced" class="settings-advanced">
               <summary>고급 설정</summary>
               <div class="settings-fields">
                 <button type="button" id="gateway-defaults" class="button">기본값 적용</button>
-                <label for="gateway-url">사내 HTTPS 주소</label>
+                <label for="gateway-url">게이트웨이 HTTPS 주소</label>
                 <input id="gateway-url" type="url" maxlength="512" spellcheck="false" placeholder="https://gateway.example.invalid">
                 <label for="gateway-answer-models">답변 모델 ID</label>
                 <input id="gateway-answer-models" maxlength="3000" spellcheck="false" aria-describedby="gateway-models-help">
