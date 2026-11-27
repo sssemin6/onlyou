@@ -77,10 +77,32 @@ test("answer evidence leads with cited results and collapses extra results only 
   assert.equal(cards[4].tag, "details");
   assert.equal(cards[4].children[0].textContent, "근거 자료 3건 더 보기");
   assert.equal(cards[4].children.length, 4);
-  assert.match(cards[0].children[2].textContent, /수신 Recipient.*첨부 Plan.pdf/);
-  assert.equal(cards[0].children[3].textContent.length, 400);
+  assert.match(cards[0].children[1].textContent, /발신 Sender · 수신 Recipient/);
+  assert.equal(cards[0].children.find((child) => child.className === "result-attachment").textContent, "첨부 Plan.pdf");
+  assert.equal(cards[0].children.find((child) => child.className === "result-preview").textContent.length, 400);
   browser.showResults(results, "검색 결과");
   assert.equal(parts.results.children[0].children.length, 7);
+});
+
+test("mail cards summarize recipients and show attachments and a body fallback", () => {
+  const parts = Object.fromEntries(["results", "result-section", "result-heading"].map((id) => [id, node("div")]));
+  const browser = loadFunctions("function showResults", "function appendMarkdownInline", {
+    element: (id) => parts[id], document: { createDocumentFragment: () => node("fragment") },
+    formatDate: () => "2026-11-27",
+  });
+  browser.showResults([
+    { kind: "mail", sender: "Sender", recipient: '"Lee, Mira" <mira@example.invalid>; Kim\nPark',
+      attachment: "Drawing.pdf", attachments: ["Notes.txt", "Drawing.pdf"], location: "파일명",
+      preview: "Drawing.pdf", body_preview: "The drawing approval is attached." },
+    { kind: "document", subject: "Draft.xlsx", archive: "Files", folder: "Specs", location: "Sheet 1", preview: "Draft data" },
+  ], "검색 결과");
+  const [mail, doc] = parts.results.children[0].children;
+  assert.match(mail.children[1].textContent, /발신 Sender · 수신 "Lee, Mira" <mira@example.invalid>, Kim 외 1명 · 2026-11-27/);
+  assert.equal(mail.children[2].textContent, "첨부 Drawing.pdf (외 1건)");
+  assert.equal(mail.children[2].title, "Notes.txt\nDrawing.pdf");
+  assert.equal(mail.children.at(-1).textContent, "The drawing approval is attached.");
+  assert.equal(doc.children[1].textContent, "2026-11-27 · Files · Specs · Sheet 1");
+  assert.equal(doc.children[2].textContent, "Draft data");
 });
 
 test("activity tracks stage timings, collapses on completion and stops its timer on abort", () => {
