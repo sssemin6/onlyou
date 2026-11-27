@@ -181,3 +181,57 @@ test("activity tracks stage timings, collapses on completion and stops its timer
   request.abort();
   assert.equal(tick, undefined);
 });
+
+test("answer toolbar copies clean text and starts a new conversation", async () => {
+  const copied = [];
+  const messages = [];
+  let resets = 0;
+  const browser = loadFunctions("function answerHeader", "function showAnswer(data)", {
+    navigator: { clipboard: { writeText: async (text) => copied.push(text) } },
+    notice: (message) => messages.push(message),
+    newConversation: () => { resets++; },
+  });
+  const [, toolbar] = browser.answerHeader({ markdown: "  **승인** [2]\n" }).children;
+  const [copy, reset] = toolbar.children;
+  await copy.events.click();
+  reset.events.click();
+  assert.deepEqual(copied, ["**승인** [2]"]);
+  assert.equal(messages.at(-1), "답변을 복사했습니다.");
+  assert.equal(resets, 1);
+});
+
+test("opening a saved conversation restores its scope and enables follow-up", async () => {
+  const elements = new Map();
+  const rendered = [];
+  const restored = { format: "markdown", markdown: "검토 결과 [1]", sources: [], results: [] };
+  const element = (id) => {
+    if (!elements.has(id)) {
+      const part = node("div");
+      part.focus = () => { part.focused = true; };
+      part.prepend = (...children) => part.children.unshift(...children);
+      elements.set(id, part);
+    }
+    return elements.get(id);
+  };
+  const browser = loadFunctions("function newConversation()", "function showReview(", {
+    element, AbortController, answerConversation: "", request: null, ALL_FILTERS: ["source", "sender"],
+    sourceSelect: { options: [{ value: "7" }] },
+    call: async (route) => {
+      assert.equal(route, "/api/conversations/saved");
+      return { filters: { tab: "mail", source: 7, sender: "구매팀" },
+        turns: [{ question: "이전 질문", answer: restored }, { question: "최근 질문", answer: restored }] };
+    },
+    clearSearch() {}, showFilterCount() {}, showAnswerControls() {},
+    selectTab: (tab) => rendered.push(tab), setQuestionContext: (question) => rendered.push(question),
+    showAnswer: (answer) => rendered.push(answer), showAnswerEvidence: (answer) => rendered.push(answer.results),
+    renderAnswerMarkdown: (markdown) => node("div", markdown), notice: assert.fail,
+  });
+  await browser.openConversation("saved");
+  assert.equal(browser.answerConversation, "saved");
+  assert.equal(browser.sourceSelect.value, "7");
+  assert.equal(element("sender").value, "구매팀");
+  assert.equal(element("query").value, "");
+  assert.equal(element("query").focused, true);
+  assert.deepEqual(rendered, ["mail", "최근 질문", restored, []]);
+  assert.equal(element("answer").children[0].children[0].textContent, "이전 질문");
+});
