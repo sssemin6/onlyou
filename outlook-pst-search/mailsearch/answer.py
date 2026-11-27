@@ -855,6 +855,19 @@ def public_row(row, *, evidence=False):
     }
 
 
+def public_rows(store, rows, *, evidence=False):
+    results = [public_row(row, evidence=evidence) for row in rows]
+    mails = [item for item in results if item["kind"] == "mail"]
+    fallback = [item for item in mails if item["location"] in {"파일명", "제목"} or not item["preview"].strip()]
+    names = store.evidence_attachment_names([item["mail"] for item in mails], indexed_only=False)
+    bodies = store.mail_body_previews([item["mail"] for item in fallback])
+    for item in mails:
+        item["attachments"] = names.get(item["mail"], [])
+    for item in fallback:
+        item["body_preview"] = bodies.get(item["mail"]) or ""
+    return results
+
+
 def answer_plan(question):
     """Build at most three retrieval queries around the question's topics and requested facts."""
     codes = list(dict.fromkeys(code.casefold() for code in PROJECT_CODE.findall(question)))
