@@ -2769,6 +2769,7 @@ class Integration(unittest.TestCase):
         source = self.import_mail()
         query = {"query": "한빛 건 자재 늦어서 밀린 거, 결국 언제로 정해졌지?"}
         self.assertGreater(len(self.call("/api/candidates", query)[1]["results"]), 0)
+
         status, data = self.call("/api/answer", query)
         self.assertEqual(status, 200)
         self.assertEqual(data["status"], "answered")
@@ -2785,6 +2786,47 @@ class Integration(unittest.TestCase):
         with self.store.connection() as conn:
             for table in ("mails", "terms", "passages", "attachments", "vectors", "vector_buckets"):
                 self.assertEqual(conn.execute(f"SELECT count(*) FROM {table}").fetchone()[0], 0)
+
+    def test_search_and_answer_cards_include_attachment_names_and_body_fallback(self):
+        folder = self.mail / "result-card"
+        folder.mkdir()
+        body = "Uniqueorchid inspection body. " + "Buffered text for the preview limit. " * 10
+        mail = EmailMessage()
+        mail["Subject"] = "Atlas result card fixture"
+        mail["From"] = "Sender <sender@example.invalid>"
+        mail["To"] = "Receiver <receiver@example.invalid>"
+        mail.set_content(body)
+        mail.add_attachment(b"Inspect this file", maintype="text", subtype="plain", filename="Bluezinnia.txt")
+        mail.add_attachment(b"unsupported", maintype="application", subtype="octet-stream", filename="extra.bin")
+        (folder / "card.eml").write_bytes(mail.as_bytes())
+        (folder / "empty.eml").write_text("Subject: Emptyfixture\n\n")
+        source = self.indexer.register(folder)
+        self.assertEqual(await_source(self.store, source, {"ready", "error"})["state"], "ready")
+        filters = {"source": source}
+
+        def search(query, **options):
+            status, result = self.call("/api/search", {"query": query, "filters": filters, **options})
+            self.assertEqual(status, 200)
+            row, = result["results"]
+            return row
+
+        result = search("Uniqueorchid", mode="keyword", full_text=True)
+        self.assertEqual(result["location"], "본문")
+        self.assertIsNone(result["attachment"])
+        self.assertEqual(result["attachments"], ["Bluezinnia.txt", "extra.bin"])
+        self.assertIn("receiver@example.invalid", result["recipient"])
+
+        filename = search("Bluezinnia", mode="quick")
+        self.assertEqual(filename["location"], "파일명")
+        self.assertEqual(filename["attachments"], result["attachments"])
+        self.assertEqual(filename["body_preview"], body[:200])
+        empty = search("Emptyfixture", mode="quick")
+        self.assertEqual((empty["location"], empty["attachments"], empty["body_preview"]), ("제목", [], ""))
+
+        status, answer = self.call("/api/answer", {"query": "Uniqueorchid", "filters": filters})
+        self.assertEqual(status, 200)
+        evidence = next(row for row in answer["results"] if row["mail"] == result["mail"])
+        self.assertEqual(evidence["attachments"], result["attachments"])
 
     def test_refresh_preserves_version_and_updates_evidence(self):
         source = self.import_mail()
