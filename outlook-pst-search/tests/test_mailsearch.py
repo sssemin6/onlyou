@@ -32,7 +32,7 @@ from mailsearch.answer import (QUERY_EMBEDDING_TIMEOUT, QUERY_REWRITE_TIMEOUT, A
                                reciprocal_rank, report_unconfirmed_aspects, rewritten_evidence,
                                source_text, supplemental_evidence, validate)
 from mailsearch.embedding import EmbeddingAPI, GatewayRequestError, tls_context, warn_unverified
-from mailsearch.external import ExternalAI, Excerpt, Reviews, pack_excerpts, pcf_batches
+from mailsearch.external import ANSWER_DETAILS, ExternalAI, Excerpt, Reviews, pack_excerpts, pcf_batches
 from mailsearch.extract import convert_legacy, extract_attachment, extract_bytes
 from mailsearch.filesystem import DRIVE_REMOTE, is_unc_share, local_path, source_path
 from mailsearch.intranet import CHAT_PATH, RERANK_PATH, IntranetAI, LOCAL_EMBEDDING
@@ -182,14 +182,16 @@ class Integration(unittest.TestCase):
                                          for i in range(data["top_n"])]}
                 else:
                     self.assertEqual(path, CHAT_PATH)
-                    if data["max_tokens"] == 384:
+                    if data.get("max_tokens") == 384:
                         self.assertIn(model, ("answer-model-a", "answer-model-b"))
                         question = json.loads(data["messages"][1]["content"])
                         self.assertEqual(set(question), {"question", "today"})
                         content = '{"sub_queries":["A-17 납기"],"keywords":["A-17"],"filters":{}}'
                     else:
                         self.assertEqual(model, "answer-model-a")
-                        content = '```json\n{"ok": true}\n```'
+                        self.assertEqual(data["messages"], [{"role": "user", "content": "Hello"}])
+                        self.assertNotIn("response_format", data)
+                        content = "Hello"
                     value = {"choices": [{"message": {"content": content}, "finish_reason": "stop"}]}
                 response.read.return_value = json.dumps(value).encode()
 
@@ -1673,6 +1675,7 @@ class Integration(unittest.TestCase):
 
         def markdown_reply(_origin, _path, options, _headers, **_kwargs):
             self.assertTrue(options["stream"])
+            self.assertIn(ANSWER_DETAILS["balanced"], options["messages"][0]["content"])
             row = next(row for row in json.loads(options["messages"][-1]["content"])["evidence"] if quote in row["text"])
             yield {"choices": [{"delta": {"content": "## 승인 결과\n최종 승인 납품일은 "}}]}
             generating.set()
@@ -1699,6 +1702,8 @@ class Integration(unittest.TestCase):
                 self.assertEqual([event["stage"] for event in stages], ["retrieving", "reranking", "generating"])
                 self.assertGreater(stages[1]["candidates"], 1)
                 self.assertGreater(stages[2]["evidence"], 0)
+                self.assertIn(f"{stages[1]['candidates']}건", stages[1]["message"])
+                self.assertIn(f"{stages[2]['evidence']}건", stages[2]["message"])
                 self.assertTrue(generating.wait(1))
                 self.assertEqual(next_event(response, "delta")["text"], "## 승인 결과\n최종 승인 납품일은 ")
                 release.set()
@@ -1714,6 +1719,47 @@ class Integration(unittest.TestCase):
         self.assertIn("최종 승인 납품일은 4월 25일입니다.", result["markdown"])
         self.assertNotIn("[99]", result["markdown"])
         self.assertIn(quote, result["sources"][0]["quote"])
+
+    def test_intranet_details_and_conditional_followup_event(self):
+        source = self.import_mail()
+        self.assertEqual(self.call("/api/intranet/settings", {"action": "apply", "key": "fixture-key", "selections": {
+            "answer": "answer-model-a", "embedding": "", "rerank": "",
+        }})[0], 200)
+        route = "/api/intranet/answer"
+        payload = {"query": "A-17 최종 승인", "filters": {"source": source}}
+        for url in (route, route + "/stream"):
+            for invalid in ("verbose", None, ["balanced"]):
+                with self.subTest(url=url, invalid=invalid):
+                    self.assertEqual(self.call(url, {**payload, "detail": invalid}), (400, {"error": "answer_detail"}))
+
+        def reply(*_args, **_kwargs):
+            yield {"choices": [{"message": {"content": "승인을 확인했습니다. [1]"}}]}
+
+        with (patch.dict(os.environ, MAILSEARCH_QUERY_REWRITE="1", MAILSEARCH_AGENTIC_RETRY="1"),
+              patch.object(self.ai.embedding_api, "rewrite_query", return_value=None),
+              patch.object(self.ai.embedding_api, "diagnose_evidence_gap", return_value={
+                  "sufficient": False, "missing_aspects": ["승인 후속 회신"], "follow_up_queries": ["A-17 납품 승인"],
+              }) as diagnose,
+              patch("mailsearch.external.request_gateway_stream", side_effect=reply) as wire):
+            for detail, instruction in ANSWER_DETAILS.items():
+                self.assertEqual(self.call(route, {**payload, "detail": detail})[0], 200)
+                self.assertIn(instruction, wire.call_args.args[2]["messages"][0]["content"])
+            diagnose.reset_mock()
+            conn = http.client.HTTPConnection("127.0.0.1", self.app.server_port, timeout=8)
+            try:
+                conn.request("POST", route + "/stream", json.dumps({**payload, "detail": "detailed"}),
+                             {"X-Mail-Session": self.app.token, "Content-Type": "application/json"})
+                response = conn.getresponse()
+                self.assertEqual(response.status, 200)
+                events = response.read().decode().split("\n\n")
+            finally:
+                conn.close()
+            stages = [json.loads(event.split("\n", 1)[1][6:])["stage"] for event in events
+                      if event.startswith("event: stage\n")]
+            self.assertEqual(stages, ["retrieving", "reranking", "followup", "generating"])
+            self.assertTrue(any(event.startswith("event: complete\n") for event in events))
+            self.assertIn(ANSWER_DETAILS["detailed"], wire.call_args.args[2]["messages"][0]["content"])
+            diagnose.assert_called_once()
 
     def test_intranet_concurrency_serializes_each_conversation_and_excludes_settings(self):
         source = self.import_mail()
@@ -3706,6 +3752,43 @@ class Integration(unittest.TestCase):
             pst.unlink()
             self.assertEqual(download(picture["id"])[0], 404)
 
+    def test_attachment_inline_formats_keep_original_access_and_safe_types(self):
+        folder = self.mail / "previews"
+        folder.mkdir()
+        message = EmailMessage()
+        message["Subject"] = "Attachment preview fixture"
+        message.set_content("Open the attachment preview fixture.")
+        cases = {
+            "drawing.PDF": (b"%PDF-1.7 fixture", "application/pdf"),
+            "photo.png": (b"\x89PNG\r\n\x1a\nfixture", "image/png"),
+            "list.csv": (b"one,two", "text/plain; charset=utf-8"),
+            "vector.svg": (b"<svg></svg>", None),
+            "page.html": (b"<html>fixture</html>", None),
+        }
+        for name, (body, _) in cases.items():
+            message.add_attachment(body, maintype="application", subtype="octet-stream", filename=name)
+        (folder / "test.eml").write_bytes(message.as_bytes())
+        source = self.indexer.register(folder)
+        self.assertEqual(await_source(self.store, source, {"ready", "error"})["state"], "ready")
+        rows = self.call("/api/search", {"query": "fixture", "filters": {"source": source}})[1]["results"]
+        attachments = self.call(f"/api/evidence/{rows[0]['passage']}")[1]["attachments"]
+        conn = http.client.HTTPConnection("127.0.0.1", self.app.server_port, timeout=5)
+        try:
+            for item in attachments:
+                name = item["name"]
+                with self.subTest(name=name):
+                    conn.request("GET", f"/api/attachment/{item['id']}?inline=1", headers={"X-Mail-Session": self.app.token})
+                    response = conn.getresponse()
+                    body, mime = cases[name]
+                    self.assertEqual(response.status, 200)
+                    self.assertEqual(response.read(), body)
+                    self.assertEqual(response.getheader("Content-Type"), mime or "application/octet-stream")
+                    self.assertEqual(response.getheader("Content-Disposition").split(";")[0], "inline" if mime else "attachment")
+                    self.assertEqual(response.getheader("X-Content-Type-Options"), "nosniff")
+        finally:
+            conn.close()
+        self.assertEqual(self.call(f"/api/attachment/{attachments[0]['id']}?inline=1", token=False)[0], 403)
+
     def test_pst_numbered_exports_index_and_empty_refresh_keeps_previous_index(self):
         pst = self.mail / "archive.pst"
         pst.write_bytes(b"!BDN" + bytes(4) + b"SM" + bytes(2))
@@ -4480,6 +4563,57 @@ class GatewayTLS(unittest.TestCase):
 
 
 class ExternalTransport(unittest.TestCase):
+    def test_deepseek_test_and_json_completions_accept_litellm_content_blocks(self):
+        client = IntranetAI("key", {"answer": "deepseek-v4-1-flash-1017", "embedding": "", "rerank": ""},
+                            origin="https://example.invalid", answer_models="deepseek-v4-1-flash-1017")
+        ai = client.answer_client
+        reply = {"choices": [{"message": {"content": [
+            {"type": "text", "text": "<think>private {scratch}</think>\nHere is the result:\n```json\n"},
+            {"type": "reasoning", "text": "ignore me"},
+            {"type": "text", "text": '{"ok":true}\n```\nFinished.'},
+        ]}}]}
+        with patch("mailsearch.external.request_gateway_json") as request:
+            for message in ({"content": "Hello from DeepSeek"},
+                            {"content": "<think>hidden</think>", "reasoning_content": "reasoned"},
+                            {"content": [{"type": "text", "text": "<think>hidden</think>안녕하세요"}]}):
+                request.return_value = {"choices": [{"message": message}]}
+                ai.test()
+                self.assertEqual(request.call_args.args[2], {
+                    "model": ai.model, "messages": [{"role": "user", "content": "Hello"}],
+                })
+                self.assertFalse(request.call_args.kwargs["retry_stale"])
+            request.return_value = {"choices": [{"message": {"content": "<think>hidden</think>"}}]}
+            with self.assertRaisesRegex(ValueError, "external_test_reply"):
+                ai.test()
+            request.return_value = reply
+            self.assertEqual(ai.complete("instruction", "question", token_limit=50, timeout=2), {"ok": True})
+        with patch.object(client, "request", return_value=reply):
+            self.assertEqual(client.rewrite_query("instruction", "question", timeout=2), {"ok": True})
+            self.assertEqual(client.diagnose_evidence_gap("instruction", "question", timeout=2), {"ok": True})
+
+    def test_deepseek_markdown_never_sends_split_reasoning_in_deltas(self):
+        origin = "https://example.invalid"
+        ai = ExternalAI(origin + CHAT_PATH, "deepseek-v4-1-flash-1017", "key", intranet=True, gateway=origin)
+        chunks = [
+            {"content": "결론: <Th"},
+            {"content": [{"type": "text", "text": "ink>비공개</TH"}]},
+            {"content": "INK>승인 [1]", "reasoning_content": "비공개"},
+            {"content": "<think>닫히지 않은 비공개"},
+        ]
+        deltas = []
+        with patch("mailsearch.external.request_gateway_stream", return_value=(
+            {"choices": [{"delta": chunk}]} for chunk in chunks
+        )):
+            final = ai.answer_markdown("승인?", (), on_delta=deltas.append)
+            self.assertEqual(final, "결론: 승인 [1]")
+            self.assertEqual(deltas, ["결론: ", "승인 [1]"])
+        with patch("mailsearch.external.request_gateway_stream", return_value=(
+            {"choices": [{"message": {"content": [
+                {"type": "text", "text": "<think>비공개</think>승인 [1]"},
+            ]}}]} for _ in range(1)
+        )):
+            self.assertEqual(ai.answer_markdown("승인?", ()), "승인 [1]")
+
     def test_https_endpoint_only_and_no_redirect(self):
         for url in ("http://api.example.invalid/v1/chat/completions",
                     "https://user@api.example.invalid/v1/chat/completions",
