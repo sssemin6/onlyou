@@ -10,9 +10,10 @@ function node(tag, text = "", className = "") {
   return {
     tag, textContent: text, className,
     children: [],
+    events: {},
     classList: { remove() {} },
     setAttribute() {},
-    addEventListener() {},
+    addEventListener(type, handler) { this.events[type] = handler; },
     append(...children) { this.children.push(...children); },
     replaceChildren(...children) { this.children = children; },
   };
@@ -59,6 +60,50 @@ test("mail viewer compacts blank lines and marks only a supplied quote", async (
   assert.equal(pre.children[1].tag, "mark");
   assert.equal(pre.children[1].textContent, "approval\n\nrecord");
   assert.equal(item.body, original);
+});
+
+test("attachment matches and office previews open the full mail with a separate excerpt", async () => {
+  const parts = {
+    viewer: { ...node("dialog"), open: false, showModal() { this.open = true; } },
+    "viewer-title": node("h2"),
+    "viewer-content": node("div"),
+  };
+  const mail = {
+    kind: "mail", subject: "Drawing review", archive: "Archive", folder: "Inbox",
+    body: "Original mail introduction.\r\n\r\n\r\nReview approved. Full mail ending.",
+    attachment: "Drawing.docx", attachments: [{ id: 3, name: "Drawing.docx", status: "완료", passage: 2 }],
+  };
+  const browser = loadFunctions("function highlight", "function recentTitle", {
+    element: (id) => parts[id], formatDate: () => "",
+    call: async (url) => url.endsWith("/1") ? { ...mail, location: "파일명", text: "Drawing.docx" }
+      : url.endsWith("/2") ? { ...mail, location: "본문", text: "Attachment section: Review approved." }
+        : { ...mail, body: "", location: "본문", text: " " },
+  });
+  const content = parts["viewer-content"];
+  const headings = () => content.children.filter((child) => child.tag === "h3").map((child) => child.textContent);
+  const paragraphs = () => content.children.filter((child) => child.tag === "pre");
+  const original = "Original mail introduction.\n\nReview approved. Full mail ending.";
+
+  await browser.openEvidence(1);
+  assert.deepEqual(headings(), ["메일 본문", "첨부"]);
+  assert.deepEqual(paragraphs().map((child) => child.textContent), [original]);
+
+  const attachments = content.children.find((child) => child.tag === "ul");
+  const preview = attachments.children[0].children.find((child) => child.textContent === "미리보기");
+  await preview.events.click();
+  assert.deepEqual(headings(), ["메일 본문", "일치한 첨부 내용 · Drawing.docx (본문)", "첨부"]);
+  assert.deepEqual(paragraphs().map((child) => child.textContent), [original, "Attachment section: Review approved."]);
+
+  await browser.openEvidence(2, "Review approved.");
+  const [body, excerpt] = paragraphs();
+  assert.equal(body.textContent, original);
+  assert.deepEqual(body.children, []);
+  assert.equal(excerpt.children[1].tag, "mark");
+  assert.equal(excerpt.children[1].textContent, "Review approved.");
+
+  await browser.openEvidence(4);
+  assert.deepEqual(headings(), ["메일 본문", "첨부"]);
+  assert.deepEqual(paragraphs().map((child) => child.textContent), ["본문 없음"]);
 });
 
 test("answer evidence leads with cited results and collapses extra results only for answers", () => {
