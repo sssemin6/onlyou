@@ -78,6 +78,15 @@ CREATE TABLE IF NOT EXISTS passages (
     attachment INTEGER REFERENCES attachments(id) ON DELETE CASCADE, location TEXT NOT NULL,
     start INTEGER NOT NULL, text TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS conversations (
+    id TEXT PRIMARY KEY, title TEXT NOT NULL, updated TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS conversation_turns (
+    id INTEGER PRIMARY KEY, conversation TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    question TEXT NOT NULL, answer TEXT NOT NULL, scope TEXT NOT NULL, created TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS conversation_recent ON conversations(updated DESC, id DESC);
+CREATE INDEX IF NOT EXISTS conversation_turn_order ON conversation_turns(conversation, id);
 CREATE TABLE IF NOT EXISTS pcf_documents (
     mail INTEGER PRIMARY KEY REFERENCES mails(id) ON DELETE CASCADE, data TEXT NOT NULL
 );
@@ -367,6 +376,48 @@ def fts_query(words, mode):
         else:
             clauses.append(f'"{word}"')
     return " OR ".join(clauses)
+
+
+def summarize_participants(headers, limit=12):
+    people, domains = {}, {}
+    count = 0
+    for row in headers:
+        count += 1
+        addresses, mail_domains = set(), set()
+        for field in ("sender", "recipient"):
+            field_value = row.get(field, "")
+            entries = re.split(r'[,;\n](?=(?:[^"]*"[^"]*")*[^"]*$)', field_value)
+            for entry in entries:
+                entry = entry.strip()
+                if not entry:
+                    continue
+                name, address = next(iter(getaddresses([entry])), ("", "")) if "@" in entry else (entry, "")
+                address = normalized(address.strip())
+                domain = address.rpartition("@")[2] if re.fullmatch(EMAIL_ADDRESS, address) else ""
+                if not domain:
+                    name = name or entry
+                    address = ""
+                key = address or normalized(name)
+                if not key or key in addresses:
+                    continue
+                addresses.add(key)
+                entry = people.setdefault(key, {"name": "", "email": address, "domain": domain})
+                if name and not entry["name"]:
+                    entry["name"] = name[:120]
+                update_correspondence(entry, row)
+                if domain and domain not in mail_domains:
+                    mail_domains.add(domain)
+                    update_correspondence(domains.setdefault(domain, {"domain": domain}), row)
+
+    def ranked(values):
+        return sorted(values, key=lambda item: (item["count"], item["last_sent"]), reverse=True)[:limit]
+    return {"mail_count": count, "participants": ranked(people.values()), "domains": ranked(domains.values())}
+
+
+def update_correspondence(entry, row):
+    entry["count"] = entry.get("count", 0) + 1
+    if "last_sent" not in entry or row.get("sent", "") > entry["last_sent"]:
+        entry.update(last_sent=row.get("sent", ""), subject=row.get("subject", "")[:160])
 
 
 def topic_key(subject):
@@ -1232,6 +1283,74 @@ class Store:
                 ids.append(row["id"])
         return ids
 
+    def list_conversations(self):
+        with self.connection() as conn:
+            return [dict(row) for row in conn.execute(
+                "SELECT id,title,updated FROM conversations ORDER BY updated DESC,id DESC LIMIT 30",
+            )]
+
+    def conversation_turns(self, key, *, limit=-1):
+        with self.connection() as conn:
+            turns = conn.execute(
+                """SELECT question,answer,scope,created FROM conversation_turns
+                   WHERE conversation=? ORDER BY id DESC LIMIT ?""", (key, limit),
+            ).fetchall()
+        return [{**row, "answer": json.loads(row["answer"]), "scope": json.loads(row["scope"])}
+                for row in reversed(turns)]
+
+    def save_conversation_turn(self, key, question, answer, scope):
+        # Answer handlers use a pooled read-only connection for retrieval.
+        with contextlib.closing(self.open_connection()) as conn, conn:
+            created = datetime.now(timezone.utc).isoformat(timespec="microseconds")
+            conn.execute("""INSERT INTO conversations(id,title,updated) VALUES(?,?,?)
+                            ON CONFLICT(id) DO UPDATE SET updated=excluded.updated""", (key, question, created))
+            conn.execute("""INSERT INTO conversation_turns(conversation,question,answer,scope,created)
+                            VALUES(?,?,?,?,?)""",
+                         (key, question, json.dumps(answer, ensure_ascii=False), json.dumps(scope), created))
+            conn.execute("""DELETE FROM conversations WHERE id IN (
+                            SELECT id FROM conversations ORDER BY updated DESC,id DESC LIMIT -1 OFFSET 30)""")
+
+    def delete_conversation(self, key):
+        with self.connection() as conn:
+            return bool(conn.execute("DELETE FROM conversations WHERE id=?", (key,)).rowcount)
+
+    def participant_summary(self, query_terms, filters, limit=12, *, seed_ids=None):
+        """Summarize scoped mail headers, including scoped neighbors of the strongest matches."""
+        limit = max(0, min(limit, 30))
+        if isinstance(query_terms, str):
+            query_terms = re.findall(r"[\w@.+-]+", query_terms)
+        terms = list(dict.fromkeys(normalized(term.strip()) for term in query_terms if term.strip()))[:12]
+        if seed_ids is not None:
+            seed_ids = list(seed_ids)
+        where, params = self.scope(filters, seed_ids or ())
+        if seed_ids is not None:
+            matched = "1" if seed_ids else "0"
+            match_params = []
+        elif terms:
+            matched = """EXISTS (SELECT 1 FROM json_each(?) term WHERE instr(norm(m.subject),term.value)>0
+                         OR instr(norm(m.sender),term.value)>0 OR instr(norm(m.recipient),term.value)>0)"""
+            match_params = [json.dumps(terms)]
+        else:
+            matched, match_params = "0", []
+        if not limit:
+            return summarize_participants(())
+        fields = "m.id,m.subject,m.sender,m.recipient,m.sent,m.source,m.item,m.kind,s.path,s.kind AS source_kind"
+        with self.connection() as conn:
+            conn.create_function("norm", 1, normalized, deterministic=True)
+            rows = conn.execute(f"""SELECT {fields} FROM mails m {JOIN}
+                                    WHERE {where} AND m.kind='mail' AND {matched}
+                                    ORDER BY m.sent DESC,m.id DESC""", (*params, *match_params))
+            sources, documents = {}, {}
+            headers = {row["id"]: dict(row) for row in rows
+                       if self.result_access(row, sources, documents, refresh=True) is True}
+            related = self.related_mail_ids(list(headers)[:8], filters, hops=3)
+            if related:
+                where, params = self.scope(filters, related)
+                rows = conn.execute(f"SELECT {fields} FROM mails m {JOIN} WHERE {where} AND m.kind='mail'", params)
+                headers.update((row["id"], dict(row)) for row in rows
+                               if self.result_access(row, sources, documents, refresh=True) is True)
+        return summarize_participants(headers.values(), limit)
+
     def scope(self, filters, extra=()):
         clauses = [VISIBLE_VERSION]
         params = []
@@ -1915,7 +2034,8 @@ class Store:
                         CROSS JOIN sources s ON s.id=m.source CROSS JOIN attachments a ON a.mail=m.id
                         WHERE {where} AND instr(lower(a.name), lower(?)) > 0
                         AND EXISTS (SELECT 1 FROM passages p WHERE p.attachment=a.id AND p.location<>'파일명')
-                        ORDER BY ids.key, length(a.name), a.id LIMIT 1""", (json.dumps(mails), *params, name),
+                        ORDER BY lower(a.name)<>lower(?), ids.key, length(a.name), a.id LIMIT 1""",
+                        (json.dumps(mails), *params, name, name),
                 ).fetchall()
                 for attachment in attachments:
                     found.extend(row[0] for row in conn.execute(
@@ -1926,7 +2046,7 @@ class Store:
             visible = {row["passage"]: row for row in self.passages(ids, filters, conn)}
         return [visible[pid] for pid in ids if pid in visible]
 
-    def related(self, seeds, filters, *, hops=1, question=""):
+    def related_mail_ids(self, seeds, filters, *, hops=1):
         if not seeds:
             return []
         where, params = self.scope(filters)
@@ -1978,6 +2098,10 @@ class Store:
             emails = set(re.findall(r"[\w.+-]+@[\w.-]+", (row["sender"] + " " + row["recipient"]).lower()))
             if row["id"] not in seeds and (row["message_id"] in identifiers or row["id"] in reply_ids or refs[row["topic"]] & emails):
                 linked.append(row["id"])
+        return linked
+
+    def related(self, seeds, filters, *, hops=1, question=""):
+        linked = self.related_mail_ids(seeds, filters, hops=hops)
         if not linked:
             return []
         words = [word for word in query_words(question, fuzzy=True) if len(word) > 1]
